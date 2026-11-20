@@ -47,5 +47,25 @@ services:
       timeout: 5s
       retries: 6
 
+  aoc-letta:
+    image: letta/letta:0.16.4
+    container_name: aoc-letta
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8283:8283"
+    volumes:
+      - aoc_letta_pg_data:/var/lib/postgresql/data
+    environment:
+      OPENAI_API_KEY: ${AOC_LLM__API_KEY:-dummy}
+      OPENAI_API_BASE: ${AOC_LLM__BASE_URL:-http://127.0.0.1:8000/v1}
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8283/v1/health/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
 volumes:
   aoc_pg_data:
+  aoc_letta_pg_data:
