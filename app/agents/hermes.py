@@ -106,23 +106,22 @@ class HermesAdapter(AgentInterface):
         extra_env: dict[str, str] = {}
         if safe_mode:
             cmd.append("--safe-mode")
-            if self._llm_settings is not None:
-                llm_cfg = self._llm_settings
-            else:
-                from app.core.config import get_settings
-
-                llm_cfg = get_settings().llm
+            llm_cfg = self._llm_settings
+            base_url = str(self.options.get("base_url") or (llm_cfg.base_url if llm_cfg else ""))
+            model_name = str(self.options.get("model") or (llm_cfg.model if llm_cfg else ""))
+            if not base_url or not model_name:
+                raise ValueError("HermesAdapter safe_mode=true requires injected llm_settings or options.base_url/model")
             cmd.extend(
                 [
                     "--provider",
                     "custom",
                     "--base-url",
-                    str(self.options.get("base_url") or llm_cfg.base_url),
+                    base_url,
                     "-m",
-                    str(self.options.get("model") or llm_cfg.model),
+                    model_name,
                 ]
             )
-            if llm_cfg.api_key:
+            if llm_cfg and llm_cfg.api_key:
                 secret = llm_cfg.api_key.get_secret_value()
                 if secret:
                     # Security (P1-1a): pass API key strictly via environment, NEVER via CLI argv

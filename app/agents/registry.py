@@ -8,7 +8,7 @@ from app.agents.base import AgentCapability, AgentInterface, AgentProbeResult
 from app.agents.codex import CodexAdapter
 from app.agents.generic_cli import GenericCLIAdapter
 from app.agents.hermes import HermesAdapter
-from app.core.config import get_agent_config
+from app.core.config import LLMSettings, get_agent_config
 from app.observability.logging import get_logger
 from app.storage.repository import StateRepository
 
@@ -37,7 +37,11 @@ class AgentRegistry:
     def get_probe(self, agent_id: str) -> AgentProbeResult | None:
         return self._probes.get(agent_id)
 
-    def load_from_config(self, cfg: dict[str, Any] | None = None) -> None:
+    def load_from_config(
+        self,
+        cfg: dict[str, Any] | None = None,
+        llm_settings: LLMSettings | None = None,
+    ) -> None:
         data = cfg if cfg is not None else get_agent_config()
         for entry in data.get("agents", []):
             cap = AgentCapability(
@@ -54,9 +58,9 @@ class AgentRegistry:
             binary = entry.get("binary", cap.agent_id)
             options = entry.get("options") or {}
             if kind == "codex":
-                adapter: AgentInterface = CodexAdapter(cap, binary=binary, options=options)
+                adapter: AgentInterface = CodexAdapter(cap, binary=binary, options=options, llm_settings=llm_settings)
             elif kind == "hermes":
-                adapter = HermesAdapter(cap, binary=binary, options=options)
+                adapter = HermesAdapter(cap, binary=binary, options=options, llm_settings=llm_settings)
             else:
                 adapter = GenericCLIAdapter(cap, binary=binary, options=options)
             self.register(adapter)

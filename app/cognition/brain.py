@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import (
     ActionPlan,
     AssessmentResult,
@@ -24,8 +25,14 @@ from app.perception.interfaces import Observation
 
 
 class CognitionBrain(BrainInterface):
-    def __init__(self, adapter: OpenAICompatibleLLMAdapter) -> None:
-        self._adapter = adapter
+    def __init__(self, gateway: LLMGatewayInterface | OpenAICompatibleLLMAdapter) -> None:
+        if isinstance(gateway, OpenAICompatibleLLMAdapter):
+            self._gateway: LLMGatewayInterface = LLMGateway(
+                llm_settings=gateway.settings,
+                adapter=gateway,
+            )
+        else:
+            self._gateway = gateway
 
     async def assess(
         self,
@@ -45,7 +52,7 @@ class CognitionBrain(BrainInterface):
             "drives": [d.model_dump(mode="json") for d in drives],
             "recent_memories": memories[:10],
         }
-        return await self._adapter.complete_structured(
+        return await self._gateway.complete_structured(
             operation="assess",
             system_prompt=system_prompt,
             user_payload=payload,
@@ -74,7 +81,7 @@ class CognitionBrain(BrainInterface):
             "budget_remaining": context.budget_remaining,
             "active_goals": context.active_goals[:5],
         }
-        proposal = await self._adapter.complete_structured(
+        proposal = await self._gateway.complete_structured(
             operation="generate_goal",
             system_prompt=system_prompt,
             user_payload=payload,
@@ -106,7 +113,7 @@ class CognitionBrain(BrainInterface):
             "budget_remaining": context.budget_remaining,
             "memories": context.memories[:8],
         }
-        return await self._adapter.complete_structured(
+        return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
             user_payload=payload,
@@ -145,7 +152,7 @@ class CognitionBrain(BrainInterface):
                 "environment_state": context.post_observation.environment_state,
             },
         }
-        result = await self._adapter.complete_structured(
+        result = await self._gateway.complete_structured(
             operation="evaluate",
             system_prompt=system_prompt,
             user_payload=payload,

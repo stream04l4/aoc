@@ -7,7 +7,7 @@ import pytest
 
 from app.agents.registry import AgentRegistry
 from app.cognition.interfaces import ActionPlan, VerificationSpec
-from app.core.config import GovernanceSettings
+from app.core.config import GovernanceSettings, Settings
 from app.core.enums import TaskStatus
 from app.governance.policy import GovernanceManager
 from app.orchestration.orchestrator import AgentOrchestrator
@@ -21,7 +21,7 @@ async def test_real_codex_exec_bounded_l1_task(repo: StateRepository, tmp_path):
         pytest.skip("codex CLI not installed")
 
     registry = AgentRegistry(repo=repo)
-    registry.load_from_config()
+    registry.load_from_config(llm_settings=Settings().llm)
     probes = await registry.probe_all()
     assert probes["codex"].ok is True
     # Also verify hermes probe status is truthfully recorded (experimental)

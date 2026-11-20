@@ -9,10 +9,10 @@ All modules communicate strictly through explicit Python abstract interfaces (`i
 
 | Module | Path | Responsibility | External Contract |
 |---|---|---|---|
-| Core Runtime | `app/core/` | Config, enums, Lifecycle Manager (8 states), Scheduler, Autonomous Loop (16 steps), State Manager | Orchestrates loop via module interfaces only |
-| Perception | `app/perception/` | SensorManager, SystemSensor, AgentSensor, EnvironmentSensor | `PerceptionInterface`, `SensorInterface`, `Observation` |
-| Drive Engine | `app/drives/` | Independent evaluators (Survival, Reproduction, Curiosity), satisfaction/persistence/trend calculation, Arbitration | `DriveEngineInterface`, `DriveEvaluator`, `DriveState`, `DriveDecision` |
-| Cognition | `app/cognition/` | OpenAI-compatible LLM Adapter, Assess, Goal Generation, Action Planning, Outcome Evaluation | `BrainInterface` (read-only advice; zero write/dispatch privileges) |
+| Core Runtime | `app/core/` | Config, enums (`LifecycleState` incl. `THROTTLED`, `QuotaStatus`), Lifecycle Manager (9 states), Scheduler (quota-reset throttling), Autonomous Loop (16 steps + re-entrancy lock), State Manager | Orchestrates loop via module interfaces only |
+| Perception | `app/perception/` | SensorManager, SystemSensor (shares `LLMGateway.health_check`), AgentSensor, EnvironmentSensor | `PerceptionInterface`, `SensorInterface`, `Observation` |
+| Drive Engine | `app/drives/` | Independent evaluators (Survival decoupled from Economic Quota, Reproduction, Curiosity), satisfaction/persistence/trend calculation, Arbitration | `DriveEngineInterface`, `DriveEvaluator`, `DriveState`, `DriveDecision` |
+| Cognition | `app/cognition/` | Unified `LLMGateway` (per-cycle call/token/concurrency/emergency/hard-cap enforcement, circuit breaker, HTTP-level accounting), OpenAI-compatible LLM Adapter, Brain (`assess/generate_goal/plan/evaluate`) | `BrainInterface`, `LLMGatewayInterface` (read-only advice; zero write/dispatch privileges) |
 | Governance | `app/governance/` | Permission levels L0–L3, Policy enforcement, Resource Budget, Workspace isolation | `GovernanceInterface`, `PolicyVerdict` |
 | Agent Orchestration | `app/orchestration/`, `app/agents/` | AgentRegistry (probed capabilities), CodexAdapter, HermesAdapter (experimental), GenericCLIAdapter, TaskDispatcher, ExecutionMonitor, ResultCollector | `AgentInterface`, `AgentCapability`, `AgentTask`, `AgentExecution` |
 | Memory | `app/memory/` | Dual-layer memory: PostgreSQL real-time state + Letta long-term cognitive memory (5 types) | `MemoryInterface`, `MemoryItem` |

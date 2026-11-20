@@ -20,10 +20,13 @@ import asyncio
 import secrets
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from typing import Any
 
 from app.agents.registry import AgentRegistry
+from app.cognition.brain import CognitionBrain
+from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import (
     ActionPlan,
     AssessmentResult,
@@ -44,6 +47,7 @@ from app.core.enums import (
     LifecycleState,
     MemoryType,
     PermissionLevel,
+    QuotaStatus,
     TaskStatus,
 )
 from app.core.lifecycle import LifecycleManager
@@ -80,6 +84,7 @@ class AutonomousLoop:
         registry: AgentRegistry,
         orchestrator: AgentOrchestrator,
         memory: ExperienceManager,
+        llm_gateway: LLMGatewayInterface | None = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -92,6 +97,7 @@ class AutonomousLoop:
         self.registry = registry
         self.orchestrator = orchestrator
         self.memory = memory
+        self.llm_gateway = llm_gateway
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -150,7 +156,10 @@ class AutonomousLoop:
         now = utcnow()
 
         # ── 1. WAKE UP ──────────────────────────────────────────────────────
-        if not self.lifecycle.is_paused and self.lifecycle.state != LifecycleState.CRITICAL:
+        if not self.lifecycle.is_paused and self.lifecycle.state not in {
+            LifecycleState.CRITICAL,
+            LifecycleState.THROTTLED,
+        }:
             await self.lifecycle.transition(LifecycleState.ACTIVE, reason="cycle start")
         cycle_id, cycle_num = await self.repo.start_cycle(self.organism_id, self.lifecycle.state.value)
         logger.info("cycle.start", cycle_id=str(cycle_id), cycle_number=cycle_num)
@@ -172,6 +181,70 @@ class AutonomousLoop:
             await self.repo.update_cycle(cycle_id, phase="PERCEPTION")
             pre_obs = await self.perception.perceive(cycle_id=cycle_id, phase="pre", persist=True)
 
+            # P1-1: Pre-check Economic Quota BEFORE invoking LLM to prevent budget-exhausted spin loops!
+            pre_budget = await self.governance.check_budget()
+            if pre_budget.is_quota_exhausted:
+                prelim_ctx = await self._build_drive_context(pre_obs, None, now)
+                prelim_drives = self.drives.compute_states(prelim_ctx, prev_drives)
+                prelim_decision = self.drives.arbitrate(prelim_drives, now=now)
+                is_physical_emergency = bool(prelim_decision.constraints.get("emergency_mode"))
+
+                if not is_physical_emergency:
+                    # Pure Economic Quota exhaustion (NOT a survival crisis): throttle without calling LLM
+                    outcome = "BUDGET_EXHAUSTED"
+                    await self.repo.save_drive_states(
+                        self.organism_id, prelim_drives.values(), cycle_id=cycle_id, phase="pre"
+                    )
+                    await self.repo.update_organism_state(
+                        self.organism_id,
+                        quota_reset_at=pre_budget.quota_reset_at,
+                        throttled_reason=pre_budget.reason,
+                    )
+                    await self.lifecycle.transition(
+                        LifecycleState.THROTTLED,
+                        reason=pre_budget.reason,
+                        next_wake_at=pre_budget.quota_reset_at,
+                        cycle_id=cycle_id,
+                    )
+                    await self.repo.update_cycle(
+                        cycle_id,
+                        drives_pre={k: v.model_dump(mode="json") for k, v in prelim_drives.items()},
+                        decision={
+                            "selected_drive": NO_DRIVE,
+                            "priority_score": 0.0,
+                            "alternative_drives": list(prelim_drives.keys()),
+                            "reason": f"Quota exhausted ({pre_budget.quota_status}): {pre_budget.reason}; throttled until reset.",
+                            "constraints": {
+                                "quota_status": pre_budget.quota_status,
+                                "quota_reset_at": pre_budget.quota_reset_at.isoformat() if pre_budget.quota_reset_at else None,
+                            },
+                            "timestamp": now.isoformat(),
+                        },
+                    )
+                    await self._finalize_cycle(
+                        cycle_id=cycle_id,
+                        outcome=outcome,
+                        pre_drives=prelim_drives,
+                        post_drives=prelim_drives,
+                        state_changes={
+                            "action": "throttled",
+                            "quota_status": pre_budget.quota_status,
+                            "quota_reset_at": pre_budget.quota_reset_at.isoformat() if pre_budget.quota_reset_at else None,
+                            "budget": pre_budget.model_dump(mode="json"),
+                        },
+                        t0=t0,
+                    )
+                    return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
+            else:
+                # Quota has recovered or is OK: clear any prior throttle markers
+                if self.lifecycle.state == LifecycleState.THROTTLED:
+                    await self.repo.update_organism_state(
+                        self.organism_id, quota_reset_at=None, throttled_reason=None
+                    )
+                    await self.lifecycle.transition(
+                        LifecycleState.ACTIVE, reason="quota refreshed", cycle_id=cycle_id
+                    )
+
             # ── 4. SELF ASSESSMENT ──────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="SELF_ASSESSMENT")
             recalled_memories = await self.memory.recall(query="", limit=8)
@@ -182,17 +255,23 @@ class AutonomousLoop:
             llm_probe = (pre_obs.system_state or {}).get("llm")
             if isinstance(llm_probe, dict) and llm_probe.get("available") is False:
                 llm_available_for_brain = False
+            if pre_budget.quota_status == QuotaStatus.QUOTA_EXHAUSTED.value:
+                # Hard cap reached: even emergency LLM calls are disabled; deterministic L0 fallback only
+                llm_available_for_brain = False
+
+            emergency_llm = pre_budget.quota_status == QuotaStatus.QUOTA_EMERGENCY_ONLY.value
 
             if llm_available_for_brain:
                 try:
-                    assessment = await self.brain.assess(pre_obs, mem_dicts, list(prev_drives.values()))
+                    with self._gateway_scope(cycle_id=cycle_id, emergency=emergency_llm):
+                        assessment = await self.brain.assess(pre_obs, mem_dicts, list(prev_drives.values()))
                     await self._record_llm_usage("assess", assessment.usage, cycle_id)
                 except BrainError as exc:
                     logger.warning("cycle.assess_failed", cycle_id=str(cycle_id), error=str(exc))
                     assessment = AssessmentResult(summary=f"Brain assessment unavailable: {exc}", confidence=0.2)
             else:
                 assessment = AssessmentResult(
-                    summary="LLM endpoint reported unavailable by SystemSensor; skipping LLM assessment",
+                    summary="LLM endpoint reported unavailable or hard quota exhausted; skipping LLM assessment",
                     anomalies=["llm_unavailable"],
                     confidence=0.3,
                 )
@@ -541,9 +620,11 @@ class AutonomousLoop:
     async def _generate_goal_safe(
         self, cog_ctx: CognitiveContext, llm_available: bool, cycle_id: uuid.UUID
     ) -> GoalProposal:
+        is_em = bool(cog_ctx.decision.constraints.get("emergency_mode"))
         if llm_available:
             try:
-                gp = await self.brain.generate_goal(cog_ctx)
+                with self._gateway_scope(cycle_id=cycle_id, emergency=is_em):
+                    gp = await self.brain.generate_goal(cog_ctx)
                 await self._record_llm_usage("generate_goal", gp.usage, cycle_id)
                 return gp
             except BrainError as exc:
@@ -565,9 +646,11 @@ class AutonomousLoop:
     async def _plan_safe(
         self, cog_ctx: CognitiveContext, llm_available: bool, cycle_id: uuid.UUID
     ) -> ActionPlan:
+        is_em = bool(cog_ctx.decision.constraints.get("emergency_mode"))
         if llm_available:
             try:
-                ap = await self.brain.plan(cog_ctx)
+                with self._gateway_scope(cycle_id=cycle_id, emergency=is_em):
+                    ap = await self.brain.plan(cog_ctx)
                 await self._record_llm_usage("plan", ap.usage, cycle_id)
                 return ap
             except BrainError as exc:
@@ -624,7 +707,8 @@ class AutonomousLoop:
 
         if llm_available:
             try:
-                eval_res = await self.brain.evaluate(eval_ctx)
+                with self._gateway_scope(cycle_id=cycle_id, emergency=(selected_drive == DriveType.SURVIVAL.value)):
+                    eval_res = await self.brain.evaluate(eval_ctx)
                 await self._record_llm_usage("evaluate", eval_res.usage, cycle_id)
             except BrainError as exc:
                 logger.warning("cycle.evaluate_failed", error=str(exc))
@@ -787,7 +871,16 @@ class AutonomousLoop:
         CYCLE_DURATION.observe(time.perf_counter() - t0)
         logger.info("cycle.finished", cycle_id=str(cycle_id), outcome=outcome, seconds=round(time.perf_counter() - t0, 2))
 
+    def _gateway_scope(self, *, cycle_id: uuid.UUID, emergency: bool = False):
+        if isinstance(self.llm_gateway, LLMGateway):
+            return self.llm_gateway.scope(cycle_id=cycle_id, emergency=emergency)
+        return nullcontext()
+
     async def _record_llm_usage(self, operation: str, usage: Any, cycle_id: uuid.UUID) -> None:
+        # When CognitionBrain runs through LLMGateway, every HTTP attempt (success/retry/failure)
+        # is already persisted atomically by the gateway — avoid double-counting.
+        if isinstance(self.brain, CognitionBrain) and self.llm_gateway is not None:
+            return
         if usage and getattr(usage, "total_tokens", 0) > 0:
             await self.repo.record_usage(
                 category="llm",

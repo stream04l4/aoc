@@ -10,10 +10,17 @@ class LifecycleState(StrEnum):
     ACTIVE = "ACTIVE"
     IDLE = "IDLE"
     SLEEPING = "SLEEPING"
+    THROTTLED = "THROTTLED"
     CRITICAL = "CRITICAL"
     PAUSED = "PAUSED"
     STOPPED = "STOPPED"
     ERROR = "ERROR"
+
+
+class QuotaStatus(StrEnum):
+    QUOTA_OK = "QUOTA_OK"
+    QUOTA_EMERGENCY_ONLY = "QUOTA_EMERGENCY_ONLY"
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
 
 
 class DriveType(StrEnum):

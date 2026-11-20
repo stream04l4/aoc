@@ -7,6 +7,7 @@ runtime:
   cycle_interval_seconds: 60        # pause between active cycles
   idle_sleep_seconds: 300           # sleep when nothing worth doing (scheduled wake-up)
   critical_interval_seconds: 30     # faster cadence in CRITICAL state
+  throttled_max_sleep_seconds: 900  # max sleep slice while waiting for quota_reset_at
   monitor_poll_seconds: 5           # how often WAIT/MONITOR polls running executions
   max_wait_per_cycle_seconds: 120   # loop never blocks longer than this on a task; task keeps running
   max_cycles: 0                     # 0 = unlimited (used by tests to bound runs)
@@ -52,8 +53,15 @@ governance:
     max_task_timeout_seconds: 600
     max_concurrent_tasks: 1
     max_llm_calls_per_cycle: 8
+    max_tokens_per_cycle: 100000
+    max_concurrent_llm_calls: 2
     max_llm_tokens_per_day: 2000000
+    emergency_llm_calls_per_day: 10
+    emergency_llm_tokens_per_day: 100000
+    hard_daily_llm_tokens_cap: 2200000
     max_task_retries: 2
+    circuit_breaker_threshold: 5
+    circuit_breaker_cooldown_seconds: 30.0
 
 logging:
   level: "INFO"

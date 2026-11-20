@@ -38,6 +38,7 @@ class RuntimeSettings(BaseModel):
     cycle_interval_seconds: float = 60
     idle_sleep_seconds: float = 300
     critical_interval_seconds: float = 30
+    throttled_max_sleep_seconds: float = 900
     monitor_poll_seconds: float = 5
     max_wait_per_cycle_seconds: float = 120
     max_cycles: int = 0
@@ -88,8 +89,15 @@ class BudgetSettings(BaseModel):
     max_task_timeout_seconds: int = 600
     max_concurrent_tasks: int = 1
     max_llm_calls_per_cycle: int = 8
+    max_tokens_per_cycle: int = 100_000
+    max_concurrent_llm_calls: int = 2
     max_llm_tokens_per_day: int = 2_000_000
+    emergency_llm_calls_per_day: int = 10
+    emergency_llm_tokens_per_day: int = 100_000
+    hard_daily_llm_tokens_cap: int = 2_200_000
     max_task_retries: int = 2
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_cooldown_seconds: float = 30.0
 
 
 class GovernanceSettings(BaseModel):

@@ -1,9 +1,13 @@
-"""Survival Drive Evaluator (task book 4.1).
+"""Survival Drive Evaluator (task book 4.1 + V2.0 P1-1 decoupling).
 
-Evaluates whether the organism can sustain operation using actual collected
-metrics: resources (disk/memory/load headroom — never raw CPU utilization),
-LLM service availability & latency, external agent availability, resource
-budget headroom, and operational reliability (recent failures / services).
+Evaluates genuine operational & physical survival threats using real collected metrics:
+  - Resource Sufficiency: disk / memory / sustained load per core (never raw CPU %)
+  - Service Availability: LLM health & latency, external agent availability
+  - Operational Health: database/service availability & recent execution reliability
+
+Economic Quota (`budget`) is recorded as an informational dimension for observability
+and explicitly DECOUPLED from Survival CRITICAL so quota exhaustion enters THROTTLED
+instead of causing a Survival CRITICAL <-> BUDGET_DEFERRED spin loop.
 """
 
 from __future__ import annotations
@@ -41,13 +45,21 @@ class SurvivalDriveEvaluator(DriveEvaluator):
         agent_score, agent_notes = self._score_agents(avail_res)
         notes.extend(agent_notes)
 
-        # 4. Budget & cost balance
+        # 4. Budget & cost balance (Economic Quota — informational only, decoupled from Survival CRITICAL)
         budget_score, budget_notes = self._score_budget(ctx.budget, avail_res)
         notes.extend(budget_notes)
 
-        # 5. Service & task reliability
+        # 5. Operational health & reliability (DB + monitored services + recent task failures)
         rel_score, rel_notes = self._score_reliability(ctx.recent_execution_statuses, sys_state, th)
         notes.extend(rel_notes)
+
+        # Optional explicit database health probe
+        db_health_score: float | None = None
+        db_info = sys_state.get("database")
+        if isinstance(db_info, dict) and "ok" in db_info:
+            db_health_score = 1.0 if db_info.get("ok") else 0.0
+            if db_health_score == 0.0:
+                notes.append("core database unavailable")
 
         dimensions: dict[str, float | None] = {
             "resources": resources_score,
@@ -56,28 +68,41 @@ class SurvivalDriveEvaluator(DriveEvaluator):
             "budget": budget_score,
             "reliability": rel_score,
         }
+        if db_health_score is not None:
+            dimensions["database"] = db_health_score
 
-        weights = self.cfg.get(
-            "dimension_weights",
-            {
-                "resources": 0.30,
-                "llm_health": 0.20,
-                "agent_availability": 0.15,
-                "budget": 0.15,
-                "reliability": 0.20,
-            },
+        # Exclude `budget` from survival health weights (P1-1: Economic Quota != Survival Crisis)
+        raw_weights = dict(
+            self.cfg.get(
+                "dimension_weights",
+                {
+                    "resources": 0.35,
+                    "llm_health": 0.25,
+                    "agent_availability": 0.15,
+                    "reliability": 0.25,
+                },
+            )
         )
+        raw_weights.pop("budget", None)
+        if db_health_score is not None and "database" not in raw_weights:
+            raw_weights["database"] = 0.25
+
         satisfaction, data_conf, w_notes = weighted_dimensions(
-            dimensions, weights, default_when_all_missing=0.35
+            dimensions, raw_weights, default_when_all_missing=0.35
         )
         notes.extend(w_notes)
 
         # Blend with observation confidence
         confidence = clamp01(data_conf * max(0.1, obs.confidence)) if data_conf > 0 else 0.0
 
-        # Criticality check: any single vital dimension critically low pulls satisfaction & urgency
+        # Criticality check (P1-1): ONLY true physical/core-service survival threats trigger critical!
+        # Budget exhaustion is NEVER in vital_dims.
         crit_dim_threshold = float(th.get("critical_dimension", 0.15))
-        vital_dims = [d for k in ("resources", "llm_health", "budget") if (d := dimensions.get(k)) is not None]
+        vital_dims = [
+            d
+            for k in ("resources", "llm_health", "database")
+            if (d := dimensions.get(k)) is not None
+        ]
         min_vital = min(vital_dims) if vital_dims else None
         critical = min_vital is not None and min_vital <= crit_dim_threshold
 

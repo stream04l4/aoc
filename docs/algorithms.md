@@ -17,11 +17,11 @@ Each drive produces a `DriveState` with normalized fields in `[0, 1]` (except `t
 
 1. **Survival (`SurvivalDriveEvaluator`)**:
    - `resources`: bottleneck-weighted blend (`0.4 * mean + 0.6 * min`) of nonlinear disk free ratio, memory available ratio, and sustained load per core (raw CPU % is explicitly not used).
-   - `llm_health`: probe reachability and latency band.
+   - `llm_health`: probe reachability and latency band (via `LLMGateway.health_check`).
    - `agent_availability`: `healthy_count / enabled_count`.
-   - `budget`: `min(1 - tasks_used/tasks_limit, 1 - tokens_used/tokens_limit)`.
    - `reliability`: success ratio over recent execution window + monitored service health.
-   - Any vital dimension (`resources`, `llm_health`, `budget`) ≤ `critical_dimension` triggers `critical=True`, caps satisfaction, and sets `urgency=1.0`.
+   - `budget`: recorded as an informational Economic Quota dimension only — explicitly **decoupled from Survival health weights and `critical` triggers (P1-1)** so daily quota exhaustion transitions cleanly into `THROTTLED` until `quota_reset_at` instead of causing a `CRITICAL <-> BUDGET_DEFERRED` spin loop.
+   - Only genuine vital dimensions (`resources`, `llm_health`, `database`) ≤ `critical_dimension` trigger `critical=True`, cap satisfaction, and set `urgency=1.0`.
 2. **Reproduction (`ReproductionDriveEvaluator`)** *(virtual only in V1.0)*:
    - `capability_coverage`, `reusable_skills`, `capability_goals`, `resource_reserve`, `expansion_readiness`.
 3. **Curiosity (`CuriosityDriveEvaluator`)**:

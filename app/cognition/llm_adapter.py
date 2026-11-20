@@ -87,6 +87,8 @@ class OpenAICompatibleLLMAdapter:
         system_prompt: str,
         user_payload: dict[str, Any],
         schema_cls: type[T],
+        *,
+        http_call_fn: Callable[[str, list[dict[str, str]], int], Awaitable[tuple[str, LLMUsage]]] | None = None,
     ) -> T:
         """Request JSON conforming to ``schema_cls`` with bounded retries on schema error."""
         schema_json = json.dumps(schema_cls.model_json_schema(), ensure_ascii=False)
@@ -109,7 +111,10 @@ class OpenAICompatibleLLMAdapter:
         accum_usage = LLMUsage(model=self.settings.model)
 
         for attempt in range(1, max_attempts + 1):
-            raw_text, call_usage = await self._call_api(operation, messages)
+            if http_call_fn is not None:
+                raw_text, call_usage = await http_call_fn(operation, messages, attempt)
+            else:
+                raw_text, call_usage = await self.call_chat_completions(operation, messages)
             accum_usage.prompt_tokens += call_usage.prompt_tokens
             accum_usage.completion_tokens += call_usage.completion_tokens
             accum_usage.total_tokens += call_usage.total_tokens
@@ -152,6 +157,10 @@ class OpenAICompatibleLLMAdapter:
         raise BrainSchemaError(
             f"Operation '{operation}' failed schema validation after {max_attempts} attempt(s): {last_error}"
         )
+
+    async def call_chat_completions(self, operation: str, messages: list[dict[str, str]]) -> tuple[str, LLMUsage]:
+        """Execute a single OpenAI-compatible /chat/completions HTTP request (invoked via LLMGateway)."""
+        return await self._call_api(operation, messages)
 
     async def _call_api(self, operation: str, messages: list[dict[str, str]]) -> tuple[str, LLMUsage]:
         url = self.settings.base_url.rstrip("/") + "/chat/completions"

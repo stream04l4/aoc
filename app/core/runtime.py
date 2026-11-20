@@ -7,8 +7,8 @@ from typing import Any
 
 from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
+from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import BrainInterface
-from app.cognition.llm_adapter import OpenAICompatibleLLMAdapter
 from app.core.config import Settings, get_agent_config, get_drive_config, get_policy_config, get_settings
 from app.core.lifecycle import LifecycleManager
 from app.core.loop import AutonomousLoop
@@ -42,6 +42,7 @@ class OrganismRuntime:
         policy_config: dict[str, Any] | None = None,
         auto_load_agents: bool = True,
         llm_probe_fn=None,
+        llm_gateway: LLMGatewayInterface | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self._owns_db = db is None
@@ -51,13 +52,23 @@ class OrganismRuntime:
         self.organism_id: uuid.UUID | None = None
         self.lifecycle: LifecycleManager | None = None
 
-        # Perception
+        # Unified LLM Gateway (P1-1: all LLM calls, health probes, and external token accounting)
+        self.llm_gateway: LLMGatewayInterface = llm_gateway or LLMGateway(
+            llm_settings=self.settings.llm,
+            budget_settings=self.settings.governance.budget,
+            repo=self.repo,
+        )
+
+        # Perception (shares LLMGateway.health_check when llm_probe is enabled)
+        effective_llm_probe = llm_probe_fn
+        if effective_llm_probe is None and self.settings.perception.llm_probe:
+            effective_llm_probe = self.llm_gateway.health_check
         self.perception = SensorManager(repo=self.repo)
         self.system_sensor = SystemSensor(
             self.settings.perception,
             self.settings.llm,
             repo=self.repo,
-            llm_probe_fn=llm_probe_fn,
+            llm_probe_fn=effective_llm_probe,
         )
         self.agent_sensor = AgentSensor(self.repo)
         self.env_sensor = EnvironmentSensor(self.repo)
@@ -69,7 +80,7 @@ class OrganismRuntime:
         self.drives = DriveEngine(config=drive_config if drive_config is not None else get_drive_config())
 
         # Brain
-        self.brain: BrainInterface = brain or CognitionBrain(OpenAICompatibleLLMAdapter(self.settings.llm))
+        self.brain: BrainInterface = brain or CognitionBrain(self.llm_gateway)
 
         # Governance
         self.governance = GovernanceManager(
@@ -78,15 +89,16 @@ class OrganismRuntime:
             policy_cfg=policy_config if policy_config is not None else get_policy_config(),
         )
 
-        # Agents & Orchestration
+        # Agents & Orchestration (inject llm_settings explicitly — no hidden global get_settings())
         self.registry = registry or AgentRegistry(repo=self.repo)
         if registry is None and auto_load_agents:
-            self.registry.load_from_config(get_agent_config())
+            self.registry.load_from_config(get_agent_config(), llm_settings=self.settings.llm)
         self.orchestrator = AgentOrchestrator(
             registry=self.registry,
             governance=self.governance,
             repo=self.repo,
             max_retries=self.settings.governance.budget.max_task_retries,
+            llm_gateway=self.llm_gateway,
         )
 
         # Memory
@@ -129,6 +141,7 @@ class OrganismRuntime:
             registry=self.registry,
             orchestrator=self.orchestrator,
             memory=self.memory,
+            llm_gateway=self.llm_gateway,
         )
         recovery = await self.loop.recover()
         self.scheduler = OrganismScheduler(self.loop, self.lifecycle, self.settings.runtime)

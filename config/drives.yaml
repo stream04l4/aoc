@@ -26,11 +26,11 @@ drives:
     estimated_cost: 0.2
     estimated_risk: 0.35
     dimension_weights:
-      resources: 0.30
-      llm_health: 0.20
+      resources: 0.35
+      llm_health: 0.25
       agent_availability: 0.15
-      budget: 0.15
-      reliability: 0.20
+      reliability: 0.25
+      # budget is tracked as Economic Quota (P1-1), intentionally decoupled from Survival health/CRITICAL
     thresholds:
       disk_free_critical: 0.05   # free ratio at which disk score hits 0
       disk_free_healthy: 0.20    # free ratio at which disk score hits 1

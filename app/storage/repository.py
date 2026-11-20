@@ -763,6 +763,47 @@ class StateRepository:
             ).one()
             return {"count": int(row[0]), "amount": float(row[1]), "seconds": float(row[2])}
 
+    async def oldest_usage_since(self, category: str, since: datetime) -> datetime | None:
+        async with self.db.session() as s:
+            ts = (
+                await s.execute(
+                    select(func.min(ResourceUsage.created_at)).where(
+                        ResourceUsage.category == category, ResourceUsage.created_at >= since
+                    )
+                )
+            ).scalar_one_or_none()
+            if ts is not None and ts.tzinfo is None:
+                return ts.replace(tzinfo=timezone.utc)
+            return ts
+
+    async def emergency_llm_usage_since(self, since: datetime) -> dict:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(ResourceUsage.amount, ResourceUsage.details).where(
+                        ResourceUsage.category == "llm", ResourceUsage.created_at >= since
+                    )
+                )
+            ).all()
+            count = 0
+            tokens = 0.0
+            for amount, details in rows:
+                if isinstance(details, dict) and details.get("emergency") is True:
+                    count += 1
+                    tokens += float(amount or 0.0)
+            return {"count": count, "amount": tokens}
+
+    async def llm_usage_for_cycle(self, cycle_id: uuid.UUID) -> dict:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(func.count(ResourceUsage.id), func.coalesce(func.sum(ResourceUsage.amount), 0.0)).where(
+                        ResourceUsage.category == "llm", ResourceUsage.cycle_id == cycle_id
+                    )
+                )
+            ).one()
+            return {"calls": int(row[0]), "tokens": float(row[1])}
+
     # ── system config (operator-owned) ──────────────────────────────────────
     async def get_config(self, key: str) -> dict | None:
         async with self.db.session() as s:

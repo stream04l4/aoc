@@ -24,6 +24,7 @@ from app.agents.base import (
     sanitize_env,
     terminate_process_group,
 )
+from app.core.config import LLMSettings
 from app.core.enums import ExecutionStatus
 from app.perception.interfaces import utcnow
 
@@ -44,10 +45,12 @@ class CodexAdapter(AgentInterface):
         cap: AgentCapability,
         binary: str = "codex",
         options: dict[str, Any] | None = None,
+        llm_settings: LLMSettings | None = None,
     ) -> None:
         self._cap = cap
         self.binary = binary
         self.options = dict(options or {})
+        self._llm_settings = llm_settings
         self._running: dict[str, _RunningProc] = {}
         self._finished: dict[str, AgentStatus] = {}
 
@@ -127,11 +130,19 @@ class CodexAdapter(AgentInterface):
         ]
         extra_env: dict[str, str] = {}
         if self.options.get("use_aoc_llm"):
-            from app.core.config import get_settings
-
-            llm_cfg = get_settings().llm
-            base_url = str(self.options.get("base_url") or llm_cfg.base_url)
-            model_name = str(self.options.get("model") or llm_cfg.model)
+            llm_cfg = self._llm_settings
+            base_url = str(self.options.get("base_url") or (llm_cfg.base_url if llm_cfg else ""))
+            model_name = str(self.options.get("model") or (llm_cfg.model if llm_cfg else ""))
+            if not base_url or not model_name:
+                return AgentExecution(
+                    execution_id=exec_id,
+                    task_id=task.task_id,
+                    agent_id=self._cap.agent_id,
+                    status=ExecutionStatus.FAILED.value,
+                    started_at=started,
+                    completed_at=utcnow(),
+                    error="CodexAdapter use_aoc_llm=true requires injected llm_settings or options.base_url/model",
+                )
             cmd.extend(
                 [
                     "-c",
@@ -148,7 +159,7 @@ class CodexAdapter(AgentInterface):
                     model_name,
                 ]
             )
-            if llm_cfg.api_key:
+            if llm_cfg and llm_cfg.api_key:
                 extra_env["CODEX_CUSTOM_API_KEY"] = llm_cfg.api_key.get_secret_value()
         else:
             model = self.options.get("model")

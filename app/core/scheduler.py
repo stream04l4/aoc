@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.core.config import RuntimeSettings
 from app.core.enums import LifecycleState
@@ -71,6 +71,14 @@ class OrganismScheduler:
 
                 if self.lifecycle.state == LifecycleState.CRITICAL:
                     sleep_s = self.settings.critical_interval_seconds
+                elif outcome == "BUDGET_EXHAUSTED" or self.lifecycle.state == LifecycleState.THROTTLED:
+                    sleep_s = self._compute_throttle_sleep(result)
+                    wake_at = utcnow() + timedelta(seconds=sleep_s)
+                    await self.lifecycle.transition(
+                        LifecycleState.THROTTLED,
+                        reason=f"throttled {round(sleep_s, 1)}s awaiting quota reset",
+                        next_wake_at=wake_at,
+                    )
                 elif outcome == "IDLE":
                     sleep_s = self.settings.idle_sleep_seconds
                     await self.lifecycle.transition(
@@ -98,3 +106,20 @@ class OrganismScheduler:
                 await self.lifecycle.wait_for_wake(timeout_seconds=backoff)
 
         logger.info("scheduler.exited", cycles_executed=self._cycles_executed)
+
+    def _compute_throttle_sleep(self, cycle_result: dict) -> float:
+        max_slice = max(1.0, float(self.settings.throttled_max_sleep_seconds))
+        sc = cycle_result.get("state_changes") or {}
+        reset_raw = sc.get("quota_reset_at")
+        if isinstance(reset_raw, str):
+            try:
+                reset_dt = datetime.fromisoformat(reset_raw)
+                if reset_dt.tzinfo is None:
+                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+                delta = (reset_dt - utcnow()).total_seconds()
+                if delta > 0:
+                    return min(max_slice, max(1.0, delta))
+                return 1.0
+            except ValueError:
+                pass
+        return min(max_slice, max(float(self.settings.idle_sleep_seconds), 60.0))

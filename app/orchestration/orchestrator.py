@@ -24,6 +24,7 @@ from typing import Any
 
 from app.agents.base import AgentExecution, AgentTask
 from app.agents.registry import AgentRegistry
+from app.cognition.gateway import LLMGatewayInterface
 from app.cognition.interfaces import ActionPlan, VerificationSpec
 from app.core.enums import ExecutionStatus, GoalStatus, PermissionLevel, TaskStatus
 from app.governance.interfaces import GovernanceInterface, PolicyVerdict
@@ -99,12 +100,14 @@ class AgentOrchestrator:
         repo: StateRepository,
         verifier: ResultVerifier | None = None,
         max_retries: int = 2,
+        llm_gateway: LLMGatewayInterface | None = None,
     ) -> None:
         self.registry = registry
         self.governance = governance
         self.repo = repo
         self.verifier = verifier or ResultVerifier()
         self.max_retries = max(0, int(max_retries))
+        self.llm_gateway = llm_gateway
         # In-process handles for currently running background executions: task_id -> (exec_id, asyncio.Task)
         self._inflight: dict[str, tuple[str, asyncio.Task[AgentExecution]]] = {}
         self._approval_locks: dict[str, asyncio.Lock] = {}
@@ -558,6 +561,41 @@ class AgentOrchestrator:
             resource_usage=execution.resource_usage,
             verification=verification.model_dump(mode="json"),
         )
+
+        # P1-1 / T9: attribute external agent tokens (e.g. Codex sharing AOC vLLM) to unified LLM ledger
+        res_usage = execution.resource_usage or {}
+        in_tok = int(res_usage.get("input_tokens") or res_usage.get("prompt_tokens") or 0)
+        out_tok = int(res_usage.get("output_tokens") or res_usage.get("completion_tokens") or 0)
+        tot_tok = int(res_usage.get("total_tokens") or (in_tok + out_tok))
+        if tot_tok > 0:
+            cycle_uuid = uuid.UUID(task_row["cycle_id"]) if task_row.get("cycle_id") else None
+            wall_s = float(res_usage.get("wall_seconds", 0.0))
+            if self.llm_gateway is not None:
+                await self.llm_gateway.record_external_usage(
+                    source=execution.agent_id,
+                    total_tokens=tot_tok,
+                    prompt_tokens=in_tok,
+                    completion_tokens=out_tok,
+                    seconds=wall_s,
+                    cycle_id=cycle_uuid,
+                    task_id=task_uuid,
+                    details={"execution_id": execution.execution_id},
+                )
+            else:
+                await self.repo.record_usage(
+                    category="llm",
+                    amount=float(tot_tok),
+                    seconds=wall_s,
+                    details={
+                        "source": execution.agent_id,
+                        "external_agent": True,
+                        "prompt_tokens": in_tok,
+                        "completion_tokens": out_tok,
+                        "execution_id": execution.execution_id,
+                    },
+                    cycle_id=cycle_uuid,
+                    task_id=task_uuid,
+                )
 
         if execution.status == ExecutionStatus.SUCCEEDED.value and verification.passed:
             outcome = {

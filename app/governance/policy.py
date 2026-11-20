@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.cognition.interfaces import ActionPlan
 from app.core.config import GovernanceSettings, get_policy_config
-from app.core.enums import DriveType, PermissionLevel, TaskStatus
+from app.core.enums import DriveType, PermissionLevel, QuotaStatus, TaskStatus
 from app.governance.interfaces import BudgetStatus, GovernanceInterface, PolicyVerdict
 from app.observability.metrics import POLICY_VERDICTS
+from app.perception.interfaces import utcnow
 from app.storage.repository import StateRepository, day_start
 
 
@@ -27,10 +29,12 @@ class GovernanceManager(GovernanceInterface):
         self.policy = policy_cfg if policy_cfg is not None else get_policy_config()
         self.workspace_root = Path(settings.workspace_root).resolve()
 
-    async def check_budget(self) -> BudgetStatus:
-        since = day_start()
+    async def check_budget(self, now: datetime | None = None) -> BudgetStatus:
+        ref_now = now or utcnow()
+        since = day_start(ref_now)
         task_usage = await self.repo.usage_since("agent_task", since)
         llm_usage = await self.repo.usage_since("llm", since)
+        em_usage = await self.repo.emergency_llm_usage_since(since)
         active = await self.repo.list_tasks(
             statuses=[TaskStatus.DISPATCHED.value, TaskStatus.RUNNING.value], limit=50
         )
@@ -38,22 +42,54 @@ class GovernanceManager(GovernanceInterface):
         b = self.settings.budget
         tasks_used = int(task_usage["count"])
         tokens_used = int(llm_usage["amount"])
+        em_calls = int(em_usage["count"])
+        em_tokens = int(em_usage["amount"])
+        hard_cap = max(b.max_llm_tokens_per_day, b.hard_daily_llm_tokens_cap)
         running = len(active)
 
         reasons: list[str] = []
-        if tasks_used >= b.max_agent_tasks_per_day:
+        reset_candidates: list[datetime] = []
+        tasks_exhausted = tasks_used >= b.max_agent_tasks_per_day
+        tokens_exhausted = tokens_used >= b.max_llm_tokens_per_day
+
+        if tasks_exhausted:
             reasons.append(f"daily agent task limit reached ({tasks_used}/{b.max_agent_tasks_per_day})")
-        if tokens_used >= b.max_llm_tokens_per_day:
+            oldest_task = await self.repo.oldest_usage_since("agent_task", since)
+            reset_candidates.append((oldest_task + timedelta(hours=24)) if oldest_task else (ref_now + timedelta(hours=24)))
+        if tokens_exhausted:
             reasons.append(f"daily LLM token limit reached ({tokens_used}/{b.max_llm_tokens_per_day})")
+            oldest_llm = await self.repo.oldest_usage_since("llm", since)
+            reset_candidates.append((oldest_llm + timedelta(hours=24)) if oldest_llm else (ref_now + timedelta(hours=24)))
         if running >= b.max_concurrent_tasks:
             reasons.append(f"max concurrent tasks reached ({running}/{b.max_concurrent_tasks})")
 
+        quota_reset_at = max(reset_candidates) if reset_candidates else None
+
+        if not tasks_exhausted and not tokens_exhausted:
+            quota_status = QuotaStatus.QUOTA_OK.value
+        else:
+            emergency_headroom = (
+                tokens_used < hard_cap
+                and em_calls < b.emergency_llm_calls_per_day
+                and em_tokens < b.emergency_llm_tokens_per_day
+            )
+            quota_status = (
+                QuotaStatus.QUOTA_EMERGENCY_ONLY.value if emergency_headroom else QuotaStatus.QUOTA_EXHAUSTED.value
+            )
+
         return BudgetStatus(
             allowed=len(reasons) == 0,
+            quota_status=quota_status,
+            quota_reset_at=quota_reset_at,
             tasks_used_today=tasks_used,
             tasks_limit_per_day=b.max_agent_tasks_per_day,
             tokens_used_today=tokens_used,
             tokens_limit_per_day=b.max_llm_tokens_per_day,
+            emergency_llm_calls_used_today=em_calls,
+            emergency_llm_calls_limit_per_day=b.emergency_llm_calls_per_day,
+            emergency_llm_tokens_used_today=em_tokens,
+            emergency_llm_tokens_limit_per_day=b.emergency_llm_tokens_per_day,
+            hard_daily_llm_tokens_cap=hard_cap,
             running_tasks=running,
             max_concurrent_tasks=b.max_concurrent_tasks,
             reason="; ".join(reasons) if reasons else "within budget",

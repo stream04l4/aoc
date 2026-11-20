@@ -216,13 +216,16 @@ def test_14_survival_zero_healthy_agents_lowers_score():
     assert st.satisfaction < 0.90
 
 
-def test_15_survival_budget_exhausted_triggers_critical():
+def test_15_survival_budget_exhausted_does_not_trigger_critical():
+    # V2.0 P1-1 (T1): Economic Quota exhaustion is decoupled from Survival CRITICAL
     engine = DriveEngine()
     ctx = healthy_ctx(budget={"tasks_used": 20, "tasks_limit": 20, "tokens_used": 100, "tokens_limit": 100000})
     st = engine.compute_states(ctx, {})["survival"]
     assert st.dimensions["budget"] == 0.0
-    assert st.satisfaction <= 0.15
-    assert st.urgency == 1.0
+    assert st.satisfaction > 0.80
+    assert st.urgency < 0.60
+    decision = engine.arbitrate({"survival": st}, now=T0)
+    assert not decision.constraints.get("emergency_mode")
 
 
 def test_16_survival_recent_failures_lower_reliability():
