@@ -13,7 +13,8 @@ agents:
     experimental: false
     options:
       sandbox: "workspace-write"   # danger-full-access is refused by the adapter
-      model: null                  # null -> codex default from ~/.codex/config.toml
+      use_aoc_llm: true            # route codex exec to AOC's OpenAI-compatible vLLM endpoint (wire_api=responses)
+      model: null                  # null -> uses AOC_LLM__MODEL when use_aoc_llm=true, else codex default
 
   - agent_id: hermes
     name: "Hermes Agent"
