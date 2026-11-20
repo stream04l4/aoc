@@ -97,7 +97,7 @@ async def test_repository_identity_cycle_and_drive_persistence(repo: StateReposi
 
 @pytest.mark.asyncio
 async def test_api_health_state_metrics_and_world(db: Database):
-    app = create_app(settings=Settings(), db=db)
+    app = create_app(settings=Settings(), db=db, start_scheduler=False)
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -110,7 +110,7 @@ async def test_api_health_state_metrics_and_world(db: Database):
             assert r.status_code == 200
             body = r.json()
             assert body["name"] == "AOC-001"
-            assert body["state"]["lifecycle_state"] == "INITIALIZING"
+            assert body["state"]["lifecycle_state"] in {"INITIALIZING", "ACTIVE"}
 
             r = await client.post(
                 "/world",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -53,6 +53,13 @@ class DriveState(BaseModel):
     @classmethod
     def _clamp_trend(cls, v: float) -> float:
         return clamp_signed(v)
+
+    @field_validator("updated_at", "last_satisfied_at")
+    @classmethod
+    def _ensure_utc(cls, v: datetime | None) -> datetime | None:
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
     @model_validator(mode="after")
     def _deficit_rule(self) -> "DriveState":

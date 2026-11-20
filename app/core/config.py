@@ -69,6 +69,9 @@ class MemorySettings(BaseModel):
     letta_token: SecretStr | None = None
     agent_name: str = "aoc-organism-memory"
     timeout_seconds: float = 60
+    embedding_endpoint: str = "http://aoc:9200/v1"
+    embedding_model: str = "aoc-local-embed-1024"
+    embedding_dim: int = 1024
 
 
 class PerceptionSettings(BaseModel):

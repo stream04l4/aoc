@@ -11,8 +11,13 @@ Evaluates knowledge exploration and learning progress across six dimensions:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import math
 from typing import Any
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 from app.core.enums import DriveType
 from app.drives.interfaces import DriveContext, DriveEvaluation, DriveEvaluator, clamp01
@@ -74,7 +79,7 @@ class CuriosityDriveEvaluator(DriveEvaluator):
         if ctx.last_information_gain is not None:
             decay = 1.0
             if ctx.last_information_gain_at is not None:
-                dt_hours = max(0.0, (ctx.now - ctx.last_information_gain_at).total_seconds() / 3600.0)
+                dt_hours = max(0.0, (_ensure_utc(ctx.now) - _ensure_utc(ctx.last_information_gain_at)).total_seconds() / 3600.0)
                 decay = math.pow(0.5, dt_hours / ig_half_life)
             ig_score = clamp01(clamp01(ctx.last_information_gain) * decay)
 
@@ -82,7 +87,7 @@ class CuriosityDriveEvaluator(DriveEvaluator):
         learn_half_life = max(0.5, float(targets.get("learning_half_life_hours", 12)))
         learning_score: float | None = None
         if ctx.last_learning_at is not None:
-            dt_hours = max(0.0, (ctx.now - ctx.last_learning_at).total_seconds() / 3600.0)
+            dt_hours = max(0.0, (_ensure_utc(ctx.now) - _ensure_utc(ctx.last_learning_at)).total_seconds() / 3600.0)
             learning_score = clamp01(math.pow(0.5, dt_hours / learn_half_life))
 
         dimensions: dict[str, float | None] = {
