@@ -1,0 +1,46 @@
+# Governance policy. The organism (and its brain) cannot modify this file at runtime.
+permission_levels:
+  L0: "read-only operations"
+  L1: "restricted writes inside an isolated task workspace"
+  L2: "high-risk operations - require human approval"
+  L3: "core system / infrastructure modification - forbidden for autonomous execution"
+
+# Agent sandbox mode allowed per permission level
+level_sandbox:
+  L0: "read-only"
+  L1: "workspace-write"
+
+# Keyword/pattern rules applied to plan objective+description (case-insensitive).
+# A match escalates the plan to at least the given level.
+escalation_rules:
+  - level: L3
+    reason: "infrastructure / cloud resource creation"
+    patterns: ["create (a )?(cloud )?server", "provision", "launch instance", "ec2", "terraform apply", "buy ", "purchase", "billing"]
+  - level: L3
+    reason: "privilege / security policy modification"
+    patterns: ["sudo ", "chmod 777", "chown root", "visudo", "/etc/sudoers", "disable (the )?(firewall|ufw)", "modify (the )?(security|safety) polic", "policy.yaml", "governance"]
+  - level: L3
+    reason: "credential exfiltration"
+    patterns: ["(export|exfiltrat|steal|dump|print|read|cat|copy|send|upload|extract).{0,40}(api[_ -]?keys?|secrets?|passwords?|private keys?|credentials?|access tokens?)", "\\.env\\b", "\\.ssh/", "id_rsa", "\\.pem\\b", "auth\\.json", "\\.git-credentials"]
+  - level: L3
+    reason: "self-replication / instance cloning"
+    patterns: ["replicate (yourself|itself|the organism)", "clone (yourself|itself|the organism)", "spawn (a )?new (instance|organism)", "copy (your|its) identity"]
+  - level: L3
+    reason: "core memory / database destruction"
+    patterns: ["drop (table|database)", "truncate table", "delete .{0,30}(core )?memor(y|ies)", "rm -rf /(\\s|$)", "aoc (database|db)", "letta (database|db)"]
+  - level: L3
+    reason: "disable shutdown / pause / resource limits"
+    patterns: ["disable (shutdown|pause|budget|limit)", "remove (the )?budget", "ignore (the )?limit"]
+  - level: L2
+    reason: "system service or package changes"
+    patterns: ["systemctl", "apt(-get)? install", "pip install", "npm install -g", "restart (the )?service", "kill ", "crontab", "docker "]
+  - level: L2
+    reason: "deleting files outside workspace"
+    patterns: ["rm -rf", "delete files", "/home/ubuntu/(?!aoc-workspaces)"]
+
+# Hard-forbidden capability requests from the reproduction drive (task book 4.2 / 11)
+reproduction_forbidden:
+  - "create server"
+  - "replicate"
+  - "clone identity"
+  - "increase permission"

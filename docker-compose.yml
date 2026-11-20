@@ -1,0 +1,51 @@
+services:
+  aoc-postgres:
+    image: postgres:16-alpine
+    container_name: aoc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aoc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aoc_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-aoc}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - aoc_pg_data:/var/lib/postgresql/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aoc} -d ${POSTGRES_DB:-aoc}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  aoc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aoc-core
+    restart: unless-stopped
+    depends_on:
+      aoc-postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AOC_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-aoc}:${POSTGRES_PASSWORD:-aoc_local_dev}@aoc-postgres:5432/${POSTGRES_DB:-aoc}
+      AOC_MEMORY__LETTA_BASE_URL: http://aoc-letta:8283
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - ./config:/app/config:ro
+      - ${AOC_WORKSPACE_ROOT:-/home/ubuntu/aoc-workspaces}:/home/ubuntu/aoc-workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9200/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  aoc_pg_data:

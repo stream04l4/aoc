@@ -1,0 +1,88 @@
+# Drive engine parameters. All weights/thresholds live here (task book 4.5: no hard-coding).
+# Normalized scores are clamped to [0,1]. `trend` is a signed rate in [-1,1] (documented exception).
+
+dynamics:
+  unmet_threshold: 0.35          # deficit above this counts as "unmet" for persistence
+  persistence_growth: 0.15       # per-cycle growth (scaled by deficit) while unmet
+  persistence_decay: 0.6         # multiplicative decay per cycle once met
+  trend_smoothing: 0.5           # EMA factor for trend (0 = no smoothing)
+
+arbitration:
+  idle_threshold: 0.12           # if every priority is below this -> IDLE (no forced tasks)
+  persistence_gain: 0.6          # priority *= (1 + gain * persistence)
+  inhibition_strength: 0.6       # just-satisfied drive is suppressed by up to this fraction
+  inhibition_tau_seconds: 1800   # suppression decays with this time constant
+  cost_penalty: 0.10
+  risk_penalty: 0.15
+  survival_critical_threshold: 0.30   # survival satisfaction below this -> emergency override
+  min_confidence: 0.2            # drives with confidence below this cannot win (insufficient data)
+
+drives:
+  survival:
+    weight: 1.3
+    base_urgency: 0.3
+    urgency_deficit_gain: 0.7
+    urgency_trend_gain: 0.5      # falling satisfaction raises urgency
+    estimated_cost: 0.2
+    estimated_risk: 0.35
+    dimension_weights:
+      resources: 0.30
+      llm_health: 0.20
+      agent_availability: 0.15
+      budget: 0.15
+      reliability: 0.20
+    thresholds:
+      disk_free_critical: 0.05   # free ratio at which disk score hits 0
+      disk_free_healthy: 0.20    # free ratio at which disk score hits 1
+      mem_avail_critical: 0.05
+      mem_avail_healthy: 0.25
+      load_per_core_ok: 1.0      # sustained load/core below this is fine
+      load_per_core_bad: 3.0     # sustained load/core at which cpu headroom score hits 0
+      llm_latency_ok_ms: 5000
+      llm_latency_bad_ms: 60000
+      failure_window: 10         # last N executions considered for reliability
+      critical_dimension: 0.15   # any single dimension below this -> urgency 1.0
+
+  reproduction:
+    weight: 0.7
+    base_urgency: 0.1
+    urgency_deficit_gain: 0.5
+    urgency_trend_gain: 0.2
+    estimated_cost: 0.4
+    estimated_risk: 0.2
+    dimension_weights:
+      capability_coverage: 0.30
+      reusable_skills: 0.25
+      capability_goals: 0.15
+      resource_reserve: 0.15
+      expansion_readiness: 0.15
+    targets:
+      skills: 10                 # reusable procedural skills considered "fully stocked"
+      capability_goals_window: 5 # completed capability goals considered "fully satisfied" (rolling window)
+    desired_capabilities:        # capabilities the organism wants to have (virtual reproduction target)
+      - coding
+      - research
+      - repository_analysis
+      - system_diagnosis
+      - knowledge_summarization
+
+  curiosity:
+    weight: 0.9
+    base_urgency: 0.15
+    urgency_deficit_gain: 0.6
+    urgency_trend_gain: 0.2
+    estimated_cost: 0.3
+    estimated_risk: 0.1
+    dimension_weights:
+      knowledge_gaps: 0.25
+      unknown_information: 0.20
+      exploration_completion: 0.15
+      new_knowledge: 0.15
+      information_gain: 0.10
+      learning_progress: 0.15
+    targets:
+      max_gaps: 5                # this many open gaps -> gap score 0
+      max_unknown: 5
+      new_knowledge_window: 5    # semantic memories in window considered "fully fed"
+      learning_half_life_hours: 12
+      information_gain_half_life_hours: 24

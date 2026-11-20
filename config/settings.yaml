@@ -1,0 +1,57 @@
+# AOC runtime settings. Secrets (API keys, DB password) come from environment / .env only.
+organism:
+  name: "AOC-001"
+  version: "1.0.0"
+
+runtime:
+  cycle_interval_seconds: 60        # pause between active cycles
+  idle_sleep_seconds: 300           # sleep when nothing worth doing (scheduled wake-up)
+  critical_interval_seconds: 30     # faster cadence in CRITICAL state
+  monitor_poll_seconds: 5           # how often WAIT/MONITOR polls running executions
+  max_wait_per_cycle_seconds: 120   # loop never blocks longer than this on a task; task keeps running
+  max_cycles: 0                     # 0 = unlimited (used by tests to bound runs)
+
+api:
+  host: "0.0.0.0"
+  port: 9200
+
+database:
+  # Full URL comes from AOC_DATABASE__URL; this is only the local default.
+  url: "postgresql+asyncpg://aoc:aoc@127.0.0.1:5433/aoc"
+  echo: false
+
+llm:
+  base_url: "http://127.0.0.1:8000/v1"
+  model: "Qwen/Qwen3.8-27B-FP8"
+  temperature: 0.3
+  max_tokens: 4096
+  timeout_seconds: 180
+  max_schema_retries: 2
+  # api_key: from AOC_LLM__API_KEY
+
+memory:
+  provider: "letta"                 # letta | none
+  letta_base_url: "http://127.0.0.1:8283"
+  agent_name: "aoc-organism-memory"
+  timeout_seconds: 60
+
+perception:
+  monitored_services: []            # e.g. [{name: "stock-web", url: "http://127.0.0.1:9090/"}]
+  disk_paths: ["/"]
+  llm_probe: true
+
+governance:
+  # Default max permission an autonomous task may receive without human approval.
+  auto_approve_max_level: "L1"
+  workspace_root: "/home/ubuntu/aoc-workspaces"
+  budget:
+    max_agent_tasks_per_day: 20
+    max_task_timeout_seconds: 600
+    max_concurrent_tasks: 1
+    max_llm_calls_per_cycle: 8
+    max_llm_tokens_per_day: 2000000
+    max_task_retries: 2
+
+logging:
+  level: "INFO"
+  json: true

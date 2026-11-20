@@ -1,0 +1,46 @@
+# Agent declarations. Capabilities must reflect what is actually installed/configured;
+# the registry probes each binary at startup and disables agents that fail the probe.
+agents:
+  - agent_id: codex
+    name: "OpenAI Codex CLI"
+    agent_type: cli
+    adapter: codex
+    binary: "codex"
+    capabilities: [coding, debugging, code_review, terminal, repository_analysis, system_diagnosis]
+    supported_modes: [read-only, workspace-write]
+    max_concurrency: 1
+    enabled: true
+    experimental: false
+    options:
+      sandbox: "workspace-write"   # danger-full-access is refused by the adapter
+      model: null                  # null -> codex default from ~/.codex/config.toml
+
+  - agent_id: hermes
+    name: "Hermes Agent"
+    agent_type: cli
+    adapter: hermes
+    binary: "hermes"
+    capabilities: [research, general_task, knowledge_summarization]
+    supported_modes: [oneshot]
+    max_concurrency: 1
+    enabled: true
+    experimental: true             # no native status/cancel API; managed via subprocess
+    options:
+      toolsets: "web,file"
+      max_turns: 30
+      safe_mode: true
+      ignore_user_config: false    # needs the user's provider config for the LLM
+
+  # Generic extension point for other CLI agents (e.g. DSH) - disabled until verified.
+  - agent_id: generic-dsh
+    name: "DSH (unverified)"
+    agent_type: cli
+    adapter: generic_cli
+    binary: "dsh"
+    capabilities: []
+    supported_modes: []
+    max_concurrency: 1
+    enabled: false
+    experimental: true
+    options:
+      command_template: []
