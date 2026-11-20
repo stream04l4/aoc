@@ -124,6 +124,21 @@ class LifecycleSettings(BaseModel):
     retry_backoff_seconds: float = 1.0
 
 
+class RunnerSettings(BaseModel):
+    enabled: bool = False
+    runner_id: str = "host-runner-1"
+    socket_path: str = "/run/aoc-runner/runner.sock"
+    state_dir: str = "/var/lib/aoc-runner"
+    workspace_root: str = "/home/ubuntu/aoc-workspaces"
+    cgroup_memory_max: str = "2G"
+    cgroup_pids_max: int = 128
+    heartbeat_interval_seconds: float = 15.0
+    heartbeat_timeout_seconds: float = 60.0
+    request_timeout_seconds: float = 30.0
+    systemd_unit: str | None = None
+    auth_token: SecretStr | None = None
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -153,6 +168,7 @@ class Settings(BaseSettings):
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     lifecycle: LifecycleSettings = Field(default_factory=LifecycleSettings)
+    runner: RunnerSettings = Field(default_factory=RunnerSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -190,3 +206,8 @@ def get_policy_config() -> dict[str, Any]:
 @lru_cache
 def get_lifecycle_config() -> dict[str, Any]:
     return load_yaml("lifecycle.yaml")
+
+
+@lru_cache
+def get_runner_config() -> dict[str, Any]:
+    return load_yaml("runner.yaml")

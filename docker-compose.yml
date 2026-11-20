@@ -33,10 +33,13 @@ services:
     environment:
       AOC_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-aoc}:${POSTGRES_PASSWORD:-aoc_local_dev}@aoc-postgres:5432/${POSTGRES_DB:-aoc}
       AOC_MEMORY__LETTA_BASE_URL: http://aoc-letta:8283
+      AOC_RUNNER__ENABLED: ${AOC_RUNNER__ENABLED:-true}
+      AOC_RUNNER__SOCKET_PATH: /run/aoc-runner/runner.sock
     ports:
       - "127.0.0.1:9200:9200"
     volumes:
       - ./config:/app/config:ro
+      - /run/aoc-runner:/run/aoc-runner
       - ${AOC_WORKSPACE_ROOT:-/home/ubuntu/aoc-workspaces}:/home/ubuntu/aoc-workspaces
     extra_hosts:
       - "host.docker.internal:host-gateway"

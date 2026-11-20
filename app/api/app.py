@@ -187,6 +187,44 @@ def create_app(
             await rt.outbox.dispatch_once()
         return {"task_id": task_id, "status": "CANCELLED"}
 
+    @app.post("/v2/tasks/{task_id}/reconcile")
+    async def reconcile_task_v2(
+        task_id: str, _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
+        rt = _rt()
+        try:
+            t_uuid = uuid.UUID(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid task_id UUID") from exc
+        if await rt.repo.get_task(t_uuid) is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        res = await rt.orchestrator.reconcile_task(task_id, trigger="manual_reconcile")
+        if rt.outbox is not None:
+            await rt.outbox.dispatch_once()
+        return res
+
+    @app.get("/v2/runners")
+    async def list_runners_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
+        rt = _rt()
+        await rt.orchestrator.sync_runner_heartbeat()
+        return await rt.repo.list_runners()
+
+    @app.get("/v2/runners/{runner_id}/executions")
+    async def list_runner_executions_v2(
+        runner_id: str, limit: int = 50, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
+        rt = _rt()
+        from app.runner.client import RunnerUnavailableError, UnixSocketRunnerBackend
+
+        if isinstance(rt.execution_backend, UnixSocketRunnerBackend) and rt.execution_backend.runner_id == runner_id:
+            try:
+                recs = await rt.execution_backend.client.list_executions(limit=min(max(limit, 1), 200))
+                return [r.model_dump(mode="json") for r in recs]
+            except RunnerUnavailableError:
+                pass
+        rows = await rt.repo.list_executions(limit=min(max(limit, 1), 200))
+        return [r for r in rows if r.get("runner_id") == runner_id]
+
     @app.get("/agents")
     async def list_agents(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         return await _rt().repo.list_agents()

@@ -29,6 +29,7 @@ from app.storage.models import (
     DriveHistory,
     DriveStateRow,
     EventLog,
+    ExecutionRecoveryRecord,
     GoalHistory,
     InboxEvent,
     MemoryIndex,
@@ -38,6 +39,7 @@ from app.storage.models import (
     OutboxEvent,
     PolicyEvaluation,
     ResourceUsage,
+    RunnerRegistryRow,
     SystemConfig,
     TaskLifecycleEvent,
     WorldState,
@@ -1296,6 +1298,144 @@ class StateRepository:
                 .values(status="pending", attempts=0, next_retry_at=utcnow(), locked_at=None, last_error=None)
             )
             return (res.rowcount or 0) == 1
+
+    # ── host agent runner registry & crash recovery audit (P1-3) ────────────
+    async def upsert_runner(
+        self,
+        *,
+        runner_id: str,
+        socket_path: str,
+        host_boot_id: str | None = None,
+        systemd_unit: str | None = None,
+        status: str = "online",
+        capabilities: dict[str, Any] | None = None,
+        last_heartbeat_at: datetime | None = None,
+    ) -> dict:
+        now = utcnow()
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(RunnerRegistryRow).where(RunnerRegistryRow.runner_id == runner_id))
+            ).scalar_one_or_none()
+            if row is None:
+                row = RunnerRegistryRow(
+                    runner_id=runner_id,
+                    socket_path=socket_path,
+                    host_boot_id=host_boot_id,
+                    systemd_unit=systemd_unit,
+                    status=status,
+                    capabilities=_jsonable(capabilities or {}),
+                    last_heartbeat_at=last_heartbeat_at or now,
+                    updated_at=now,
+                )
+                s.add(row)
+            else:
+                row.socket_path = socket_path
+                if host_boot_id is not None:
+                    row.host_boot_id = host_boot_id
+                if systemd_unit is not None:
+                    row.systemd_unit = systemd_unit
+                row.status = status
+                if capabilities is not None:
+                    row.capabilities = _jsonable(capabilities)
+                row.last_heartbeat_at = last_heartbeat_at or now
+                row.updated_at = now
+            await s.flush()
+            return self._runner_dict(row)
+
+    async def get_runner(self, runner_id: str) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(RunnerRegistryRow).where(RunnerRegistryRow.runner_id == runner_id))
+            ).scalar_one_or_none()
+            return self._runner_dict(row) if row else None
+
+    async def list_runners(self) -> list[dict]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(select(RunnerRegistryRow).order_by(RunnerRegistryRow.runner_id.asc()))
+            ).scalars().all()
+            return [self._runner_dict(r) for r in rows]
+
+    @staticmethod
+    def _runner_dict(r: RunnerRegistryRow) -> dict:
+        return {
+            "id": str(r.id),
+            "runner_id": r.runner_id,
+            "socket_path": r.socket_path,
+            "host_boot_id": r.host_boot_id,
+            "systemd_unit": r.systemd_unit,
+            "status": r.status,
+            "capabilities": r.capabilities,
+            "last_heartbeat_at": r.last_heartbeat_at,
+            "updated_at": r.updated_at,
+        }
+
+    async def create_recovery_record(
+        self,
+        *,
+        execution_id: uuid.UUID,
+        task_id: uuid.UUID,
+        action_taken: str,
+        runner_id: str | None = None,
+        trigger: str = "startup",
+        observed_identity: dict[str, Any] | None = None,
+        previous_status: str | None = None,
+        resolved_status: str | None = None,
+        notes: str = "",
+    ) -> uuid.UUID:
+        async with self.db.session() as s:
+            row = ExecutionRecoveryRecord(
+                execution_id=execution_id,
+                task_id=task_id,
+                runner_id=runner_id,
+                trigger=trigger,
+                observed_identity=_jsonable(observed_identity or {}),
+                previous_status=previous_status,
+                resolved_status=resolved_status,
+                action_taken=action_taken,
+                notes=notes,
+            )
+            s.add(row)
+            await s.flush()
+            return row.id
+
+    async def list_recovery_records(
+        self, execution_id: uuid.UUID | None = None, task_id: uuid.UUID | None = None, limit: int = 50
+    ) -> list[dict]:
+        async with self.db.session() as s:
+            q = select(ExecutionRecoveryRecord)
+            if execution_id is not None:
+                q = q.where(ExecutionRecoveryRecord.execution_id == execution_id)
+            if task_id is not None:
+                q = q.where(ExecutionRecoveryRecord.task_id == task_id)
+            rows = (
+                await s.execute(q.order_by(ExecutionRecoveryRecord.created_at.desc()).limit(limit))
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "execution_id": str(r.execution_id),
+                    "task_id": str(r.task_id),
+                    "runner_id": r.runner_id,
+                    "trigger": r.trigger,
+                    "observed_identity": r.observed_identity,
+                    "previous_status": r.previous_status,
+                    "resolved_status": r.resolved_status,
+                    "action_taken": r.action_taken,
+                    "notes": r.notes,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    async def get_execution_by_idempotency_key(self, idempotency_key: str) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(AgentExecutionRow).where(AgentExecutionRow.idempotency_key == idempotency_key)
+                )
+            ).scalar_one_or_none()
+            return self._exec_dict(row) if row else None
 
 
 def day_start(now: datetime | None = None) -> datetime:

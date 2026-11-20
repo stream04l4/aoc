@@ -511,15 +511,46 @@ class AgentOrchestrator:
             expected_output=task_row["expected_output"],
             workspace=task_row["workspace"],
             timeout_seconds=task_row["timeout_seconds"],
-            resource_budget=task_row["resource_budget"],
+            resource_budget={**(task_row["resource_budget"] or {}), "execution_idempotency_key": exec_idem},
             permission_level=task_row["permission_level"],
             success_criteria=task_row["success_criteria"],
             sandbox_mode=sandbox_mode,
         )
 
-        await self.backend.launch(adapter, agent_task)
+        try:
+            await self.backend.launch(adapter, agent_task)
+        except Exception as exc:
+            logger.error("orchestrator.launch_failed", task_id=str(task_uuid), execution_id=exec_id, error=str(exc))
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.RECOVERY_REQUIRED,
+                execution_id=exec_uuid,
+                actor="orchestrator",
+                reason=f"launch handshake failed: {exc}",
+                idempotency_key=f"launch_err:{exec_id}",
+            )
+            await self.repo.create_recovery_record(
+                execution_id=exec_uuid,
+                task_id=task_uuid,
+                trigger="launch_handshake_error",
+                previous_status=ExecutionStatus.DISPATCHING.value,
+                resolved_status=TaskStatus.RECOVERY_REQUIRED.value,
+                action_taken="marked_recovery_required",
+                notes=str(exc),
+            )
+            raise
+
+        launch_meta = self.backend.get_launch_metadata(str(task_uuid))
+        exec_updates: dict[str, Any] = {"status": ExecutionStatus.RUNNING.value}
+        if launch_meta.get("runner_id"):
+            exec_updates["runner_id"] = launch_meta["runner_id"]
+        if launch_meta.get("pid") is not None:
+            exec_updates["pid"] = int(launch_meta["pid"])
+        if launch_meta.get("process_identity"):
+            exec_updates["process_identity"] = launch_meta["process_identity"]
+
         async with self.repo.transaction() as s:
-            await self.repo.update_execution(exec_uuid, status=ExecutionStatus.RUNNING.value, session=s)
+            await self.repo.update_execution(exec_uuid, session=s, **exec_updates)
             await self.state_machine.transition(
                 task_uuid,
                 TaskStatus.RUNNING,
@@ -821,11 +852,387 @@ class AgentOrchestrator:
         )
         return True
 
-    async def recover_on_startup(self) -> dict[str, int]:
-        """Reconcile any tasks/executions left RUNNING or DISPATCHED after an abrupt crash.
+    async def sync_runner_heartbeat(self) -> dict[str, Any] | None:
+        """Query host Runner health over UDS and persist status in runner_registry (P1-3)."""
+        from app.runner.client import RunnerUnavailableError, UnixSocketRunnerBackend
 
-        Never re-runs already SUCCEEDED tasks (task book Scenario E).
+        if not isinstance(self.backend, UnixSocketRunnerBackend):
+            return None
+        try:
+            h = await self.backend.client.health()
+            return await self.repo.upsert_runner(
+                runner_id=h.runner_id,
+                socket_path=h.socket_path,
+                host_boot_id=h.host_boot_id,
+                systemd_unit=h.systemd_unit,
+                status="online",
+                capabilities={
+                    "cgroup_delegated": h.cgroup_delegated,
+                    "cgroup_root": h.cgroup_root,
+                    "state_dir": h.state_dir,
+                    "active_executions": h.active_executions,
+                },
+                last_heartbeat_at=utcnow(),
+            )
+        except RunnerUnavailableError as exc:
+            logger.warning("orchestrator.runner_heartbeat_failed", runner_id=self.backend.runner_id, error=str(exc))
+            return await self.repo.upsert_runner(
+                runner_id=self.backend.runner_id,
+                socket_path=self.backend.client.socket_path,
+                status="offline",
+                capabilities={"last_error": str(exc)},
+            )
+
+    def _build_agent_task_from_row(self, task_row: dict[str, Any], exec_id: str) -> AgentTask:
+        sandbox_mode = (task_row.get("resource_budget") or {}).get("sandbox_mode", "read-only")
+        return AgentTask(
+            task_id=task_row["task_id"],
+            execution_id=exec_id,
+            objective=task_row["objective"],
+            description=task_row.get("description", ""),
+            assigned_agent=task_row["assigned_agent"],
+            expected_output=task_row.get("expected_output", ""),
+            workspace=task_row["workspace"],
+            timeout_seconds=int(task_row["timeout_seconds"]),
+            resource_budget=dict(task_row.get("resource_budget") or {}),
+            permission_level=task_row["permission_level"],
+            success_criteria=list(task_row.get("success_criteria") or []),
+            sandbox_mode=sandbox_mode,
+        )
+
+    async def reconcile_task(self, task_id: str, trigger: str = "manual_reconcile") -> dict[str, Any]:
+        """Reconcile a single task's executions against Host Agent Runner or local OS state (P1-3)."""
+        from app.runner.client import RunnerUnavailableError, UnixSocketRunnerBackend
+
+        task_uuid = uuid.UUID(task_id)
+        task_row = await self.repo.get_task(task_uuid)
+        if task_row is None:
+            return {"task_id": task_id, "action": "not_found"}
+
+        cur_status = TaskStatus(task_row["status"])
+        execs = await self.repo.list_executions(task_id=task_uuid, limit=10)
+        latest_exec = execs[0] if execs else None
+
+        # Case 6: terminal execution persisted in DB, but finalization Outbox/TaskFinalizer hasn't completed yet
+        if cur_status.is_terminal and cur_status != TaskStatus.RECOVERY_REQUIRED:
+            if latest_exec and latest_exec.get("finalized_at") is None:
+                exec_uuid = uuid.UUID(latest_exec["execution_id"])
+                await self.repo.enqueue_outbox_event(
+                    event_type=OutboxEventType.EXECUTION_FINALIZE,
+                    idempotency_key=f"finalize:{latest_exec['execution_id']}",
+                    payload={"execution_id": latest_exec["execution_id"], "task_id": task_id},
+                    aggregate_type="execution",
+                    aggregate_id=exec_uuid,
+                )
+                await self.repo.create_recovery_record(
+                    execution_id=exec_uuid,
+                    task_id=task_uuid,
+                    runner_id=latest_exec.get("runner_id"),
+                    trigger=trigger,
+                    observed_identity=latest_exec.get("process_identity") or {},
+                    previous_status=cur_status.value,
+                    resolved_status=cur_status.value,
+                    action_taken="reenqueued_unfinalized_outbox",
+                    notes="Terminal execution lacked finalized_at; ensured execution.finalize outbox event exists",
+                )
+                return {"task_id": task_id, "status": cur_status.value, "action": "reenqueued_unfinalized_outbox"}
+            return {"task_id": task_id, "status": cur_status.value, "action": "already_terminal"}
+
+        if not isinstance(self.backend, UnixSocketRunnerBackend):
+            return {"task_id": task_id, "status": cur_status.value, "action": "noop_local_backend"}
+
+        if latest_exec is None:
+            return {"task_id": task_id, "status": cur_status.value, "action": "no_execution_to_reconcile"}
+
+        exec_id = latest_exec["execution_id"]
+        exec_uuid = uuid.UUID(exec_id)
+        idem_key = latest_exec.get("idempotency_key") or ""
+
+        try:
+            rec = await self.backend.client.get_execution(exec_id)
+            if rec is None and idem_key:
+                rec = await self.backend.client.get_execution_by_key(idem_key)
+        except RunnerUnavailableError as exc:
+            # Runner unreachable -> NEVER guess success or blindly re-run!
+            if cur_status != TaskStatus.RECOVERY_REQUIRED:
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    execution_id=exec_uuid,
+                    actor="reconciler",
+                    reason=f"Runner unreachable during {trigger}: {exc}",
+                    idempotency_key=f"reconcile_offline:{exec_id}:{trigger}:{task_row['state_version']}",
+                )
+            await self.repo.create_recovery_record(
+                execution_id=exec_uuid,
+                task_id=task_uuid,
+                runner_id=latest_exec.get("runner_id") or self.backend.runner_id,
+                trigger=trigger,
+                observed_identity=latest_exec.get("process_identity") or {},
+                previous_status=cur_status.value,
+                resolved_status=TaskStatus.RECOVERY_REQUIRED.value,
+                action_taken="marked_recovery_required_runner_offline",
+                notes=str(exc),
+            )
+            return {
+                "task_id": task_id,
+                "execution_id": exec_id,
+                "status": TaskStatus.RECOVERY_REQUIRED.value,
+                "action": "marked_recovery_required_runner_offline",
+            }
+
+        # Case A: Execution record not found on reachable Runner (e.g. Core died in DISPATCHING before RPC reached Runner)
+        if rec is None:
+            is_idempotent_l0 = task_row["permission_level"] == PermissionLevel.L0.value
+            if is_idempotent_l0 and cur_status in {TaskStatus.DISPATCHING, TaskStatus.DISPATCHED, TaskStatus.RECOVERY_REQUIRED}:
+                await self.repo.update_execution(
+                    exec_uuid,
+                    status=ExecutionStatus.FAILED.value,
+                    completed_at=utcnow(),
+                    error="Execution never reached host runner before crash (L0 confirmed absent)",
+                )
+                if cur_status != TaskStatus.RECOVERY_REQUIRED:
+                    await self.state_machine.transition(
+                        task_uuid,
+                        TaskStatus.RECOVERY_REQUIRED,
+                        execution_id=exec_uuid,
+                        actor="reconciler",
+                        reason="Execution absent on runner after crash",
+                        idempotency_key=f"reconcile_missing_rr:{exec_id}",
+                    )
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.FAILED,
+                    execution_id=exec_uuid,
+                    actor="reconciler",
+                    reason="Confirmed absent on host runner (L0 read-only)",
+                    idempotency_key=f"reconcile_missing_fail:{exec_id}",
+                    task_updates={"outcome": {"execution_id": exec_id, "error": "Execution absent on host runner"}},
+                    outbox_events=[
+                        {
+                            "event_type": OutboxEventType.EXECUTION_FINALIZE,
+                            "idempotency_key": f"finalize:{exec_id}",
+                            "payload": {"execution_id": exec_id, "task_id": task_id},
+                            "aggregate_type": "execution",
+                            "aggregate_id": exec_uuid,
+                        }
+                    ],
+                )
+                await self.repo.create_recovery_record(
+                    execution_id=exec_uuid,
+                    task_id=task_uuid,
+                    runner_id=self.backend.runner_id,
+                    trigger=trigger,
+                    previous_status=cur_status.value,
+                    resolved_status=TaskStatus.FAILED.value,
+                    action_taken="marked_failed_absent_on_runner",
+                    notes="Execution record not present on host runner; L0 task safely failed",
+                )
+                return {"task_id": task_id, "execution_id": exec_id, "status": TaskStatus.FAILED.value, "action": "marked_failed_absent_on_runner"}
+
+            if cur_status != TaskStatus.RECOVERY_REQUIRED:
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.RECOVERY_REQUIRED,
+                    execution_id=exec_uuid,
+                    actor="reconciler",
+                    reason="Non-L0 execution absent on runner; requires operator confirmation",
+                    idempotency_key=f"reconcile_missing_nonl0:{exec_id}:{task_row['state_version']}",
+                )
+            await self.repo.create_recovery_record(
+                execution_id=exec_uuid,
+                task_id=task_uuid,
+                runner_id=self.backend.runner_id,
+                trigger=trigger,
+                previous_status=cur_status.value,
+                resolved_status=TaskStatus.RECOVERY_REQUIRED.value,
+                action_taken="marked_recovery_required_absent",
+                notes="Execution absent on host runner for non-L0 task; halted for safety",
+            )
+            return {"task_id": task_id, "execution_id": exec_id, "status": TaskStatus.RECOVERY_REQUIRED.value, "action": "marked_recovery_required_absent"}
+
+        obs_ident = rec.process_identity.model_dump(mode="json") if rec.process_identity else {}
+
+        # Case B: Process confirmed alive & running on Runner -> re-attach monitoring without re-running!
+        if rec.status in {ExecutionStatus.RUNNING.value, ExecutionStatus.STARTING.value} and rec.alive:
+            adapter = self.registry.get(task_row["assigned_agent"])
+            agent_task = self._build_agent_task_from_row(task_row, exec_id)
+            if adapter is not None:
+                self.backend.reattach(
+                    task_id=task_id,
+                    execution_id=exec_id,
+                    adapter=adapter,
+                    task=agent_task,
+                    runner_id=rec.runner_id,
+                    process_identity=obs_ident,
+                )
+            await self.repo.update_execution(
+                exec_uuid,
+                status=ExecutionStatus.RUNNING.value,
+                runner_id=rec.runner_id,
+                pid=rec.process_identity.pid if rec.process_identity else None,
+                process_identity=obs_ident,
+            )
+            if cur_status != TaskStatus.RUNNING:
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.RUNNING,
+                    execution_id=exec_uuid,
+                    actor="reconciler",
+                    reason=f"Re-attached to live host runner execution ({rec.identity_check})",
+                    idempotency_key=f"reattach:{exec_id}:{task_row['state_version']}",
+                )
+            await self.repo.create_recovery_record(
+                execution_id=exec_uuid,
+                task_id=task_uuid,
+                runner_id=rec.runner_id,
+                trigger=trigger,
+                observed_identity=obs_ident,
+                previous_status=cur_status.value,
+                resolved_status=TaskStatus.RUNNING.value,
+                action_taken="reattached_running",
+                notes=f"Verified live process via {rec.identity_check}",
+            )
+            return {"task_id": task_id, "execution_id": exec_id, "status": TaskStatus.RUNNING.value, "action": "reattached_running"}
+
+        # Case C: Runner already holds terminal execution result -> recover & feed through _collect_and_decide!
+        if rec.status in {
+            ExecutionStatus.SUCCEEDED.value,
+            ExecutionStatus.FAILED.value,
+            ExecutionStatus.TIMEOUT.value,
+            ExecutionStatus.CANCELLED.value,
+        }:
+            await self.repo.update_execution(
+                exec_uuid,
+                runner_id=rec.runner_id,
+                pid=rec.process_identity.pid if rec.process_identity else None,
+                process_identity=obs_ident,
+            )
+            if cur_status in {TaskStatus.DISPATCHING, TaskStatus.DISPATCHED, TaskStatus.RECOVERY_REQUIRED}:
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.RUNNING,
+                    execution_id=exec_uuid,
+                    actor="reconciler",
+                    reason="Runner holds terminal execution result; advancing to collect",
+                    idempotency_key=f"reconcile_to_run:{exec_id}:{task_row['state_version']}",
+                )
+            adapter = self.registry.get(task_row["assigned_agent"])
+            agent_task = self._build_agent_task_from_row(task_row, exec_id)
+            agent_exec = self.backend.convert_record(adapter, agent_task, rec)
+            final_task = await self._collect_and_decide(task_uuid, agent_exec)
+            resolved_st = str(final_task.get("status", TaskStatus.FAILED.value))
+            await self.repo.create_recovery_record(
+                execution_id=exec_uuid,
+                task_id=task_uuid,
+                runner_id=rec.runner_id,
+                trigger=trigger,
+                observed_identity=obs_ident,
+                previous_status=cur_status.value,
+                resolved_status=resolved_st,
+                action_taken="recovered_terminal_result",
+                notes=f"Recovered runner terminal status={rec.status} exit_code={rec.exit_code}",
+            )
+            return {
+                "task_id": task_id,
+                "execution_id": exec_id,
+                "status": resolved_st,
+                "action": "recovered_terminal_result",
+            }
+
+        # Fallback: indeterminate runner state -> RECOVERY_REQUIRED
+        if cur_status != TaskStatus.RECOVERY_REQUIRED:
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.RECOVERY_REQUIRED,
+                execution_id=exec_uuid,
+                actor="reconciler",
+                reason=f"Indeterminate runner state ({rec.status}, alive={rec.alive}, check={rec.identity_check})",
+                idempotency_key=f"reconcile_indet:{exec_id}:{task_row['state_version']}",
+            )
+        await self.repo.create_recovery_record(
+            execution_id=exec_uuid,
+            task_id=task_uuid,
+            runner_id=rec.runner_id,
+            trigger=trigger,
+            observed_identity=obs_ident,
+            previous_status=cur_status.value,
+            resolved_status=TaskStatus.RECOVERY_REQUIRED.value,
+            action_taken="marked_recovery_required_indeterminate",
+            notes=f"runner_status={rec.status} alive={rec.alive} check={rec.identity_check}",
+        )
+        return {
+            "task_id": task_id,
+            "execution_id": exec_id,
+            "status": TaskStatus.RECOVERY_REQUIRED.value,
+            "action": "marked_recovery_required_indeterminate",
+        }
+
+    async def recover_on_startup(self) -> dict[str, int]:
+        """Reconcile any tasks/executions left in-flight after an abrupt crash (P1-3 + Scenario E).
+
+        Never re-runs already SUCCEEDED tasks.
         """
+        from app.runner.client import UnixSocketRunnerBackend
+
+        if isinstance(self.backend, UnixSocketRunnerBackend):
+            await self.sync_runner_heartbeat()
+            reattached = 0
+            recovered_terminal = 0
+            marked_recovery = 0
+            reenqueued = 0
+
+            inflight_tasks = await self.repo.list_tasks(
+                statuses=[
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.DISPATCHING.value,
+                    TaskStatus.DISPATCHED.value,
+                    TaskStatus.VERIFYING.value,
+                    TaskStatus.RECOVERY_REQUIRED.value,
+                    TaskStatus.ORPHANED.value,
+                ],
+                limit=100,
+            )
+            for t in inflight_tasks:
+                res = await self.reconcile_task(t["task_id"], trigger="startup")
+                act = res.get("action", "")
+                if act == "reattached_running":
+                    reattached += 1
+                elif act in {"recovered_terminal_result", "marked_failed_absent_on_runner"}:
+                    recovered_terminal += 1
+                elif act.startswith("marked_recovery_required"):
+                    marked_recovery += 1
+
+            # Also guarantee Case 6: terminal executions without finalized_at get outbox re-enqueued
+            unfinalized = await self.repo.list_unfinalized_terminal_executions(limit=50)
+            for ex in unfinalized:
+                await self.repo.enqueue_outbox_event(
+                    event_type=OutboxEventType.EXECUTION_FINALIZE,
+                    idempotency_key=f"finalize:{ex['execution_id']}",
+                    payload={"execution_id": ex["execution_id"], "task_id": ex["task_id"]},
+                    aggregate_type="execution",
+                    aggregate_id=uuid.UUID(ex["execution_id"]),
+                )
+                reenqueued += 1
+
+            summary = {
+                "reconciled_tasks": reattached + recovered_terminal + marked_recovery,
+                "reconciled_executions": reattached + recovered_terminal + marked_recovery,
+                "reattached_running": reattached,
+                "recovered_terminal": recovered_terminal,
+                "recovery_required": marked_recovery,
+                "reenqueued_unfinalized": reenqueued,
+            }
+            if any(summary.values()):
+                await self.repo.log_event(
+                    "orchestrator.recovered",
+                    message="Host Runner startup reconciliation completed",
+                    payload=summary,
+                    level="warning" if marked_recovery else "info",
+                )
+            return summary
+
+        # LocalSubprocessBackend fallback path (unit tests & non-runner mode)
         reconciled_execs = 0
         reconciled_tasks = 0
 
@@ -848,6 +1255,15 @@ class AgentOrchestrator:
                     status=ExecutionStatus.FAILED.value,
                     completed_at=utcnow(),
                     error="Orphaned execution recovered after AOC restart (process no longer running)",
+                )
+                await self.repo.create_recovery_record(
+                    execution_id=uuid.UUID(ex["execution_id"]),
+                    task_id=uuid.UUID(ex["task_id"]),
+                    trigger="startup",
+                    previous_status=ex["status"],
+                    resolved_status=ExecutionStatus.FAILED.value,
+                    action_taken="local_orphan_marked_failed",
+                    notes="Process no longer running on local backend startup",
                 )
                 reconciled_execs += 1
 

@@ -95,6 +95,37 @@ class AgentInterface(ABC):
     @abstractmethod
     async def cancel(self, execution_id: str) -> bool: ...
 
+    def build_runner_spec(self, task: AgentTask) -> dict[str, Any] | None:
+        """Optional spec for host Agent Runner execution: {command, stdin_text, extra_env}."""
+        return None
+
+    def parse_runner_result(
+        self,
+        *,
+        task: AgentTask,
+        status: str,
+        stdout: str,
+        stderr: str,
+        exit_code: int | None,
+        error: str | None,
+        started_at: datetime,
+        completed_at: datetime | None,
+        pid: int | None,
+    ) -> AgentExecution:
+        return AgentExecution(
+            execution_id=task.execution_id or "",
+            task_id=task.task_id,
+            agent_id=self.capability.agent_id,
+            status=status,
+            started_at=started_at,
+            completed_at=completed_at or utcnow(),
+            result={"summary": (stdout or "").strip()[-4000:], "exit_code": exit_code},
+            stdout=(stdout or "")[-20000:],
+            stderr=(stderr or "")[-8000:],
+            error=error,
+            pid=pid,
+        )
+
 
 async def terminate_process_group(proc: asyncio.subprocess.Process, grace_seconds: float = 3.0) -> None:
     """Safely terminate a subprocess and its entire process group."""

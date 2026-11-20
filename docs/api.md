@@ -45,3 +45,6 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `POST` | `/control/cycle` | Run one autonomous cycle synchronously (`409 Conflict` if a cycle is already running) |
 | `POST` | `/approvals/{task_id}/approve` | Approve an L2 task via `approve_and_dispatch()` (re-validates policy, budget, `plan_hash`, agent health, workspace; atomic claim) |
 | `POST` | `/approvals/{task_id}/reject` | Reject an L2 task and sync plan/goal/approval records |
+| `POST` | `/v2/tasks/{task_id}/reconcile` | Reconcile task/execution state against Host Agent Runner (Bearer `control`) |
+| `GET` | `/v2/runners` | List registered host systemd Agent Runners and heartbeat status (Bearer `read`) |
+| `GET` | `/v2/runners/{runner_id}/executions` | Inspect executions tracked by a specific Host Agent Runner (Bearer `read`) |

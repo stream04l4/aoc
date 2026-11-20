@@ -316,6 +316,106 @@ class CodexAdapter(AgentInterface):
             error="unknown execution_id",
         )
 
+    def build_runner_spec(self, task: AgentTask) -> dict[str, Any] | None:
+        sandbox = task.sandbox_mode or str(self.options.get("sandbox", "read-only"))
+        if sandbox not in ALLOWED_SANDBOXES:
+            raise ValueError(f"Refused disallowed sandbox mode '{sandbox}' (allowed: {sorted(ALLOWED_SANDBOXES)})")
+        resolved = shutil.which(self.binary)
+        if not resolved:
+            raise FileNotFoundError(f"Codex binary '{self.binary}' not found")
+
+        os.makedirs(task.workspace, exist_ok=True)
+        last_msg_path = os.path.join(task.workspace, ".aoc_last_message.txt")
+        if os.path.exists(last_msg_path):
+            try:
+                os.remove(last_msg_path)
+            except OSError:
+                pass
+
+        cmd = [
+            resolved,
+            "exec",
+            "--sandbox",
+            sandbox,
+            "-C",
+            task.workspace,
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--json",
+            "-o",
+            last_msg_path,
+        ]
+        extra_env: dict[str, str] = {}
+        if self.options.get("use_aoc_llm"):
+            llm_cfg = self._llm_settings
+            base_url = str(self.options.get("base_url") or (llm_cfg.base_url if llm_cfg else ""))
+            model_name = str(self.options.get("model") or (llm_cfg.model if llm_cfg else ""))
+            if not base_url or not model_name:
+                raise ValueError("CodexAdapter use_aoc_llm=true requires injected llm_settings or options.base_url/model")
+            cmd.extend(
+                [
+                    "-c",
+                    'model_provider="aoc_llm"',
+                    "-c",
+                    'model_providers.aoc_llm.name="AOC_LLM"',
+                    "-c",
+                    f'model_providers.aoc_llm.base_url="{base_url}"',
+                    "-c",
+                    'model_providers.aoc_llm.env_key="CODEX_CUSTOM_API_KEY"',
+                    "-c",
+                    'model_providers.aoc_llm.wire_api="responses"',
+                    "-m",
+                    model_name,
+                ]
+            )
+            if llm_cfg and llm_cfg.api_key:
+                extra_env["CODEX_CUSTOM_API_KEY"] = llm_cfg.api_key.get_secret_value()
+        else:
+            model = self.options.get("model")
+            if model:
+                cmd.extend(["-m", str(model)])
+        cmd.append("-")
+        return {
+            "command": cmd,
+            "stdin_text": build_agent_prompt(task),
+            "extra_env": extra_env,
+        }
+
+    def parse_runner_result(
+        self,
+        *,
+        task: AgentTask,
+        status: str,
+        stdout: str,
+        stderr: str,
+        exit_code: int | None,
+        error: str | None,
+        started_at: datetime,
+        completed_at: datetime | None,
+        pid: int | None,
+    ) -> AgentExecution:
+        last_msg_path = os.path.join(task.workspace, ".aoc_last_message.txt")
+        parsed_result, usage = self._parse_output(stdout or "", last_msg_path, task.workspace)
+        done_at = completed_at or utcnow()
+        try:
+            usage["wall_seconds"] = round(max(0.0, (done_at - started_at).total_seconds()), 3)
+        except Exception:
+            usage["wall_seconds"] = 0.0
+        return AgentExecution(
+            execution_id=task.execution_id or "",
+            task_id=task.task_id,
+            agent_id=self._cap.agent_id,
+            status=status,
+            started_at=started_at,
+            completed_at=done_at,
+            result=parsed_result,
+            stdout=(stdout or "")[-20000:],
+            stderr=(stderr or "")[-8000:],
+            error=error,
+            resource_usage=usage,
+            pid=pid,
+        )
+
     async def cancel(self, execution_id: str) -> bool:
         rp = self._running.get(execution_id)
         if rp is None:

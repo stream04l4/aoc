@@ -1,0 +1,11 @@
+# Host systemd Agent Runner configuration (V2.0 P1-3)
+enabled: false
+runner_id: host-runner-1
+socket_path: /run/aoc-runner/runner.sock
+state_dir: /var/lib/aoc-runner
+workspace_root: /home/ubuntu/aoc-workspaces
+cgroup_memory_max: "2G"
+cgroup_pids_max: 128
+heartbeat_interval_seconds: 15
+heartbeat_timeout_seconds: 60
+request_timeout_seconds: 30

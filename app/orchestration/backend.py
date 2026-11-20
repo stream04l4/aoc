@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from typing import Any
 
 from app.agents.base import AgentExecution, AgentInterface, AgentTask
 from app.core.enums import ExecutionStatus
@@ -36,6 +37,10 @@ class ExecutionBackendInterface(ABC):
     @abstractmethod
     async def cancel(self, task_id: str, adapter: AgentInterface | None = None) -> tuple[bool, str | None]:
         """Cancel a running task. Returns (cancelled, execution_id)."""
+
+    def get_launch_metadata(self, task_id: str) -> dict[str, Any]:
+        """Optional runner metadata captured at launch (runner_id, pid, process_identity)."""
+        return {}
 
 
 class LocalSubprocessBackend(ExecutionBackendInterface):

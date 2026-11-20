@@ -1,0 +1,31 @@
+[Unit]
+Description=AOC Host Agent Runner (unprivileged cgroup v2 + UDS executor)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/aoc
+EnvironmentFile=-/home/ubuntu/aoc/.env
+Environment=AOC_RUNNER__ENABLED=true
+Environment=AOC_RUNNER__SOCKET_PATH=/run/aoc-runner/runner.sock
+Environment=AOC_RUNNER__STATE_DIR=/var/lib/aoc-runner
+Environment=AOC_RUNNER__SYSTEMD_UNIT=aoc-agent-runner.service
+RuntimeDirectory=aoc-runner
+RuntimeDirectoryMode=0750
+StateDirectory=aoc-runner
+StateDirectoryMode=0750
+Delegate=yes
+# Keep child executions alive across runner restarts so the runner can re-adopt them via ProcessIdentity
+KillMode=process
+Restart=always
+RestartSec=1
+ExecStart=/home/ubuntu/aoc/.venv/bin/python -m app.runner.service
+
+# Security hardening (unprivileged, never root, never Docker socket)
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

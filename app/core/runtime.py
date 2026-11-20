@@ -11,11 +11,13 @@ from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import BrainInterface
 from app.core.config import (
     LifecycleSettings,
+    RunnerSettings,
     Settings,
     get_agent_config,
     get_drive_config,
     get_lifecycle_config,
     get_policy_config,
+    get_runner_config,
     get_settings,
 )
 from app.core.lifecycle import LifecycleManager
@@ -61,6 +63,9 @@ class OrganismRuntime:
         lc_yaml = get_lifecycle_config()
         if lc_yaml and self.settings.lifecycle == LifecycleSettings():
             self.settings = self.settings.model_copy(update={"lifecycle": LifecycleSettings.model_validate(lc_yaml)})
+        rn_yaml = get_runner_config()
+        if rn_yaml and self.settings.runner == RunnerSettings():
+            self.settings = self.settings.model_copy(update={"runner": RunnerSettings.model_validate(rn_yaml)})
         self._owns_db = db is None
         self.db = db or Database(self.settings.database.url, echo=self.settings.database.echo)
         self.repo = StateRepository(self.db)
@@ -110,7 +115,21 @@ class OrganismRuntime:
         if registry is None and auto_load_agents:
             self.registry.load_from_config(get_agent_config(), llm_settings=self.settings.llm)
         self.state_machine = TaskStateMachine(self.repo)
-        self.execution_backend: ExecutionBackendInterface = execution_backend or LocalSubprocessBackend()
+        if execution_backend is not None:
+            self.execution_backend: ExecutionBackendInterface = execution_backend
+        elif self.settings.runner.enabled:
+            from app.runner.client import RunnerClient, UnixSocketRunnerBackend
+
+            rc = RunnerClient(
+                socket_path=self.settings.runner.socket_path,
+                auth_token=(
+                    self.settings.runner.auth_token.get_secret_value() if self.settings.runner.auth_token else ""
+                ),
+                timeout_seconds=self.settings.runner.request_timeout_seconds,
+            )
+            self.execution_backend = UnixSocketRunnerBackend(rc, runner_id=self.settings.runner.runner_id)
+        else:
+            self.execution_backend = LocalSubprocessBackend()
         self.orchestrator = AgentOrchestrator(
             registry=self.registry,
             governance=self.governance,

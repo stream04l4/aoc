@@ -455,3 +455,33 @@ class InboxEvent(Base):
     event_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     processed_at: Mapped[datetime] = mapped_column(TS, default=_now)
     result_summary: Mapped[dict] = mapped_column(JsonType, default=dict)
+
+
+# ── host systemd agent runner & crash recovery (P1-3) ───────────────────────
+class RunnerRegistryRow(Base):
+    __tablename__ = "runner_registry"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    runner_id: Mapped[str] = mapped_column(String(64), unique=True)
+    socket_path: Mapped[str] = mapped_column(String(256))
+    host_boot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    systemd_unit: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="online")  # online | degraded | offline
+    capabilities: Mapped[dict] = mapped_column(JsonType, default=dict)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class ExecutionRecoveryRecord(Base):
+    __tablename__ = "execution_recovery_records"
+    __table_args__ = (Index("ix_recovery_exec", "execution_id"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    execution_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_executions.id"))
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_tasks.id"))
+    runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trigger: Mapped[str] = mapped_column(String(32), default="startup")  # startup | manual_reconcile | heartbeat_timeout
+    observed_identity: Mapped[dict] = mapped_column(JsonType, default=dict)
+    previous_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resolved_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action_taken: Mapped[str] = mapped_column(String(64))
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
