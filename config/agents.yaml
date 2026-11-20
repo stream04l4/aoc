@@ -6,7 +6,7 @@ agents:
     agent_type: cli
     adapter: codex
     binary: "codex"
-    capabilities: [coding, debugging, code_review, terminal, repository_analysis, system_diagnosis]
+    capabilities: [coding, debugging, code_review, terminal, repository_analysis, system_diagnosis, research, knowledge_summarization, general_task]
     supported_modes: [read-only, workspace-write]
     max_concurrency: 1
     enabled: true
@@ -17,14 +17,14 @@ agents:
       model: null                  # null -> uses AOC_LLM__MODEL when use_aoc_llm=true, else codex default
 
   - agent_id: hermes
-    name: "Hermes Agent"
+    name: "Hermes Agent (Experimental)"
     agent_type: cli
     adapter: hermes
     binary: "hermes"
     capabilities: [research, general_task, knowledge_summarization]
     supported_modes: [oneshot]
     max_concurrency: 1
-    enabled: true
+    enabled: false                 # disabled by default: v0.23.2 --oneshot --safe-mode verified failing with exit code 1
     experimental: true             # no native status/cancel API; managed via subprocess
     options:
       toolsets: "web,file"

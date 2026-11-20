@@ -109,6 +109,8 @@ class AutonomousLoop:
             ),
         )
         await self.lifecycle.sync_from_db()
+        if self.lifecycle.state == LifecycleState.STOPPED:
+            await self.lifecycle.transition(LifecycleState.INITIALIZING, reason="restarting from stopped state")
 
         # Hydrate last learning timestamp from semantic memories if present
         sem = await self.repo.list_memory_index(memory_type=MemoryType.SEMANTIC.value, limit=1)

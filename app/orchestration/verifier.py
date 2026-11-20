@@ -85,7 +85,7 @@ class ResultVerifier:
                         "detail": "present & non-empty" if exists else f"missing/empty or outside workspace: {spec.target}",
                     }
                 )
-            elif spec.kind == "contains_keywords":
+            elif spec.kind in {"contains_keywords", "keywords"}:
                 haystack = output_text.lower()
                 # Also check workspace text files if target file specified
                 if spec.target:
