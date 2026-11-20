@@ -7,14 +7,28 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
+from app.api.auth import (
+    SCOPE_APPROVE,
+    SCOPE_CONTROL,
+    SCOPE_INTERNAL,
+    SCOPE_READ,
+    Principal,
+    require_scope,
+    validate_api_security_config,
+)
 from app.core.config import Settings, get_settings
-from app.core.enums import TaskStatus
+from app.core.loop import CycleInProgressError
 from app.core.runtime import OrganismRuntime
 from app.observability.metrics import REGISTRY
+from app.orchestration.orchestrator import (
+    ApprovalConflictError,
+    ApprovalDeniedError,
+    ApprovalNotFoundError,
+)
 from app.storage.database import Database
 
 
@@ -50,11 +64,20 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         rt = runtime or OrganismRuntime(settings=cfg, db=db)
+        # Fail fast if bound to non-loopback with auth_enabled=False before initializing runtime
+        if not rt.settings.api.auth_enabled:
+            validate_api_security_config(rt.settings.api, has_db_credentials=False)
         app.state.runtime = rt
         app.state.settings = rt.settings
         app.state.db = rt.db
         app.state.repo = rt.repo
         await rt.start(start_scheduler=bool(start_scheduler))
+        try:
+            has_db_creds = await rt.repo.has_active_api_credentials()
+            validate_api_security_config(rt.settings.api, has_db_credentials=has_db_creds)
+        except Exception:
+            await rt.stop()
+            raise
         app.state.organism_id = rt.organism_id
         try:
             yield
@@ -81,7 +104,7 @@ def create_app(
         }
 
     @app.get("/state")
-    async def get_state() -> dict[str, Any]:
+    async def get_state(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
         rt = _rt()
         assert rt.organism_id is not None
         state = await rt.repo.get_organism_state(rt.organism_id)
@@ -97,49 +120,64 @@ def create_app(
         }
 
     @app.get("/drives")
-    async def get_drives() -> list[dict[str, Any]]:
+    async def get_drives(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         rt = _rt()
         assert rt.organism_id is not None
         return await rt.repo.load_drive_states(rt.organism_id)
 
     @app.get("/cycles")
-    async def list_cycles(limit: int = 20) -> list[dict[str, Any]]:
+    async def list_cycles(limit: int = 20, _: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         return await _rt().repo.list_cycles(limit=min(max(limit, 1), 200))
 
     @app.get("/goals")
-    async def list_goals(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    async def list_goals(
+        status: str | None = None, limit: int = 50, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
         statuses = [status] if status else None
         return await _rt().repo.list_goals(statuses=statuses, limit=min(max(limit, 1), 200))
 
     @app.get("/tasks")
-    async def list_tasks(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    async def list_tasks(
+        status: str | None = None, limit: int = 50, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
         statuses = [status] if status else None
         return await _rt().repo.list_tasks(statuses=statuses, limit=min(max(limit, 1), 200))
 
     @app.get("/agents")
-    async def list_agents() -> list[dict[str, Any]]:
+    async def list_agents(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         return await _rt().repo.list_agents()
 
     @app.get("/memories")
-    async def list_memories(memory_type: str | None = None, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    async def list_memories(
+        memory_type: str | None = None,
+        query: str = "",
+        limit: int = 20,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
         types = [memory_type] if memory_type else None
         items = await _rt().memory.recall(query=query, memory_types=types, limit=min(max(limit, 1), 100))
         return [it.model_dump(mode="json") for it in items]
 
     @app.get("/events")
-    async def list_events(limit: int = 50, event_type: str | None = None) -> list[dict[str, Any]]:
+    async def list_events(
+        limit: int = 50, event_type: str | None = None, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
         return await _rt().repo.list_events(limit=min(max(limit, 1), 500), event_type=event_type)
 
     @app.get("/decisions")
-    async def list_decisions(limit: int = 50) -> list[dict[str, Any]]:
+    async def list_decisions(limit: int = 50, _: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         return await _rt().repo.list_decisions(limit=min(max(limit, 1), 200))
 
     @app.get("/world")
-    async def list_world(kind: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    async def list_world(
+        kind: str | None = None, status: str | None = None, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
         return await _rt().repo.list_world_items(kind=kind, status=status)
 
     @app.post("/world")
-    async def upsert_world(req: WorldInputRequest) -> dict[str, Any]:
+    async def upsert_world(
+        req: WorldInputRequest, _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
         rt = _rt()
         item = await rt.repo.upsert_world_item(
             kind=req.kind,
@@ -155,7 +193,9 @@ def create_app(
         return item
 
     @app.delete("/world/{kind}/{key}")
-    async def delete_world(kind: str, key: str) -> dict[str, Any]:
+    async def delete_world(
+        kind: str, key: str, _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
         deleted = await _rt().repo.delete_world_item(kind=kind, key=key)
         if not deleted:
             raise HTTPException(status_code=404, detail="world item not found")
@@ -163,59 +203,94 @@ def create_app(
 
     # ── Lifecycle control ───────────────────────────────────────────────────
     @app.post("/control/pause")
-    async def pause(body: ControlNote = ControlNote()) -> dict[str, Any]:
+    async def pause(
+        body: ControlNote = ControlNote(), _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
         rt = _rt()
         assert rt.lifecycle is not None
         st = await rt.lifecycle.pause(body.reason)
         return {"lifecycle_state": st.value}
 
     @app.post("/control/resume")
-    async def resume(body: ControlNote = ControlNote()) -> dict[str, Any]:
+    async def resume(
+        body: ControlNote = ControlNote(), _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
         rt = _rt()
         assert rt.lifecycle is not None
         st = await rt.lifecycle.resume(body.reason)
         return {"lifecycle_state": st.value}
 
     @app.post("/control/wake")
-    async def wake(body: ControlNote = ControlNote()) -> dict[str, Any]:
+    async def wake(
+        body: ControlNote = ControlNote(), _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
         rt = _rt()
         assert rt.lifecycle is not None
         rt.lifecycle.wake(body.reason)
         return {"woken": True, "lifecycle_state": rt.lifecycle.state.value}
 
     @app.post("/control/cycle")
-    async def trigger_cycle() -> dict[str, Any]:
+    async def trigger_cycle(_: Principal = Depends(require_scope(SCOPE_CONTROL))) -> dict[str, Any]:
         rt = _rt()
         assert rt.loop is not None
-        return await rt.loop.run_cycle()
+        try:
+            return await rt.loop.run_cycle(fail_if_busy=True)
+        except CycleInProgressError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # ── Human-in-the-loop L2 approvals ──────────────────────────────────────
+    # ── Human-in-the-loop L2 approvals (via public approve_and_dispatch) ────
     @app.post("/approvals/{task_id}/approve")
-    async def approve_task(task_id: str) -> dict[str, Any]:
+    async def approve_task(
+        task_id: str,
+        body: ControlNote = ControlNote(reason="operator approved"),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
         rt = _rt()
-        t_uuid = uuid.UUID(task_id)
-        task = await rt.repo.get_task(t_uuid)
-        if task is None or task["status"] != TaskStatus.REQUIRES_APPROVAL.value:
-            raise HTTPException(status_code=404, detail="Pending approval task not found")
-        await rt.repo.log_decision("human_approval", selected="APPROVED", alternatives=["REJECTED"], reason=f"Approved task {task_id}")
-        exec_id = await rt.orchestrator._launch_attempt(
-            t_uuid, task["assigned_agent"], sandbox_mode="workspace-write"
-        )
-        return {"task_id": task_id, "execution_id": exec_id, "status": TaskStatus.RUNNING.value}
+        try:
+            t_uuid = uuid.UUID(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid task_id UUID") from exc
+        try:
+            return await rt.orchestrator.approve_and_dispatch(
+                task_id=t_uuid,
+                approver=principal.name,
+                reason=body.reason,
+                channel="api",
+            )
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ApprovalDeniedError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     @app.post("/approvals/{task_id}/reject")
-    async def reject_task(task_id: str, body: ControlNote = ControlNote()) -> dict[str, Any]:
+    async def reject_task(
+        task_id: str,
+        body: ControlNote = ControlNote(reason="operator rejected"),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
         rt = _rt()
-        t_uuid = uuid.UUID(task_id)
-        task = await rt.repo.get_task(t_uuid)
-        if task is None or task["status"] != TaskStatus.REQUIRES_APPROVAL.value:
-            raise HTTPException(status_code=404, detail="Pending approval task not found")
-        await rt.repo.update_task(t_uuid, status=TaskStatus.REJECTED.value, outcome={"rejected_reason": body.reason})
-        await rt.repo.log_decision("human_approval", selected="REJECTED", alternatives=["APPROVED"], reason=body.reason)
-        return {"task_id": task_id, "status": TaskStatus.REJECTED.value}
+        try:
+            t_uuid = uuid.UUID(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid task_id UUID") from exc
+        try:
+            return await rt.orchestrator.reject_approval(
+                task_id=t_uuid,
+                approver=principal.name,
+                reason=body.reason,
+                channel="api",
+            )
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/embeddings")
-    async def local_embeddings(req: EmbeddingRequest) -> dict[str, Any]:
+    async def local_embeddings(
+        req: EmbeddingRequest, _: Principal = Depends(require_scope(SCOPE_INTERNAL))
+    ) -> dict[str, Any]:
         from app.memory.local_embeddings import embed_batch
 
         inputs = [req.input] if isinstance(req.input, str) else list(req.input)
@@ -231,7 +306,7 @@ def create_app(
         }
 
     @app.get("/metrics")
-    async def metrics() -> Response:
+    async def metrics(_: Principal = Depends(require_scope(SCOPE_INTERNAL))) -> Response:
         return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     return app

@@ -1,6 +1,12 @@
-# AOC V1.0 — HTTP API Reference
+# AOC V2.0 (P1-1a) — HTTP API Reference
 
-Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`).
+Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; non-loopback binding is refused unless `api.auth_enabled=true` and an admin key or active `api_credentials` record exists).
+
+## Authentication & Scopes
+
+- `GET /health`: public minimal status summary (no credentials required).
+- All other endpoints require `Authorization: Bearer <token>` validated against `AOC_API__ADMIN_KEY` (`admin` scope), `AOC_API__INTERNAL_TOKEN` (`internal` scope), or SHA-256 hashed rows in `api_credentials`.
+- Scopes: `read` (GET observability/world), `control` (world mutation & `/control/*`), `approve` (`/approvals/*`), `internal` (`/metrics`, `/v1/embeddings`), `admin` (all scopes).
 
 ## Observability
 
@@ -33,6 +39,6 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`).
 | `POST` | `/control/pause` | Pause autonomous loop (`PAUSED`) |
 | `POST` | `/control/resume` | Resume autonomous loop (`ACTIVE`) |
 | `POST` | `/control/wake` | Wake sleeping organism immediately |
-| `POST` | `/control/cycle` | Run one autonomous cycle synchronously |
-| `POST` | `/approvals/{task_id}/approve` | Approve an L2 task awaiting human approval |
-| `POST` | `/approvals/{task_id}/reject` | Reject an L2 task awaiting human approval |
+| `POST` | `/control/cycle` | Run one autonomous cycle synchronously (`409 Conflict` if a cycle is already running) |
+| `POST` | `/approvals/{task_id}/approve` | Approve an L2 task via `approve_and_dispatch()` (re-validates policy, budget, `plan_hash`, agent health, workspace; atomic claim) |
+| `POST` | `/approvals/{task_id}/reject` | Reject an L2 task and sync plan/goal/approval records |

@@ -16,9 +16,9 @@ All modules communicate strictly through explicit Python abstract interfaces (`i
 | Governance | `app/governance/` | Permission levels L0–L3, Policy enforcement, Resource Budget, Workspace isolation | `GovernanceInterface`, `PolicyVerdict` |
 | Agent Orchestration | `app/orchestration/`, `app/agents/` | AgentRegistry (probed capabilities), CodexAdapter, HermesAdapter (experimental), GenericCLIAdapter, TaskDispatcher, ExecutionMonitor, ResultCollector | `AgentInterface`, `AgentCapability`, `AgentTask`, `AgentExecution` |
 | Memory | `app/memory/` | Dual-layer memory: PostgreSQL real-time state + Letta long-term cognitive memory (5 types) | `MemoryInterface`, `MemoryItem` |
-| Storage | `app/storage/` | Async SQLAlchemy 2.x engine, 18 ORM tables, Alembic migrations, StateRepository | `StateRepository` |
+| Storage | `app/storage/` | Async SQLAlchemy 2.x engine, 18 V1 + 3 P1-1a ORM tables (`api_credentials`, `approval_records`, `policy_evaluations`), Alembic migrations (`0001`–`0002`), StateRepository | `StateRepository` |
 | Observability | `app/observability/` | Structured JSON logging (`structlog`), Decision/Event logs, Prometheus `/metrics` | Metrics & logger helpers |
-| API | `app/api/` | FastAPI observability, control (pause/resume/wake), world injection, approvals | HTTP JSON + `/metrics` |
+| API | `app/api/` | FastAPI observability, Bearer token auth + scope RBAC (`app/api/auth.py`), loopback startup guard, control (pause/resume/wake/re-entrancy-guarded cycle), world injection, public `approve_and_dispatch` approvals | HTTP JSON + `/metrics` |
 
 ## Hard Invariants
 

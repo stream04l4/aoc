@@ -28,7 +28,7 @@ from app.cognition.interfaces import (
     GoalProposal,
     VerificationSpec,
 )
-from app.core.config import GovernanceSettings, MemorySettings, PerceptionSettings, RuntimeSettings, Settings
+from app.core.config import ApiSettings, GovernanceSettings, MemorySettings, PerceptionSettings, RuntimeSettings, Settings
 from app.core.enums import DriveType, ExecutionStatus, LifecycleState, MemoryType, TaskStatus
 from app.core.runtime import OrganismRuntime
 from app.drives.interfaces import DriveState, KnowledgeGap
@@ -327,29 +327,38 @@ async def test_scenario_f_agent_failure_never_marked_achieved_and_switches_agent
 
 @pytest.mark.asyncio
 async def test_api_pause_resume_and_l2_human_approval(db: Database, tmp_path):
+    admin_token = "test-admin-token-p0-7"
+    headers = {"Authorization": f"Bearer {admin_token}"}
     rt = _make_runtime(db, tmp_path, brain=ScriptedBrain(plan_level="L2"))
+    rt.settings = rt.settings.model_copy(
+        update={"api": ApiSettings(host="127.0.0.1", auth_enabled=True, admin_key=admin_token)}
+    )
     app = create_app(settings=rt.settings, runtime=rt, start_scheduler=False)
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            r = await client.post("/control/pause", json={"reason": "maintenance"})
+            r = await client.post("/control/pause", headers=headers, json={"reason": "maintenance"})
             assert r.status_code == 200
             assert r.json()["lifecycle_state"] == "PAUSED"
 
-            r = await client.post("/control/resume", json={"reason": "done"})
+            r = await client.post("/control/resume", headers=headers, json={"reason": "done"})
             assert r.status_code == 200
             assert r.json()["lifecycle_state"] == "ACTIVE"
 
             # Inject topics -> trigger cycle -> L2 plan must pause at REQUIRES_APPROVAL
             for i in range(3):
-                await client.post("/world", json={"kind": "knowledge_topic", "key": f"l2-topic-{i}", "value": {"importance": 0.95}})
-            r = await client.post("/control/cycle")
+                await client.post(
+                    "/world",
+                    headers=headers,
+                    json={"kind": "knowledge_topic", "key": f"l2-topic-{i}", "value": {"importance": 0.95}},
+                )
+            r = await client.post("/control/cycle", headers=headers)
             assert r.status_code == 200
             assert r.json()["outcome"] == "REQUIRES_APPROVAL"
 
-            pending = (await client.get("/tasks?status=REQUIRES_APPROVAL")).json()
+            pending = (await client.get("/tasks?status=REQUIRES_APPROVAL", headers=headers)).json()
             assert len(pending) == 1
             tid = pending[0]["task_id"]
 
-            r = await client.post(f"/approvals/{tid}/reject", json={"reason": "not needed"})
+            r = await client.post(f"/approvals/{tid}/reject", headers=headers, json={"reason": "not needed"})
             assert r.status_code == 200
             assert r.json()["status"] == "REJECTED"

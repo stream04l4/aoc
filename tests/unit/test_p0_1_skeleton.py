@@ -7,7 +7,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import inspect
 
 from app.api.app import create_app
-from app.core.config import Settings, get_agent_config, get_drive_config, get_policy_config
+from app.core.config import ApiSettings, Settings, get_agent_config, get_drive_config, get_policy_config
 from app.core.enums import DriveType, LifecycleState
 from app.drives.interfaces import DriveState
 from app.storage.database import Database
@@ -97,7 +97,13 @@ async def test_repository_identity_cycle_and_drive_persistence(repo: StateReposi
 
 @pytest.mark.asyncio
 async def test_api_health_state_metrics_and_world(db: Database):
-    app = create_app(settings=Settings(), db=db, start_scheduler=False)
+    admin_token = "test-admin-token-p0-1"
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    app = create_app(
+        settings=Settings(api=ApiSettings(host="127.0.0.1", auth_enabled=True, admin_key=admin_token)),
+        db=db,
+        start_scheduler=False,
+    )
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -106,7 +112,7 @@ async def test_api_health_state_metrics_and_world(db: Database):
             assert r.json()["status"] == "ok"
             assert r.json()["database"] == "ok"
 
-            r = await client.get("/state")
+            r = await client.get("/state", headers=headers)
             assert r.status_code == 200
             body = r.json()
             assert body["name"] == "AOC-001"
@@ -114,13 +120,14 @@ async def test_api_health_state_metrics_and_world(db: Database):
 
             r = await client.post(
                 "/world",
+                headers=headers,
                 json={"kind": "knowledge_topic", "key": "quantum-error-correction", "value": {"desc": "test"}},
             )
             assert r.status_code == 200
-            r = await client.get("/world?kind=knowledge_topic")
+            r = await client.get("/world?kind=knowledge_topic", headers=headers)
             assert r.status_code == 200
             assert len(r.json()) == 1
 
-            r = await client.get("/metrics")
+            r = await client.get("/metrics", headers=headers)
             assert r.status_code == 200
             assert "aoc_lifecycle_state" in r.text

@@ -16,6 +16,8 @@ Key invariants:
 
 from __future__ import annotations
 
+import asyncio
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -52,12 +54,16 @@ from app.memory.experience_manager import ExperienceManager
 from app.memory.interfaces import MemoryItem
 from app.observability.logging import get_logger
 from app.observability.metrics import CYCLE_DURATION, CYCLES_TOTAL
-from app.orchestration.orchestrator import AgentOrchestrator
+from app.orchestration.orchestrator import AgentOrchestrator, compute_params_digest, compute_plan_hash
 from app.perception.interfaces import Observation, utcnow
 from app.perception.manager import SensorManager
 from app.storage.repository import StateRepository, day_start
 
 logger = get_logger("aoc.loop")
+
+
+class CycleInProgressError(RuntimeError):
+    """Raised when a cycle trigger arrives while another cycle is actively executing."""
 
 
 class AutonomousLoop:
@@ -91,6 +97,8 @@ class AutonomousLoop:
         self._last_learning_at: datetime | None = None
         self._last_info_gain: float | None = None
         self._last_info_gain_at: datetime | None = None
+        # Re-entrancy guard preventing Scheduler and API /control/cycle from overlapping (P1-1a)
+        self._cycle_lock = asyncio.Lock()
 
     async def recover(self) -> dict[str, Any]:
         """Startup recovery (Scenario E): restore identity, memory, probes, and orphan tasks."""
@@ -130,8 +138,14 @@ class AutonomousLoop:
             await self.lifecycle.transition(LifecycleState.ACTIVE, reason="startup recovery complete")
         return summary
 
-    async def run_cycle(self) -> dict[str, Any]:
-        """Execute ONE complete autonomous cycle in strict 16-step order."""
+    async def run_cycle(self, fail_if_busy: bool = False) -> dict[str, Any]:
+        """Execute ONE complete autonomous cycle in strict 16-step order (re-entrancy protected)."""
+        if fail_if_busy and self._cycle_lock.locked():
+            raise CycleInProgressError("An autonomous cycle is already in progress")
+        async with self._cycle_lock:
+            return await self._run_cycle_locked()
+
+    async def _run_cycle_locked(self) -> dict[str, Any]:
         t0 = time.perf_counter()
         now = utcnow()
 
@@ -306,6 +320,7 @@ class AutonomousLoop:
             await self.repo.update_cycle(cycle_id, phase="POLICY_VALIDATION")
             verdict = await self.governance.validate_plan(plan, decision.selected_drive)
             plan_status = "APPROVED" if verdict.allowed else ("REQUIRES_APPROVAL" if verdict.requires_approval else "DENIED")
+            plan_hash = compute_plan_hash(plan)
             plan_id = await self.repo.create_plan(
                 goal_id=goal_id,
                 cycle_id=cycle_id,
@@ -313,6 +328,19 @@ class AutonomousLoop:
                 permission_level=verdict.effective_level,
                 verdict=verdict,
                 status=plan_status,
+                plan_hash=plan_hash,
+            )
+            await self.repo.record_policy_evaluation(
+                subject_type="plan",
+                subject_id=plan_id,
+                cycle_id=cycle_id,
+                requested_level=verdict.requested_level,
+                deterministic_level=verdict.effective_level,
+                semantic_level=None,
+                effective_level=verdict.effective_level,
+                verdict=plan_status.lower(),
+                violations=verdict.violations,
+                reason=verdict.reason,
             )
             await self.repo.log_decision(
                 decision_type="policy_validation",
@@ -325,7 +353,8 @@ class AutonomousLoop:
 
             if not verdict.allowed:
                 if verdict.requires_approval:
-                    await self.repo.create_task(
+                    ws = self.governance.prepare_workspace(f"pending-{str(plan_id)[:8]}")
+                    pending_task_id = await self.repo.create_task(
                         plan_id=plan_id,
                         goal_id=goal_id,
                         cycle_id=cycle_id,
@@ -333,7 +362,7 @@ class AutonomousLoop:
                         description=plan.description,
                         assigned_agent=plan.assigned_agent,
                         expected_output=plan.expected_output,
-                        workspace=self.governance.prepare_workspace(f"pending-{str(plan_id)[:8]}"),
+                        workspace=ws,
                         timeout_seconds=verdict.effective_timeout_seconds,
                         resource_budget={"sandbox_mode": verdict.sandbox_mode},
                         permission_level=verdict.effective_level,
@@ -341,6 +370,25 @@ class AutonomousLoop:
                         verification=[v.model_dump(mode="json") for v in plan.verification],
                         required_capability=plan.required_capability,
                         status=TaskStatus.REQUIRES_APPROVAL.value,
+                    )
+                    params_digest = compute_params_digest(
+                        {
+                            "objective": plan.objective,
+                            "description": plan.description,
+                            "assigned_agent": plan.assigned_agent,
+                            "permission_level": verdict.effective_level,
+                            "timeout_seconds": verdict.effective_timeout_seconds,
+                            "workspace": ws,
+                        }
+                    )
+                    await self.repo.create_approval_record(
+                        task_id=pending_task_id,
+                        plan_id=plan_id,
+                        plan_hash=plan_hash,
+                        params_digest=params_digest,
+                        permission_level=verdict.effective_level,
+                        nonce=secrets.token_hex(16),
+                        expires_at=utcnow() + timedelta(hours=24),
                     )
                     outcome = "REQUIRES_APPROVAL"
                 else:

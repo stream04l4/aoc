@@ -14,14 +14,18 @@ Execution is decoupled from the autonomous loop (task book section 10):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from app.agents.base import AgentExecution, AgentTask
 from app.agents.registry import AgentRegistry
-from app.cognition.interfaces import ActionPlan
-from app.core.enums import ExecutionStatus, TaskStatus
+from app.cognition.interfaces import ActionPlan, VerificationSpec
+from app.core.enums import ExecutionStatus, GoalStatus, PermissionLevel, TaskStatus
 from app.governance.interfaces import GovernanceInterface, PolicyVerdict
 from app.observability.logging import get_logger
 from app.observability.metrics import AGENT_EXECUTIONS
@@ -30,6 +34,61 @@ from app.perception.interfaces import utcnow
 from app.storage.repository import StateRepository
 
 logger = get_logger("aoc.orchestration")
+
+ALLOWED_APPROVAL_SANDBOXES = {"read-only", "workspace-write"}
+
+
+class ApprovalError(RuntimeError):
+    """Base error raised by approval verification and dispatch."""
+
+
+class ApprovalNotFoundError(ApprovalError):
+    """Raised when the target approval task does not exist."""
+
+
+class ApprovalConflictError(ApprovalError):
+    """Raised on duplicate/concurrent approval, expiry, or plan tampering."""
+
+
+class ApprovalDeniedError(ApprovalError):
+    """Raised when post-approval policy, budget, agent, or workspace recheck fails."""
+
+
+def compute_plan_hash(plan_data: dict[str, Any] | ActionPlan) -> str:
+    """Compute canonical SHA-256 hash over security-relevant ActionPlan fields."""
+    raw = plan_data.model_dump(mode="json") if isinstance(plan_data, ActionPlan) else dict(plan_data)
+    canonical = {
+        "goal_title": raw.get("goal_title", ""),
+        "objective": raw.get("objective", ""),
+        "description": raw.get("description", ""),
+        "assigned_agent": raw.get("assigned_agent", ""),
+        "required_capability": raw.get("required_capability", ""),
+        "expected_output": raw.get("expected_output", ""),
+        "timeout_seconds": raw.get("timeout_seconds", 300),
+        "permission_level": raw.get("permission_level", PermissionLevel.L0.value),
+        "success_criteria": raw.get("success_criteria", []),
+        "verification": raw.get("verification", []),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def compute_params_digest(task_data: dict[str, Any]) -> str:
+    """Compute canonical SHA-256 digest of execution-bound task parameters."""
+    canonical = {
+        "objective": task_data.get("objective", ""),
+        "description": task_data.get("description", ""),
+        "assigned_agent": task_data.get("assigned_agent", ""),
+        "permission_level": task_data.get("permission_level", ""),
+        "timeout_seconds": task_data.get("timeout_seconds", 0),
+        "workspace": task_data.get("workspace", ""),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 class AgentOrchestrator:
@@ -48,6 +107,242 @@ class AgentOrchestrator:
         self.max_retries = max(0, int(max_retries))
         # In-process handles for currently running background executions: task_id -> (exec_id, asyncio.Task)
         self._inflight: dict[str, tuple[str, asyncio.Task[AgentExecution]]] = {}
+        self._approval_locks: dict[str, asyncio.Lock] = {}
+
+    def _approval_lock(self, task_id: str) -> asyncio.Lock:
+        lock = self._approval_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._approval_locks[task_id] = lock
+        return lock
+
+    async def approve_and_dispatch(
+        self,
+        task_id: uuid.UUID,
+        approver: str = "operator",
+        reason: str = "",
+        channel: str = "api",
+    ) -> dict[str, Any]:
+        """Public L2 approval service (P1-1a).
+
+        Re-validates task state, approval expiry, plan_hash integrity, governance policy (L3 block),
+        budget, target agent health, and workspace isolation before atomically claiming and launching.
+        """
+        tid_str = str(task_id)
+        async with self._approval_lock(tid_str):
+            task = await self.repo.get_task(task_id)
+            if task is None:
+                raise ApprovalNotFoundError(f"Task {tid_str} not found")
+            if task["status"] != TaskStatus.REQUIRES_APPROVAL.value:
+                raise ApprovalConflictError(
+                    f"Task {tid_str} is not awaiting approval (current status: {task['status']})"
+                )
+
+            now = utcnow()
+            approval = await self.repo.get_pending_approval_for_task(task_id)
+            if approval is not None and _ensure_utc(approval["expires_at"]) <= now:
+                await self.repo.update_approval_record(
+                    uuid.UUID(approval["approval_id"]),
+                    status="EXPIRED",
+                    decision_note="Approval expired before decision",
+                    decided_at=now,
+                )
+                raise ApprovalConflictError(f"Approval for task {tid_str} has expired")
+
+            plan_row = await self.repo.get_plan(uuid.UUID(task["plan_id"])) if task.get("plan_id") else None
+            if plan_row is not None:
+                if plan_row["status"] not in {"REQUIRES_APPROVAL", "APPROVED"}:
+                    raise ApprovalConflictError(
+                        f"Associated plan is not approvable (status={plan_row['status']})"
+                    )
+                current_hash = compute_plan_hash(plan_row["plan"])
+                if plan_row.get("plan_hash") and plan_row["plan_hash"] != current_hash:
+                    raise ApprovalConflictError("Plan integrity check failed: plan_hash mismatch")
+                if approval is not None and approval["plan_hash"] != current_hash:
+                    raise ApprovalConflictError("Plan changed since approval request was created")
+                reconstructed_plan = ActionPlan.model_validate(plan_row["plan"])
+            else:
+                verif_specs = [
+                    v if isinstance(v, VerificationSpec) else VerificationSpec.model_validate(v)
+                    for v in (task.get("verification") or [])
+                ]
+                reconstructed_plan = ActionPlan(
+                    goal_title=task["objective"][:120],
+                    objective=task["objective"],
+                    description=task.get("description", ""),
+                    assigned_agent=task["assigned_agent"],
+                    required_capability=task.get("required_capability") or "general_task",
+                    expected_output=task.get("expected_output", ""),
+                    timeout_seconds=int(task["timeout_seconds"]),
+                    permission_level=task["permission_level"],
+                    success_criteria=list(task.get("success_criteria") or []),
+                    verification=verif_specs,
+                )
+
+            goal_row = await self.repo.get_goal(uuid.UUID(task["goal_id"])) if task.get("goal_id") else None
+            drive_type = goal_row["drive_type"] if goal_row else "unknown"
+            cycle_uuid = uuid.UUID(task["cycle_id"]) if task.get("cycle_id") else None
+
+            # 1. Re-validate Governance policy (human approval can NEVER override L3 hard prohibitions)
+            verdict = await self.governance.validate_plan(reconstructed_plan, drive_type)
+            verdict_label = (
+                "denied"
+                if verdict.effective_level == PermissionLevel.L3.value
+                else ("requires_approval" if verdict.requires_approval else ("allowed" if verdict.allowed else "denied"))
+            )
+            await self.repo.record_policy_evaluation(
+                subject_type="approval_recheck",
+                subject_id=task_id,
+                cycle_id=cycle_uuid,
+                requested_level=verdict.requested_level,
+                deterministic_level=verdict.effective_level,
+                semantic_level=None,
+                effective_level=verdict.effective_level,
+                verdict=verdict_label,
+                violations=verdict.violations,
+                reason=verdict.reason,
+            )
+            if verdict.effective_level == PermissionLevel.L3.value:
+                raise ApprovalDeniedError(f"Governance recheck forbids L3 operation: {verdict.reason}")
+
+            # 2. Re-validate Budget
+            budget = await self.governance.check_budget()
+            if not budget.allowed:
+                raise ApprovalDeniedError(f"Budget recheck failed: {budget.reason}")
+
+            # 3. Re-validate assigned external agent is registered, enabled, and healthy
+            assigned_agent = task["assigned_agent"]
+            adapter = self.registry.get(assigned_agent)
+            probe = self.registry.get_probe(assigned_agent)
+            if adapter is None or not adapter.capability.enabled or probe is None or not probe.ok:
+                raise ApprovalDeniedError(
+                    f"Assigned agent '{assigned_agent}' is unavailable, disabled, or unhealthy"
+                )
+
+            # 4. Re-validate workspace isolation and sandbox level
+            ws_root = getattr(self.governance, "workspace_root", None)
+            workspace = task.get("workspace") or ""
+            if ws_root is not None:
+                ws_root_resolved = Path(ws_root).resolve()
+                ws_path = Path(workspace).resolve() if workspace else None
+                if ws_path is None or ws_root_resolved not in ws_path.parents:
+                    workspace = self.governance.prepare_workspace(tid_str)
+                    await self.repo.update_task(task_id, workspace=workspace)
+                else:
+                    os.makedirs(ws_path, exist_ok=True)
+            else:
+                workspace = self.governance.prepare_workspace(tid_str)
+
+            req_sandbox = (task.get("resource_budget") or {}).get("sandbox_mode")
+            if req_sandbox in ALLOWED_APPROVAL_SANDBOXES:
+                sandbox_mode = req_sandbox
+            elif task["permission_level"] == PermissionLevel.L0.value:
+                sandbox_mode = "read-only"
+            else:
+                sandbox_mode = "workspace-write"
+
+            # 5. Atomic DB claim prevents concurrent double-dispatch
+            claimed = await self.repo.claim_task_for_approval(
+                task_id,
+                allowed_statuses=[TaskStatus.REQUIRES_APPROVAL.value],
+                new_status=TaskStatus.DISPATCHED.value,
+            )
+            if not claimed:
+                raise ApprovalConflictError(f"Task {tid_str} approval was already processed concurrently")
+
+            if plan_row is not None:
+                await self.repo.update_plan_status(uuid.UUID(task["plan_id"]), "APPROVED")
+            if approval is not None:
+                await self.repo.update_approval_record(
+                    uuid.UUID(approval["approval_id"]),
+                    status="CONSUMED",
+                    approver=approver,
+                    channel=channel,
+                    decision_note=reason or "approved",
+                    decided_at=now,
+                    consumed_at=now,
+                )
+            await self.repo.log_decision(
+                decision_type="human_approval",
+                selected="APPROVED",
+                alternatives=["REJECTED"],
+                reason=f"Approved task {tid_str} by {approver}" + (f": {reason}" if reason else ""),
+                payload={
+                    "task_id": tid_str,
+                    "approver": approver,
+                    "channel": channel,
+                    "assigned_agent": assigned_agent,
+                    "sandbox_mode": sandbox_mode,
+                    "effective_level": verdict.effective_level,
+                },
+                cycle_id=cycle_uuid,
+            )
+
+            exec_id = await self._launch_attempt(task_id, assigned_agent, sandbox_mode, cycle_id=cycle_uuid)
+            return {
+                "task_id": tid_str,
+                "execution_id": exec_id,
+                "assigned_agent": assigned_agent,
+                "sandbox_mode": sandbox_mode,
+                "status": TaskStatus.RUNNING.value,
+            }
+
+    async def reject_approval(
+        self,
+        task_id: uuid.UUID,
+        approver: str = "operator",
+        reason: str = "operator rejected",
+        channel: str = "api",
+    ) -> dict[str, Any]:
+        """Public L2 rejection service syncing task, plan, goal, approval record, and audit log."""
+        tid_str = str(task_id)
+        async with self._approval_lock(tid_str):
+            task = await self.repo.get_task(task_id)
+            if task is None:
+                raise ApprovalNotFoundError(f"Task {tid_str} not found")
+            if task["status"] != TaskStatus.REQUIRES_APPROVAL.value:
+                raise ApprovalConflictError(
+                    f"Task {tid_str} is not awaiting approval (current status: {task['status']})"
+                )
+
+            now = utcnow()
+            claimed = await self.repo.claim_task_for_approval(
+                task_id,
+                allowed_statuses=[TaskStatus.REQUIRES_APPROVAL.value],
+                new_status=TaskStatus.REJECTED.value,
+                outcome={"rejected_reason": reason, "rejected_by": approver, "rejected_at": now.isoformat()},
+            )
+            if not claimed:
+                raise ApprovalConflictError(f"Task {tid_str} approval was already processed concurrently")
+
+            if task.get("plan_id"):
+                await self.repo.update_plan_status(uuid.UUID(task["plan_id"]), "REJECTED")
+            if task.get("goal_id"):
+                await self.repo.transition_goal(
+                    uuid.UUID(task["goal_id"]),
+                    GoalStatus.REJECTED.value,
+                    note=f"Approval rejected by {approver}: {reason}",
+                )
+            approval = await self.repo.get_pending_approval_for_task(task_id)
+            if approval is not None:
+                await self.repo.update_approval_record(
+                    uuid.UUID(approval["approval_id"]),
+                    status="REJECTED",
+                    approver=approver,
+                    channel=channel,
+                    decision_note=reason,
+                    decided_at=now,
+                )
+            cycle_uuid = uuid.UUID(task["cycle_id"]) if task.get("cycle_id") else None
+            await self.repo.log_decision(
+                decision_type="human_approval",
+                selected="REJECTED",
+                alternatives=["APPROVED"],
+                reason=f"Rejected task {tid_str} by {approver}: {reason}",
+                payload={"task_id": tid_str, "approver": approver, "channel": channel},
+                cycle_id=cycle_uuid,
+            )
+            return {"task_id": tid_str, "status": TaskStatus.REJECTED.value}
 
     async def submit_plan(
         self,

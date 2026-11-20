@@ -49,11 +49,13 @@ class HermesAdapter(AgentInterface):
         cap: AgentCapability,
         binary: str = "hermes",
         options: dict[str, Any] | None = None,
+        llm_settings: Any | None = None,
     ) -> None:
         # Force experimental flag per task book 7.2
         self._cap = cap.model_copy(update={"experimental": True})
         self.binary = binary
         self.options = dict(options or {})
+        self._llm_settings = llm_settings
         self._running: dict[str, _RunningProc] = {}
         self._finished: dict[str, AgentStatus] = {}
 
@@ -80,24 +82,8 @@ class HermesAdapter(AgentInterface):
         except Exception as exc:
             return AgentProbeResult(ok=False, binary=resolved, error=str(exc))
 
-    async def execute(self, task: AgentTask) -> AgentExecution:
-        exec_id = task.execution_id or str(uuid.uuid4())
-        started = utcnow()
-        t0 = time.perf_counter()
-
-        resolved = shutil.which(self.binary)
-        if not resolved:
-            return AgentExecution(
-                execution_id=exec_id,
-                task_id=task.task_id,
-                agent_id=self._cap.agent_id,
-                status=ExecutionStatus.FAILED.value,
-                started_at=started,
-                completed_at=utcnow(),
-                error=f"Hermes binary '{self.binary}' not found",
-            )
-
-        os.makedirs(task.workspace, exist_ok=True)
+    def build_command_and_env(self, resolved: str, task: AgentTask) -> tuple[list[str], dict[str, str]]:
+        """Build Hermes subprocess argv and sanitized env (API key ONLY via env, never argv)."""
         max_turns = int(self.options.get("max_turns", 20))
         toolsets = self.options.get("toolsets")
         safe_mode = bool(self.options.get("safe_mode", True))
@@ -117,11 +103,15 @@ class HermesAdapter(AgentInterface):
             "--max-turns",
             str(max_turns),
         ]
+        extra_env: dict[str, str] = {}
         if safe_mode:
             cmd.append("--safe-mode")
-            from app.core.config import get_settings
+            if self._llm_settings is not None:
+                llm_cfg = self._llm_settings
+            else:
+                from app.core.config import get_settings
 
-            llm_cfg = get_settings().llm
+                llm_cfg = get_settings().llm
             cmd.extend(
                 [
                     "--provider",
@@ -133,11 +123,36 @@ class HermesAdapter(AgentInterface):
                 ]
             )
             if llm_cfg.api_key:
-                cmd.extend(["--api-key", llm_cfg.api_key.get_secret_value()])
+                secret = llm_cfg.api_key.get_secret_value()
+                if secret:
+                    # Security (P1-1a): pass API key strictly via environment, NEVER via CLI argv
+                    extra_env["OPENAI_API_KEY"] = secret
+                    extra_env["HERMES_API_KEY"] = secret
         if ignore_user_cfg:
             cmd.append("--ignore-user-config")
         if toolsets:
             cmd.extend(["-t", str(toolsets)])
+        return cmd, sanitize_env(extra_env)
+
+    async def execute(self, task: AgentTask) -> AgentExecution:
+        exec_id = task.execution_id or str(uuid.uuid4())
+        started = utcnow()
+        t0 = time.perf_counter()
+
+        resolved = shutil.which(self.binary)
+        if not resolved:
+            return AgentExecution(
+                execution_id=exec_id,
+                task_id=task.task_id,
+                agent_id=self._cap.agent_id,
+                status=ExecutionStatus.FAILED.value,
+                started_at=started,
+                completed_at=utcnow(),
+                error=f"Hermes binary '{self.binary}' not found",
+            )
+
+        os.makedirs(task.workspace, exist_ok=True)
+        cmd, proc_env = self.build_command_and_env(resolved, task)
 
         prompt = build_agent_prompt(task)
         try:
@@ -147,7 +162,7 @@ class HermesAdapter(AgentInterface):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=task.workspace,
-                env=sanitize_env(),
+                env=proc_env,
                 start_new_session=True,
             )
         except Exception as exc:

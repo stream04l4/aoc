@@ -65,6 +65,8 @@ class OrganismState(Base):
     cycle_count: Mapped[int] = mapped_column(Integer, default=0)
     emotion_reserved: Mapped[dict] = mapped_column(JsonType, default=dict)  # reserved, V1 unused
     pause_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    quota_reset_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    throttled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_wake_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     next_wake_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
@@ -179,6 +181,7 @@ class ActionPlanRow(Base):
     goal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("active_goals.id"), index=True)
     cycle_id: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
     plan: Mapped[dict] = mapped_column(JsonType, default=dict)
+    plan_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     permission_level: Mapped[str] = mapped_column(String(4))
     policy_verdict: Mapped[dict] = mapped_column(JsonType, default=dict)
     status: Mapped[str] = mapped_column(String(32))
@@ -335,3 +338,60 @@ class SystemConfig(Base):
     value: Mapped[dict] = mapped_column(JsonType, default=dict)
     updated_by: Mapped[str] = mapped_column(String(64), default="operator")
     updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+# ── security, approvals & policy audit (P1-1a / V2.0) ───────────────────────
+class ApiCredential(Base):
+    __tablename__ = "api_credentials"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    key_prefix: Mapped[str] = mapped_column(String(16), index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    scopes: Mapped[list] = mapped_column(JsonType, default=list)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    expires_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class ApprovalRecord(Base):
+    __tablename__ = "approval_records"
+    __table_args__ = (
+        Index("ix_approval_records_task_status", "task_id", "status"),
+        Index("ix_approval_records_expires", "expires_at"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_tasks.id"))
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("action_plans.id"), nullable=True)
+    plan_hash: Mapped[str] = mapped_column(String(64))
+    params_digest: Mapped[str] = mapped_column(String(64))
+    permission_level: Mapped[str] = mapped_column(String(4))
+    nonce: Mapped[str] = mapped_column(String(64), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING")
+    approver: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(TS)
+    decided_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class PolicyEvaluation(Base):
+    __tablename__ = "policy_evaluations"
+    __table_args__ = (
+        Index("ix_policy_evaluations_subject", "subject_type", "subject_id"),
+        Index("ix_policy_evaluations_created", "created_at"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    cycle_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    subject_type: Mapped[str] = mapped_column(String(32))  # plan | approval_recheck | mcp_tool
+    subject_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    requested_level: Mapped[str] = mapped_column(String(4))
+    deterministic_level: Mapped[str] = mapped_column(String(4))
+    semantic_level: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    effective_level: Mapped[str] = mapped_column(String(4))
+    verdict: Mapped[str] = mapped_column(String(32))  # allowed | requires_approval | denied
+    violations: Mapped[list] = mapped_column(JsonType, default=list)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)

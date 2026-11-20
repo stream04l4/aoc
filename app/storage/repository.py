@@ -19,6 +19,8 @@ from app.storage.models import (
     AgentExecutionRow,
     AgentRegistryRow,
     AgentTaskRow,
+    ApiCredential,
+    ApprovalRecord,
     CycleRecord,
     DecisionLog,
     DriveHistory,
@@ -29,6 +31,7 @@ from app.storage.models import (
     ObservationRecord,
     OrganismIdentity,
     OrganismState,
+    PolicyEvaluation,
     ResourceUsage,
     SystemConfig,
     WorldState,
@@ -100,6 +103,8 @@ class StateRepository:
                 "current_cycle_id": st.current_cycle_id,
                 "cycle_count": st.cycle_count,
                 "pause_requested": st.pause_requested,
+                "quota_reset_at": st.quota_reset_at,
+                "throttled_reason": st.throttled_reason,
                 "last_wake_at": st.last_wake_at,
                 "next_wake_at": st.next_wake_at,
                 "heartbeat_at": st.heartbeat_at,
@@ -429,13 +434,21 @@ class StateRepository:
         }
 
     async def create_plan(
-        self, goal_id: uuid.UUID, cycle_id: uuid.UUID, plan: Any, permission_level: str, verdict: Any, status: str
+        self,
+        goal_id: uuid.UUID,
+        cycle_id: uuid.UUID,
+        plan: Any,
+        permission_level: str,
+        verdict: Any,
+        status: str,
+        plan_hash: str | None = None,
     ) -> uuid.UUID:
         async with self.db.session() as s:
             p = ActionPlanRow(
                 goal_id=goal_id,
                 cycle_id=cycle_id,
                 plan=_jsonable(plan),
+                plan_hash=plan_hash,
                 permission_level=permission_level,
                 policy_verdict=_jsonable(verdict),
                 status=status,
@@ -443,6 +456,24 @@ class StateRepository:
             s.add(p)
             await s.flush()
             return p.id
+
+    async def get_plan(self, plan_id: uuid.UUID) -> dict | None:
+        async with self.db.session() as s:
+            p = await s.get(ActionPlanRow, plan_id)
+            if p is None:
+                return None
+            return {
+                "plan_id": str(p.id),
+                "goal_id": str(p.goal_id),
+                "cycle_id": str(p.cycle_id),
+                "plan": p.plan,
+                "plan_hash": p.plan_hash,
+                "permission_level": p.permission_level,
+                "policy_verdict": p.policy_verdict,
+                "status": p.status,
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+            }
 
     async def update_plan_status(self, plan_id: uuid.UUID, status: str) -> None:
         async with self.db.session() as s:
@@ -500,6 +531,25 @@ class StateRepository:
         values["updated_at"] = utcnow()
         async with self.db.session() as s:
             await s.execute(update(AgentTaskRow).where(AgentTaskRow.id == task_id).values(**values))
+
+    async def claim_task_for_approval(
+        self,
+        task_id: uuid.UUID,
+        allowed_statuses: list[str],
+        new_status: str,
+        outcome: dict | None = None,
+    ) -> bool:
+        """Atomically transition a task awaiting approval to prevent concurrent double-dispatch."""
+        values: dict[str, Any] = {"status": new_status, "updated_at": utcnow()}
+        if outcome is not None:
+            values["outcome"] = _jsonable(outcome)
+        async with self.db.session() as s:
+            res = await s.execute(
+                update(AgentTaskRow)
+                .where(AgentTaskRow.id == task_id, AgentTaskRow.status.in_(allowed_statuses))
+                .values(**values)
+            )
+            return (res.rowcount or 0) == 1
 
     async def get_task(self, task_id: uuid.UUID) -> dict | None:
         async with self.db.session() as s:
@@ -728,6 +778,207 @@ class StateRepository:
                 r.value = _jsonable(value)
                 r.updated_by = updated_by
                 r.updated_at = utcnow()
+
+    # ── api credentials (P1-1a) ─────────────────────────────────────────────
+    async def create_api_credential(
+        self,
+        name: str,
+        key_prefix: str,
+        key_hash: str,
+        scopes: list[str],
+        expires_at: datetime | None = None,
+    ) -> dict:
+        async with self.db.session() as s:
+            row = ApiCredential(
+                name=name,
+                key_prefix=key_prefix,
+                key_hash=key_hash,
+                scopes=_jsonable(scopes),
+                expires_at=expires_at,
+            )
+            s.add(row)
+            await s.flush()
+            return self._cred_dict(row)
+
+    async def get_api_credential_by_hash(self, key_hash: str) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(ApiCredential).where(ApiCredential.key_hash == key_hash))
+            ).scalar_one_or_none()
+            return self._cred_dict(row) if row else None
+
+    async def touch_api_credential(self, cred_id: uuid.UUID) -> None:
+        async with self.db.session() as s:
+            await s.execute(
+                update(ApiCredential).where(ApiCredential.id == cred_id).values(last_used_at=utcnow())
+            )
+
+    async def revoke_api_credential(self, cred_id: uuid.UUID) -> bool:
+        async with self.db.session() as s:
+            res = await s.execute(
+                update(ApiCredential).where(ApiCredential.id == cred_id).values(revoked=True)
+            )
+            return (res.rowcount or 0) > 0
+
+    async def has_active_api_credentials(self) -> bool:
+        now = utcnow()
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(select(ApiCredential).where(ApiCredential.revoked.is_(False)))
+            ).scalars().all()
+            for r in rows:
+                if r.expires_at is None:
+                    return True
+                exp = r.expires_at.replace(tzinfo=timezone.utc) if r.expires_at.tzinfo is None else r.expires_at
+                if exp > now:
+                    return True
+            return False
+
+    @staticmethod
+    def _cred_dict(r: ApiCredential) -> dict:
+        return {
+            "id": r.id,
+            "name": r.name,
+            "key_prefix": r.key_prefix,
+            "scopes": r.scopes,
+            "revoked": r.revoked,
+            "expires_at": r.expires_at,
+            "last_used_at": r.last_used_at,
+            "created_at": r.created_at,
+        }
+
+    # ── approval records (P1-1a / P1-8) ─────────────────────────────────────
+    async def create_approval_record(
+        self,
+        task_id: uuid.UUID,
+        plan_id: uuid.UUID | None,
+        plan_hash: str,
+        params_digest: str,
+        permission_level: str,
+        nonce: str,
+        expires_at: datetime,
+        status: str = "PENDING",
+    ) -> dict:
+        async with self.db.session() as s:
+            row = ApprovalRecord(
+                task_id=task_id,
+                plan_id=plan_id,
+                plan_hash=plan_hash,
+                params_digest=params_digest,
+                permission_level=permission_level,
+                nonce=nonce,
+                status=status,
+                expires_at=expires_at,
+            )
+            s.add(row)
+            await s.flush()
+            return self._approval_dict(row)
+
+    async def get_pending_approval_for_task(self, task_id: uuid.UUID) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(ApprovalRecord)
+                    .where(ApprovalRecord.task_id == task_id, ApprovalRecord.status == "PENDING")
+                    .order_by(ApprovalRecord.created_at.desc())
+                )
+            ).scalars().first()
+            return self._approval_dict(row) if row else None
+
+    async def get_approval_record(self, approval_id: uuid.UUID) -> dict | None:
+        async with self.db.session() as s:
+            row = await s.get(ApprovalRecord, approval_id)
+            return self._approval_dict(row) if row else None
+
+    async def update_approval_record(self, approval_id: uuid.UUID, **values: Any) -> None:
+        clean = {}
+        for k, v in values.items():
+            clean[k] = v if k in {"decided_at", "consumed_at", "expires_at"} else _jsonable(v)
+        async with self.db.session() as s:
+            await s.execute(update(ApprovalRecord).where(ApprovalRecord.id == approval_id).values(**clean))
+
+    async def list_approval_records(self, status: str | None = None, limit: int = 50) -> list[dict]:
+        async with self.db.session() as s:
+            q = select(ApprovalRecord)
+            if status:
+                q = q.where(ApprovalRecord.status == status)
+            rows = (await s.execute(q.order_by(ApprovalRecord.created_at.desc()).limit(limit))).scalars().all()
+            return [self._approval_dict(r) for r in rows]
+
+    @staticmethod
+    def _approval_dict(r: ApprovalRecord) -> dict:
+        return {
+            "approval_id": str(r.id),
+            "task_id": str(r.task_id),
+            "plan_id": str(r.plan_id) if r.plan_id else None,
+            "plan_hash": r.plan_hash,
+            "params_digest": r.params_digest,
+            "permission_level": r.permission_level,
+            "nonce": r.nonce,
+            "status": r.status,
+            "approver": r.approver,
+            "channel": r.channel,
+            "decision_note": r.decision_note,
+            "expires_at": r.expires_at,
+            "decided_at": r.decided_at,
+            "consumed_at": r.consumed_at,
+            "created_at": r.created_at,
+        }
+
+    # ── policy evaluations (P1-1a / P1-8) ───────────────────────────────────
+    async def record_policy_evaluation(
+        self,
+        subject_type: str,
+        requested_level: str,
+        deterministic_level: str,
+        effective_level: str,
+        verdict: str,
+        violations: list[str] | None = None,
+        reason: str = "",
+        cycle_id: uuid.UUID | None = None,
+        subject_id: uuid.UUID | None = None,
+        semantic_level: str | None = None,
+    ) -> uuid.UUID:
+        async with self.db.session() as s:
+            row = PolicyEvaluation(
+                cycle_id=cycle_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                requested_level=requested_level,
+                deterministic_level=deterministic_level,
+                semantic_level=semantic_level,
+                effective_level=effective_level,
+                verdict=verdict,
+                violations=_jsonable(violations or []),
+                reason=reason,
+            )
+            s.add(row)
+            await s.flush()
+            return row.id
+
+    async def list_policy_evaluations(self, subject_type: str | None = None, limit: int = 50) -> list[dict]:
+        async with self.db.session() as s:
+            q = select(PolicyEvaluation)
+            if subject_type:
+                q = q.where(PolicyEvaluation.subject_type == subject_type)
+            rows = (await s.execute(q.order_by(PolicyEvaluation.created_at.desc()).limit(limit))).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "cycle_id": str(r.cycle_id) if r.cycle_id else None,
+                    "subject_type": r.subject_type,
+                    "subject_id": str(r.subject_id) if r.subject_id else None,
+                    "requested_level": r.requested_level,
+                    "deterministic_level": r.deterministic_level,
+                    "semantic_level": r.semantic_level,
+                    "effective_level": r.effective_level,
+                    "verdict": r.verdict,
+                    "violations": r.violations,
+                    "reason": r.reason,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
 
 
 def day_start(now: datetime | None = None) -> datetime:

@@ -12,8 +12,11 @@ runtime:
   max_cycles: 0                     # 0 = unlimited (used by tests to bound runs)
 
 api:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 9200
+  auth_enabled: true
+  # admin_key: from AOC_API__ADMIN_KEY
+  # internal_token: from AOC_API__INTERNAL_TOKEN (for /metrics & /v1/embeddings)
 
 database:
   # Full URL comes from AOC_DATABASE__URL; this is only the local default.

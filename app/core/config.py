@@ -44,8 +44,11 @@ class RuntimeSettings(BaseModel):
 
 
 class ApiSettings(BaseModel):
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 9200
+    auth_enabled: bool = True
+    admin_key: SecretStr | None = None
+    internal_token: SecretStr | None = None
 
 
 class DatabaseSettings(BaseModel):
