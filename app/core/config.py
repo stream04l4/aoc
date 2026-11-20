@@ -113,6 +113,17 @@ class LoggingSettings(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class LifecycleSettings(BaseModel):
+    task_poll_interval: float = 5.0
+    max_inflight_tasks: int = 1
+    task_reconciliation_interval: float = 30.0
+    outbox_poll_interval: float = 2.0
+    outbox_batch_size: int = 20
+    outbox_max_attempts: int = 5
+    outbox_base_backoff_seconds: float = 10.0
+    retry_backoff_seconds: float = 1.0
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -141,6 +152,7 @@ class Settings(BaseSettings):
     perception: PerceptionSettings = Field(default_factory=PerceptionSettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    lifecycle: LifecycleSettings = Field(default_factory=LifecycleSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -173,3 +185,8 @@ def get_agent_config() -> dict[str, Any]:
 @lru_cache
 def get_policy_config() -> dict[str, Any]:
     return load_yaml("policy.yaml")
+
+
+@lru_cache
+def get_lifecycle_config() -> dict[str, Any]:
+    return load_yaml("lifecycle.yaml")

@@ -19,6 +19,7 @@ class SensorManager(PerceptionInterface):
         self._sensors: dict[str, SensorInterface] = {}
         self.repo = repo
         self.sensor_timeout_seconds = sensor_timeout_seconds
+        self.last_observation_id: uuid.UUID | None = None
 
     def register(self, sensor: SensorInterface) -> None:
         self._sensors[sensor.name] = sensor
@@ -103,6 +104,6 @@ class SensorManager(PerceptionInterface):
         )
 
         if persist and self.repo is not None:
-            await self.repo.save_observation(merged, cycle_id=cycle_id, phase=phase)
+            self.last_observation_id = await self.repo.save_observation(merged, cycle_id=cycle_id, phase=phase)
 
         return merged

@@ -18,6 +18,9 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `GET` | `/cycles?limit=20` | Recent autonomous cycle audit records |
 | `GET` | `/goals?status=&limit=50` | Active and historical goals |
 | `GET` | `/tasks?status=&limit=50` | External agent tasks and verification outcomes |
+| `GET` | `/v2/tasks/{task_id}/lifecycle` | Immutable `task_lifecycle_events` state machine history (`read` scope) |
+| `GET` | `/v2/tasks/{task_id}/attempts` | All `agent_executions` attempts for a task (`read` scope) |
+| `POST` | `/v2/tasks/{task_id}/cancel` | Cancel an active/queued/pending task and enqueue finalization (`control` scope) |
 | `GET` | `/agents` | Registered external agents and live probe results |
 | `GET` | `/memories?memory_type=&query=&limit=20` | Recall memories across Letta and PostgreSQL index |
 | `GET` | `/events?limit=50&event_type=` | Structured system event log |

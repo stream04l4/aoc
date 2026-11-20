@@ -34,11 +34,15 @@ NO_DRIVE = "none"
 
 class ExecutionStatus(StrEnum):
     PENDING = "PENDING"
+    DISPATCHING = "DISPATCHING"
     RUNNING = "RUNNING"
+    RESULT_RECEIVED = "RESULT_RECEIVED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     TIMEOUT = "TIMEOUT"
     CANCELLED = "CANCELLED"
+    ORPHANED = "ORPHANED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
     REQUIRES_APPROVAL = "REQUIRES_APPROVAL"
 
     @property
@@ -48,19 +52,34 @@ class ExecutionStatus(StrEnum):
             ExecutionStatus.FAILED,
             ExecutionStatus.TIMEOUT,
             ExecutionStatus.CANCELLED,
+            ExecutionStatus.ORPHANED,
+            ExecutionStatus.RECOVERY_REQUIRED,
         }
 
 
 class TaskStatus(StrEnum):
-    PENDING = "PENDING"
-    DISPATCHED = "DISPATCHED"
+    # Durable Task State Machine (V2.0 P1-2) + V1.0 backward-compatible aliases
+    CREATED = "CREATED"
+    VALIDATING = "VALIDATING"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    REQUIRES_APPROVAL = "REQUIRES_APPROVAL"  # V1.0 alias for AWAITING_APPROVAL
+    QUEUED = "QUEUED"
+    PENDING = "PENDING"  # V1.0 legacy initial status
+    DISPATCHING = "DISPATCHING"
+    DISPATCHED = "DISPATCHED"  # V1.0 legacy alias for DISPATCHING
     RUNNING = "RUNNING"
+    RESULT_RECEIVED = "RESULT_RECEIVED"
     VERIFYING = "VERIFYING"
+    RETRY_WAIT = "RETRY_WAIT"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
-    REQUIRES_APPROVAL = "REQUIRES_APPROVAL"
     REJECTED = "REJECTED"
     ABANDONED = "ABANDONED"
+    CANCELLED = "CANCELLED"
+    TIMEOUT = "TIMEOUT"
+    ORPHANED = "ORPHANED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    BUDGET_DEFERRED = "BUDGET_DEFERRED"
 
     @property
     def is_terminal(self) -> bool:
@@ -69,7 +88,14 @@ class TaskStatus(StrEnum):
             TaskStatus.FAILED,
             TaskStatus.REJECTED,
             TaskStatus.ABANDONED,
+            TaskStatus.CANCELLED,
+            TaskStatus.RECOVERY_REQUIRED,
+            TaskStatus.BUDGET_DEFERRED,
         }
+
+    @property
+    def is_awaiting_approval(self) -> bool:
+        return self in {TaskStatus.REQUIRES_APPROVAL, TaskStatus.AWAITING_APPROVAL}
 
 
 class GoalStatus(StrEnum):

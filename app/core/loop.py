@@ -33,8 +33,6 @@ from app.cognition.interfaces import (
     BrainError,
     BrainInterface,
     CognitiveContext,
-    EvaluationContext,
-    EvaluationResult,
     GoalProposal,
     VerificationSpec,
 )
@@ -42,7 +40,6 @@ from app.core.config import Settings
 from app.core.enums import (
     NO_DRIVE,
     DriveType,
-    ExecutionStatus,
     GoalStatus,
     LifecycleState,
     MemoryType,
@@ -55,12 +52,13 @@ from app.drives.engine import DriveEngine
 from app.drives.interfaces import DriveContext, DriveDecision, DriveState, KnowledgeGap
 from app.governance.interfaces import GovernanceInterface
 from app.memory.experience_manager import ExperienceManager
-from app.memory.interfaces import MemoryItem
 from app.observability.logging import get_logger
 from app.observability.metrics import CYCLE_DURATION, CYCLES_TOTAL
+from app.orchestration.finalizer import TaskFinalizer
 from app.orchestration.orchestrator import AgentOrchestrator, compute_params_digest, compute_plan_hash
 from app.perception.interfaces import Observation, utcnow
 from app.perception.manager import SensorManager
+from app.storage.outbox import OutboxDispatcher
 from app.storage.repository import StateRepository, day_start
 
 logger = get_logger("aoc.loop")
@@ -85,6 +83,8 @@ class AutonomousLoop:
         orchestrator: AgentOrchestrator,
         memory: ExperienceManager,
         llm_gateway: LLMGatewayInterface | None = None,
+        finalizer: TaskFinalizer | None = None,
+        outbox: OutboxDispatcher | None = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -98,6 +98,7 @@ class AutonomousLoop:
         self.orchestrator = orchestrator
         self.memory = memory
         self.llm_gateway = llm_gateway
+        self.outbox = outbox
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -105,6 +106,24 @@ class AutonomousLoop:
         self._last_info_gain_at: datetime | None = None
         # Re-entrancy guard preventing Scheduler and API /control/cycle from overlapping (P1-1a)
         self._cycle_lock = asyncio.Lock()
+
+        self.finalizer = finalizer or TaskFinalizer(
+            organism_id=organism_id,
+            repo=repo,
+            perception=perception,
+            drives=drives,
+            brain=brain,
+            governance=governance,
+            memory=memory,
+            verifier=orchestrator.verifier,
+            llm_gateway=llm_gateway,
+            on_learning=self._record_learning_signal,
+        )
+
+    def _record_learning_signal(self, when: datetime, gain: float) -> None:
+        self._last_learning_at = when
+        self._last_info_gain = gain
+        self._last_info_gain_at = when
 
     async def recover(self) -> dict[str, Any]:
         """Startup recovery (Scenario E): restore identity, memory, probes, and orphan tasks."""
@@ -180,6 +199,8 @@ class AutonomousLoop:
             # ── 3. PERCEPTION ───────────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="PERCEPTION")
             pre_obs = await self.perception.perceive(cycle_id=cycle_id, phase="pre", persist=True)
+            if self.perception.last_observation_id is not None:
+                await self.repo.update_cycle(cycle_id, observation_id=self.perception.last_observation_id)
 
             # P1-1: Pre-check Economic Quota BEFORE invoking LLM to prevent budget-exhausted spin loops!
             pre_budget = await self.governance.check_budget()
@@ -512,19 +533,37 @@ class AutonomousLoop:
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
             # ── 12. OUTCOME EVALUATION + POST-PERCEPTION RE-EVALUATION ──────
+            # Unified TaskFinalizer.finalize_execution() (V2.0 P1-2: single completion path)
             await self.repo.update_cycle(cycle_id, phase="OUTCOME_EVALUATION")
-            post_drives, eval_res, state_changes = await self._evaluate_and_consolidate(
-                cycle_id=cycle_id,
-                goal_id=goal_id,
-                goal_proposal=goal_proposal,
-                plan=plan,
-                task_state=task_state,
-                pre_obs=pre_obs,
-                pre_drives=pre_drives,
-                selected_drive=decision.selected_drive,
-                llm_available=llm_available_for_brain,
-            )
-            outcome = "SUCCEEDED" if eval_res.goal_achieved else "ACTION_FAILED"
+            exec_id = (task_state.get("outcome") or {}).get("execution_id")
+            if exec_id:
+                fin_res = await self.finalizer.finalize_execution(
+                    exec_id,
+                    pre_obs_override=pre_obs,
+                    pre_drives_override=pre_drives,
+                    llm_available_override=llm_available_for_brain,
+                )
+                post_drives = (
+                    {k: DriveState(**v) for k, v in fin_res.post_drives.items()}
+                    if fin_res.post_drives
+                    else pre_drives
+                )
+                state_changes = fin_res.evaluation.get("measured_satisfaction_change") and {
+                    "expected_outcome": fin_res.evaluation.get("expected_outcome", {}),
+                    "actual_outcome": fin_res.evaluation.get("actual_outcome", {}),
+                    "measured_satisfaction_change": fin_res.measured_satisfaction_change,
+                } or {}
+                outcome = "SUCCEEDED" if fin_res.goal_achieved else "ACTION_FAILED"
+            else:
+                # Edge case: task failed before any execution was created (e.g. no healthy agent)
+                await self.repo.transition_goal(
+                    goal_id,
+                    GoalStatus.FAILED.value,
+                    note=(task_state.get("outcome") or {}).get("error", "task failed before dispatch"),
+                )
+                post_drives = pre_drives
+                state_changes = {"task_status": task_state["status"], "error": (task_state.get("outcome") or {}).get("error")}
+                outcome = "ACTION_FAILED"
 
             # ── 14. STATE UPDATE & 15. SLEEP / NEXT CYCLE ───────────────────
             await self._finalize_cycle(cycle_id, outcome, pre_drives, post_drives, state_changes, t0)
@@ -540,16 +579,41 @@ class AutonomousLoop:
             CYCLE_DURATION.observe(time.perf_counter() - t0)
             return {"cycle_id": str(cycle_id), "outcome": "ERROR", "error": err_text}
 
-    async def _poll_existing_inflight(self, cycle_id: uuid.UUID) -> None:
+    async def _poll_existing_inflight(self, cycle_id: uuid.UUID) -> list[dict[str, Any]]:
+        """Poll in-flight cross-cycle tasks and finalize ALL unfinalized terminal executions (P1-2 / T2)."""
+        finalized: list[dict[str, Any]] = []
+
+        # 1. Poll active background executions tracked by the backend
         for tid in list(self.orchestrator.list_inflight_task_ids()):
             st = await self.orchestrator.poll_task(tid)
             if TaskStatus(st["status"]).is_terminal:
+                exec_id = (st.get("outcome") or {}).get("execution_id")
                 await self.repo.log_event(
                     "orchestrator.inflight_completed",
-                    message=f"Prior in-flight task {tid} finished with {st['status']}",
-                    payload={"task_id": tid, "status": st["status"]},
+                    message=f"Prior in-flight task {tid} finished with {st['status']}; invoking TaskFinalizer",
+                    payload={"task_id": tid, "execution_id": exec_id, "status": st["status"]},
                     cycle_id=cycle_id,
                 )
+                if exec_id:
+                    fin = await self.finalizer.finalize_execution(exec_id)
+                    finalized.append(fin.model_dump(mode="json"))
+
+        # 2. Catch any terminal executions persisted in DB that have not yet been finalized
+        #    (e.g. post-approval tasks, restart recovery, or prior cycle crashes)
+        unfinalized = await self.repo.list_unfinalized_terminal_executions(limit=20)
+        for ex in unfinalized:
+            fin = await self.finalizer.finalize_execution(ex["execution_id"])
+            if not fin.already_finalized:
+                finalized.append(fin.model_dump(mode="json"))
+
+        # 3. Drain due outbox events (e.g. execution.finalize / memory.sync_letta)
+        if self.outbox is not None:
+            try:
+                await self.outbox.dispatch_once()
+            except Exception as exc:
+                logger.warning("cycle.outbox_dispatch_error", cycle_id=str(cycle_id), error=str(exc))
+
+        return finalized
 
     async def _build_drive_context(
         self,
@@ -672,179 +736,6 @@ class AutonomousLoop:
                 rationale="Deterministic emergency fallback plan",
             )
         return ActionPlan(should_execute=False, rationale="LLM unavailable for planning")
-
-    async def _evaluate_and_consolidate(
-        self,
-        cycle_id: uuid.UUID,
-        goal_id: uuid.UUID,
-        goal_proposal: GoalProposal,
-        plan: ActionPlan,
-        task_state: dict[str, Any],
-        pre_obs: Observation,
-        pre_drives: dict[str, DriveState],
-        selected_drive: str,
-        llm_available: bool,
-    ) -> tuple[dict[str, DriveState], EvaluationResult, dict[str, Any]]:
-        exec_id = (task_state.get("outcome") or {}).get("execution_id")
-        exec_row = await self.repo.get_execution(uuid.UUID(exec_id)) if exec_id else None
-        verification_dict = (task_state.get("outcome") or {}).get("verification") or {}
-        verification_passed = bool(
-            task_state["status"] == TaskStatus.SUCCEEDED.value and verification_dict.get("passed", False)
-        )
-
-        # First evaluate execution output via Brain (guarded by verification_passed)
-        post_obs_initial = await self.perception.perceive(cycle_id=cycle_id, phase="post_raw", persist=False)
-
-        eval_ctx = EvaluationContext(
-            goal=goal_proposal.model_dump(mode="json"),
-            plan=plan.model_dump(mode="json"),
-            execution=exec_row or task_state,
-            verification_passed=verification_passed,
-            verification_details=verification_dict,
-            pre_observation=pre_obs,
-            post_observation=post_obs_initial,
-        )
-
-        if llm_available:
-            try:
-                with self._gateway_scope(cycle_id=cycle_id, emergency=(selected_drive == DriveType.SURVIVAL.value)):
-                    eval_res = await self.brain.evaluate(eval_ctx)
-                await self._record_llm_usage("evaluate", eval_res.usage, cycle_id)
-            except BrainError as exc:
-                logger.warning("cycle.evaluate_failed", error=str(exc))
-                eval_res = EvaluationResult(
-                    goal_achieved=verification_passed,
-                    summary=f"Deterministic evaluation fallback (LLM error: {exc})",
-                    information_gain=0.3 if verification_passed else 0.0,
-                    should_persist_memory=True,
-                )
-        else:
-            eval_res = EvaluationResult(
-                goal_achieved=verification_passed,
-                summary="Deterministic verification evaluation (LLM unavailable)",
-                information_gain=0.2 if verification_passed else 0.0,
-                should_persist_memory=True,
-            )
-
-        # Hard invariant (task book 17.7): never mark achieved if verification failed
-        if not verification_passed and eval_res.goal_achieved:
-            eval_res = eval_res.model_copy(update={"goal_achieved": False, "resolved_topic": None, "acquired_skill": None})
-
-        # Update digital world state ONLY on verified achievement
-        now = utcnow()
-        if eval_res.goal_achieved:
-            resolved_key = eval_res.resolved_topic or (
-                goal_proposal.related_key if selected_drive == DriveType.CURIOSITY.value else None
-            )
-            if resolved_key:
-                await self.repo.upsert_world_item(
-                    kind="knowledge_topic",
-                    key=resolved_key,
-                    value={"summary": eval_res.summary, "learned_facts": eval_res.learned_facts},
-                    status="resolved",
-                    source=f"cycle:{cycle_id}",
-                )
-            if selected_drive == DriveType.REPRODUCTION.value:
-                skill_key = eval_res.acquired_skill or goal_proposal.related_key
-                if skill_key:
-                    await self.repo.upsert_world_item(
-                        kind="capability",
-                        key=skill_key,
-                        value={"summary": eval_res.summary},
-                        status="acquired",
-                        source=f"cycle:{cycle_id}",
-                    )
-            if eval_res.information_gain > 0 or eval_res.learned_facts:
-                self._last_learning_at = now
-                self._last_info_gain = max(eval_res.information_gain, 0.25 if eval_res.learned_facts else 0.0)
-                self._last_info_gain_at = now
-
-        # ── 13. MEMORY CONSOLIDATION ────────────────────────────────────────
-        await self.repo.update_cycle(cycle_id, phase="MEMORY_CONSOLIDATION")
-        memory_writes: list[dict[str, Any]] = []
-        if eval_res.should_persist_memory or eval_res.goal_achieved or task_state["status"] == TaskStatus.FAILED.value:
-            ep = await self.memory.remember(
-                MemoryItem(
-                    memory_type=MemoryType.EPISODIC.value,
-                    title=f"[{selected_drive}] {goal_proposal.title}",
-                    content=f"Outcome: {'ACHIEVED' if eval_res.goal_achieved else 'FAILED'}. {eval_res.summary}",
-                    source=f"cycle:{cycle_id}",
-                    importance=max(eval_res.memory_importance, 0.7 if eval_res.goal_achieved else 0.6),
-                    tags=[selected_drive, "achieved" if eval_res.goal_achieved else "failed"],
-                ),
-                cycle_id=cycle_id,
-            )
-            memory_writes.append(ep.model_dump(mode="json"))
-
-        if eval_res.goal_achieved and eval_res.learned_facts:
-            sem = await self.memory.remember(
-                MemoryItem(
-                    memory_type=MemoryType.SEMANTIC.value,
-                    title=eval_res.resolved_topic or goal_proposal.title,
-                    content="\n".join(f"- {f}" for f in eval_res.learned_facts),
-                    source=f"cycle:{cycle_id}",
-                    importance=max(eval_res.memory_importance, 0.8),
-                    tags=[selected_drive, "knowledge"],
-                ),
-                cycle_id=cycle_id,
-            )
-            memory_writes.append(sem.model_dump(mode="json"))
-
-        if eval_res.goal_achieved and (eval_res.acquired_skill or selected_drive == DriveType.REPRODUCTION.value):
-            proc = await self.memory.remember(
-                MemoryItem(
-                    memory_type=MemoryType.PROCEDURAL.value,
-                    title=eval_res.acquired_skill or goal_proposal.title,
-                    content=eval_res.summary,
-                    source=f"cycle:{cycle_id}",
-                    importance=max(eval_res.memory_importance, 0.8),
-                    tags=["reproduction", "skill"],
-                ),
-                cycle_id=cycle_id,
-            )
-            memory_writes.append(proc.model_dump(mode="json"))
-
-        # Re-perceive AFTER world & memory updates, then RE-CALCULATE drives (task book 9.1!)
-        post_obs = await self.perception.perceive(cycle_id=cycle_id, phase="post", persist=True)
-        post_ctx = await self._build_drive_context(post_obs, None, now)
-        post_drives = self.drives.compute_states(post_ctx, pre_drives)
-
-        measured_change = {
-            dtype: round(post_drives[dtype].satisfaction - pre_drives[dtype].satisfaction, 4)
-            for dtype in post_drives
-            if dtype in pre_drives
-        }
-        expected_vs_actual = {
-            "expected_outcome": {
-                **goal_proposal.expected_outcome,
-                "expected_improvement": plan.expected_improvement,
-            },
-            "actual_outcome": {
-                "goal_achieved": eval_res.goal_achieved,
-                "task_status": task_state["status"],
-                "information_gain": eval_res.information_gain,
-                "verification_passed": verification_passed,
-                **eval_res.actual_outcome,
-            },
-            "measured_satisfaction_change": measured_change,
-        }
-
-        await self.repo.transition_goal(
-            goal_id,
-            GoalStatus.ACHIEVED.value if eval_res.goal_achieved else GoalStatus.FAILED.value,
-            note=eval_res.summary,
-            actual_outcome=expected_vs_actual["actual_outcome"],
-            measured_change=measured_change,
-        )
-        await self.repo.update_cycle(
-            cycle_id,
-            evaluation={
-                **eval_res.model_dump(mode="json"),
-                **expected_vs_actual,
-                "memory_writes": memory_writes,
-            },
-        )
-        return post_drives, eval_res, expected_vs_actual
 
     async def _finalize_cycle(
         self,

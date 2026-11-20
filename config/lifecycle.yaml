@@ -1,0 +1,9 @@
+# Durable task lifecycle, outbox dispatcher, and recovery timings (V2.0 P1-2).
+task_poll_interval: 5.0
+max_inflight_tasks: 1
+task_reconciliation_interval: 30.0
+outbox_poll_interval: 2.0
+outbox_batch_size: 20
+outbox_max_attempts: 5
+outbox_base_backoff_seconds: 10.0
+retry_backoff_seconds: 1.0

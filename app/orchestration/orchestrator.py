@@ -30,8 +30,11 @@ from app.core.enums import ExecutionStatus, GoalStatus, PermissionLevel, TaskSta
 from app.governance.interfaces import GovernanceInterface, PolicyVerdict
 from app.observability.logging import get_logger
 from app.observability.metrics import AGENT_EXECUTIONS
+from app.orchestration.backend import ExecutionBackendInterface, LocalSubprocessBackend
+from app.orchestration.state_machine import TaskStateMachine
 from app.orchestration.verifier import ResultVerifier, VerificationResult
 from app.perception.interfaces import utcnow
+from app.storage.outbox import OutboxEventType
 from app.storage.repository import StateRepository
 
 logger = get_logger("aoc.orchestration")
@@ -101,6 +104,8 @@ class AgentOrchestrator:
         verifier: ResultVerifier | None = None,
         max_retries: int = 2,
         llm_gateway: LLMGatewayInterface | None = None,
+        backend: ExecutionBackendInterface | None = None,
+        state_machine: TaskStateMachine | None = None,
     ) -> None:
         self.registry = registry
         self.governance = governance
@@ -108,8 +113,8 @@ class AgentOrchestrator:
         self.verifier = verifier or ResultVerifier()
         self.max_retries = max(0, int(max_retries))
         self.llm_gateway = llm_gateway
-        # In-process handles for currently running background executions: task_id -> (exec_id, asyncio.Task)
-        self._inflight: dict[str, tuple[str, asyncio.Task[AgentExecution]]] = {}
+        self.backend: ExecutionBackendInterface = backend or LocalSubprocessBackend()
+        self.state_machine = state_machine or TaskStateMachine(repo)
         self._approval_locks: dict[str, asyncio.Lock] = {}
 
     def _approval_lock(self, task_id: str) -> asyncio.Lock:
@@ -410,11 +415,19 @@ class AgentOrchestrator:
             success_criteria=plan.success_criteria,
             verification=[v.model_dump(mode="json") for v in plan.verification],
             required_capability=plan.required_capability,
-            status=TaskStatus.PENDING.value,
+            status=TaskStatus.CREATED.value,
+            idempotency_key=f"task:{task_id}",
             attempt=0,
             max_attempts=1 + self.max_retries,
             tried_agents=[],
             outcome={},
+        )
+        await self.state_machine.transition(
+            task_uuid,
+            TaskStatus.QUEUED,
+            actor="orchestrator",
+            reason="plan approved and queued for dispatch",
+            idempotency_key=f"queue:{task_id}:init",
         )
 
         exec_id = await self._launch_attempt(task_uuid, chosen_id, verdict.sandbox_mode, cycle_id=cycle_id)
@@ -446,14 +459,40 @@ class AgentOrchestrator:
 
         exec_uuid = uuid.uuid4()
         exec_id = str(exec_uuid)
-        await self.repo.create_execution(task_uuid, agent_id, ExecutionStatus.RUNNING.value, execution_id=exec_uuid)
-        await self.repo.update_task(
-            task_uuid,
-            assigned_agent=agent_id,
-            status=TaskStatus.RUNNING.value,
-            attempt=attempt,
-            tried_agents=tried,
-        )
+        exec_idem = f"exec:{task_uuid}:{attempt}"
+
+        # Atomically persist execution record + DISPATCHING transition in a single DB transaction
+        async with self.repo.transaction() as s:
+            await self.repo.create_execution(
+                task_uuid,
+                agent_id,
+                ExecutionStatus.DISPATCHING.value,
+                execution_id=exec_uuid,
+                attempt_number=attempt,
+                idempotency_key=exec_idem,
+                session=s,
+            )
+            cur_status = TaskStatus(task_row["status"])
+            if cur_status not in {TaskStatus.DISPATCHING, TaskStatus.DISPATCHED}:
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.DISPATCHING,
+                    execution_id=exec_uuid,
+                    actor="orchestrator",
+                    reason=f"dispatching attempt {attempt} on '{agent_id}'",
+                    idempotency_key=f"dispatch:{exec_id}",
+                    task_updates={"assigned_agent": agent_id, "attempt": attempt, "tried_agents": tried},
+                    session=s,
+                )
+            else:
+                await self.repo.update_task(
+                    task_uuid,
+                    assigned_agent=agent_id,
+                    attempt=attempt,
+                    tried_agents=tried,
+                    session=s,
+                )
+
         await self.repo.record_usage(
             category="agent_task",
             amount=1.0,
@@ -478,40 +517,33 @@ class AgentOrchestrator:
             sandbox_mode=sandbox_mode,
         )
 
-        async def _run() -> AgentExecution:
-            try:
-                return await adapter.execute(agent_task)
-            except Exception as exc:
-                return AgentExecution(
-                    execution_id=exec_id,
-                    task_id=str(task_uuid),
-                    agent_id=agent_id,
-                    status=ExecutionStatus.FAILED.value,
-                    completed_at=utcnow(),
-                    error=f"Unhandled adapter exception: {exc}",
-                )
-
-        bg_task = asyncio.create_task(_run(), name=f"aoc-exec-{exec_id[:8]}")
-        self._inflight[str(task_uuid)] = (exec_id, bg_task)
+        await self.backend.launch(adapter, agent_task)
+        async with self.repo.transaction() as s:
+            await self.repo.update_execution(exec_uuid, status=ExecutionStatus.RUNNING.value, session=s)
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.RUNNING,
+                execution_id=exec_uuid,
+                actor="orchestrator",
+                reason=f"execution {exec_id} running on '{agent_id}'",
+                idempotency_key=f"running:{exec_id}",
+                session=s,
+            )
         logger.info("orchestrator.dispatched", task_id=str(task_uuid), execution_id=exec_id, agent=agent_id, attempt=attempt)
         return exec_id
 
     async def poll_task(self, task_id: str) -> dict[str, Any]:
         """Non-blocking check: if the current execution finished, verify it and handle retry/fallback."""
         task_uuid = uuid.UUID(task_id)
-        entry = self._inflight.get(task_id)
-        if entry is None:
+        if not self.backend.is_running(task_id):
             row = await self.repo.get_task(task_uuid)
             return row or {"task_id": task_id, "status": TaskStatus.FAILED.value, "error": "not found"}
 
-        exec_id, bg_task = entry
-        if not bg_task.done():
-            # Keep DB updated with live PID if available
+        execution = await self.backend.poll(task_id)
+        if execution is None:
             row = await self.repo.get_task(task_uuid)
             return row or {"task_id": task_id, "status": TaskStatus.RUNNING.value}
 
-        self._inflight.pop(task_id, None)
-        execution = bg_task.result()
         return await self._collect_and_decide(task_uuid, execution)
 
     async def wait_for_task(
@@ -527,13 +559,8 @@ class AgentOrchestrator:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return state
-            entry = self._inflight.get(task_id)
-            if entry is not None:
-                _, bg = entry
-                try:
-                    await asyncio.wait_for(asyncio.shield(bg), timeout=min(poll_interval, remaining))
-                except asyncio.TimeoutError:
-                    pass
+            if self.backend.is_running(task_id):
+                await self.backend.wait_step(task_id, timeout=min(poll_interval, remaining))
             else:
                 await asyncio.sleep(min(poll_interval, remaining))
 
@@ -597,6 +624,34 @@ class AgentOrchestrator:
                     task_id=task_uuid,
                 )
 
+        # Durable State Machine transitions for execution completion
+        if execution.status == ExecutionStatus.TIMEOUT.value:
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.TIMEOUT,
+                execution_id=exec_uuid,
+                actor="orchestrator",
+                reason=execution.error or "execution timed out",
+                idempotency_key=f"timeout:{execution.execution_id}",
+            )
+        else:
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.RESULT_RECEIVED,
+                execution_id=exec_uuid,
+                actor="orchestrator",
+                reason=f"result received ({execution.status})",
+                idempotency_key=f"recv:{execution.execution_id}",
+            )
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.VERIFYING,
+                execution_id=exec_uuid,
+                actor="orchestrator",
+                reason="deterministic verification started",
+                idempotency_key=f"verify:{execution.execution_id}",
+            )
+
         if execution.status == ExecutionStatus.SUCCEEDED.value and verification.passed:
             outcome = {
                 "execution_id": execution.execution_id,
@@ -605,7 +660,24 @@ class AgentOrchestrator:
                 "result": execution.result,
                 "status": ExecutionStatus.SUCCEEDED.value,
             }
-            await self.repo.update_task(task_uuid, status=TaskStatus.SUCCEEDED.value, outcome=outcome)
+            await self.state_machine.transition(
+                task_uuid,
+                TaskStatus.SUCCEEDED,
+                execution_id=exec_uuid,
+                actor="orchestrator",
+                reason="deterministic verification passed",
+                idempotency_key=f"succeeded:{execution.execution_id}",
+                task_updates={"outcome": outcome},
+                outbox_events=[
+                    {
+                        "event_type": OutboxEventType.EXECUTION_FINALIZE,
+                        "idempotency_key": f"finalize:{execution.execution_id}",
+                        "payload": {"execution_id": execution.execution_id, "task_id": str(task_uuid)},
+                        "aggregate_type": "execution",
+                        "aggregate_id": exec_uuid,
+                    }
+                ],
+            )
             logger.info("orchestrator.succeeded", task_id=str(task_uuid), agent=execution.agent_id)
             return (await self.repo.get_task(task_uuid)) or outcome
 
@@ -638,6 +710,22 @@ class AgentOrchestrator:
             )
             if next_adapter is not None:
                 cycle_uuid = uuid.UUID(task_row["cycle_id"]) if task_row.get("cycle_id") else None
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.RETRY_WAIT,
+                    execution_id=exec_uuid,
+                    actor="orchestrator",
+                    reason=f"attempt {attempt} failed ({fail_reason}); scheduling retry",
+                    idempotency_key=f"retry_wait:{execution.execution_id}",
+                )
+                await self.state_machine.transition(
+                    task_uuid,
+                    TaskStatus.QUEUED,
+                    execution_id=exec_uuid,
+                    actor="orchestrator",
+                    reason=f"re-queued for attempt {attempt + 1} on '{next_adapter.capability.agent_id}'",
+                    idempotency_key=f"requeue:{execution.execution_id}",
+                )
                 await self.repo.log_decision(
                     decision_type="agent_fallback_retry",
                     selected=next_adapter.capability.agent_id,
@@ -658,32 +746,79 @@ class AgentOrchestrator:
             "verification": verification.model_dump(mode="json"),
             "attempts": attempt,
         }
-        await self.repo.update_task(task_uuid, status=TaskStatus.FAILED.value, outcome=outcome)
+        await self.state_machine.transition(
+            task_uuid,
+            TaskStatus.FAILED,
+            execution_id=exec_uuid,
+            actor="orchestrator",
+            reason=fail_reason,
+            idempotency_key=f"failed:{execution.execution_id}",
+            task_updates={"outcome": outcome},
+            outbox_events=[
+                {
+                    "event_type": OutboxEventType.EXECUTION_FINALIZE,
+                    "idempotency_key": f"finalize:{execution.execution_id}",
+                    "payload": {"execution_id": execution.execution_id, "task_id": str(task_uuid)},
+                    "aggregate_type": "execution",
+                    "aggregate_id": exec_uuid,
+                }
+            ],
+        )
         return (await self.repo.get_task(task_uuid)) or outcome
 
-    async def cancel_task(self, task_id: str) -> bool:
-        entry = self._inflight.get(task_id)
-        if entry is None:
+    async def cancel_task(self, task_id: str, actor: str = "operator", reason: str = "Cancelled by operator/lifecycle") -> bool:
+        task_uuid = uuid.UUID(task_id)
+        task_row = await self.repo.get_task(task_uuid)
+        if task_row is None:
             return False
-        exec_id, bg_task = entry
-        task_row = await self.repo.get_task(uuid.UUID(task_id))
-        if task_row:
-            adapter = self.registry.get(task_row["assigned_agent"])
-            if adapter:
-                await adapter.cancel(exec_id)
-        bg_task.cancel()
-        try:
-            await bg_task
-        except Exception:
-            pass
-        self._inflight.pop(task_id, None)
-        await self.repo.update_execution(
-            uuid.UUID(exec_id),
-            status=ExecutionStatus.CANCELLED.value,
-            completed_at=utcnow(),
-            error="Cancelled by operator/lifecycle",
+        cur_status = TaskStatus(task_row["status"])
+        if cur_status.is_terminal:
+            return False
+
+        adapter = self.registry.get(task_row["assigned_agent"])
+        cancelled_bg, exec_id = await self.backend.cancel(task_id, adapter=adapter)
+
+        outbox_evs: list[dict[str, Any]] = []
+        exec_uuid: uuid.UUID | None = None
+        if exec_id:
+            exec_uuid = uuid.UUID(exec_id)
+            await self.repo.update_execution(
+                exec_uuid,
+                status=ExecutionStatus.CANCELLED.value,
+                completed_at=utcnow(),
+                error=reason,
+            )
+            outbox_evs.append(
+                {
+                    "event_type": OutboxEventType.EXECUTION_FINALIZE,
+                    "idempotency_key": f"finalize:{exec_id}",
+                    "payload": {"execution_id": exec_id, "task_id": task_id},
+                    "aggregate_type": "execution",
+                    "aggregate_id": exec_uuid,
+                }
+            )
+        elif not cancelled_bg and cur_status not in {
+            TaskStatus.QUEUED,
+            TaskStatus.PENDING,
+            TaskStatus.RETRY_WAIT,
+            TaskStatus.REQUIRES_APPROVAL,
+            TaskStatus.AWAITING_APPROVAL,
+            TaskStatus.RUNNING,
+            TaskStatus.DISPATCHING,
+            TaskStatus.DISPATCHED,
+        }:
+            return False
+
+        await self.state_machine.transition(
+            task_uuid,
+            TaskStatus.CANCELLED,
+            execution_id=exec_uuid,
+            actor=actor,
+            reason=reason,
+            idempotency_key=f"cancel:{task_id}",
+            task_updates={"outcome": {"cancelled_by": actor, "reason": reason, "execution_id": exec_id}},
+            outbox_events=outbox_evs,
         )
-        await self.repo.update_task(uuid.UUID(task_id), status=TaskStatus.ABANDONED.value)
         return True
 
     async def recover_on_startup(self) -> dict[str, int]:
@@ -695,7 +830,8 @@ class AgentOrchestrator:
         reconciled_tasks = 0
 
         running_execs = await self.repo.list_executions(
-            statuses=[ExecutionStatus.RUNNING.value, ExecutionStatus.PENDING.value], limit=100
+            statuses=[ExecutionStatus.RUNNING.value, ExecutionStatus.DISPATCHING.value, ExecutionStatus.PENDING.value],
+            limit=100,
         )
         for ex in running_execs:
             pid = ex.get("pid")
@@ -716,10 +852,16 @@ class AgentOrchestrator:
                 reconciled_execs += 1
 
         inflight_tasks = await self.repo.list_tasks(
-            statuses=[TaskStatus.RUNNING.value, TaskStatus.DISPATCHED.value, TaskStatus.VERIFYING.value], limit=100
+            statuses=[
+                TaskStatus.RUNNING.value,
+                TaskStatus.DISPATCHING.value,
+                TaskStatus.DISPATCHED.value,
+                TaskStatus.VERIFYING.value,
+            ],
+            limit=100,
         )
         for t in inflight_tasks:
-            if t["task_id"] in self._inflight:
+            if self.backend.is_running(t["task_id"]):
                 continue
             await self.repo.update_task(
                 uuid.UUID(t["task_id"]),
@@ -741,7 +883,7 @@ class AgentOrchestrator:
         return {"reconciled_tasks": reconciled_tasks, "reconciled_executions": reconciled_execs}
 
     def has_inflight(self) -> bool:
-        return len(self._inflight) > 0
+        return len(self.backend.list_running_task_ids()) > 0
 
     def list_inflight_task_ids(self) -> list[str]:
-        return list(self._inflight.keys())
+        return self.backend.list_running_task_ids()

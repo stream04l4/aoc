@@ -143,6 +143,50 @@ def create_app(
         statuses = [status] if status else None
         return await _rt().repo.list_tasks(statuses=statuses, limit=min(max(limit, 1), 200))
 
+    @app.get("/v2/tasks/{task_id}/lifecycle")
+    async def get_task_lifecycle(
+        task_id: str, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
+        try:
+            t_uuid = uuid.UUID(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid task_id UUID") from exc
+        if await _rt().repo.get_task(t_uuid) is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return await _rt().repo.list_task_lifecycle_events(t_uuid)
+
+    @app.get("/v2/tasks/{task_id}/attempts")
+    async def get_task_attempts(
+        task_id: str, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
+        try:
+            t_uuid = uuid.UUID(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid task_id UUID") from exc
+        if await _rt().repo.get_task(t_uuid) is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return await _rt().repo.list_executions(task_id=t_uuid, limit=50)
+
+    @app.post("/v2/tasks/{task_id}/cancel")
+    async def cancel_task_v2(
+        task_id: str,
+        body: ControlNote = ControlNote(reason="operator cancelled"),
+        principal: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        try:
+            t_uuid = uuid.UUID(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid task_id UUID") from exc
+        if await rt.repo.get_task(t_uuid) is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        cancelled = await rt.orchestrator.cancel_task(task_id, actor=principal.name, reason=body.reason)
+        if not cancelled:
+            raise HTTPException(status_code=409, detail="Task cannot be cancelled in its current state")
+        if rt.outbox is not None:
+            await rt.outbox.dispatch_once()
+        return {"task_id": task_id, "status": "CANCELLED"}
+
     @app.get("/agents")
     async def list_agents(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         return await _rt().repo.list_agents()

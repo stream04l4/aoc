@@ -9,7 +9,15 @@ from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import BrainInterface
-from app.core.config import Settings, get_agent_config, get_drive_config, get_policy_config, get_settings
+from app.core.config import (
+    LifecycleSettings,
+    Settings,
+    get_agent_config,
+    get_drive_config,
+    get_lifecycle_config,
+    get_policy_config,
+    get_settings,
+)
 from app.core.lifecycle import LifecycleManager
 from app.core.loop import AutonomousLoop
 from app.core.scheduler import OrganismScheduler
@@ -19,12 +27,16 @@ from app.memory.experience_manager import ExperienceManager
 from app.memory.interfaces import MemoryInterface
 from app.memory.letta_adapter import LettaAdapter
 from app.observability.logging import configure_logging, get_logger
+from app.orchestration.backend import ExecutionBackendInterface, LocalSubprocessBackend
+from app.orchestration.finalizer import TaskFinalizer
 from app.orchestration.orchestrator import AgentOrchestrator
+from app.orchestration.state_machine import TaskStateMachine
 from app.perception.agent_sensor import AgentSensor
 from app.perception.environment_sensor import EnvironmentSensor
 from app.perception.manager import SensorManager
 from app.perception.system_sensor import SystemSensor
 from app.storage.database import Database
+from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository
 
 logger = get_logger("aoc.runtime")
@@ -43,8 +55,12 @@ class OrganismRuntime:
         auto_load_agents: bool = True,
         llm_probe_fn=None,
         llm_gateway: LLMGatewayInterface | None = None,
+        execution_backend: ExecutionBackendInterface | None = None,
     ) -> None:
         self.settings = settings or get_settings()
+        lc_yaml = get_lifecycle_config()
+        if lc_yaml and self.settings.lifecycle == LifecycleSettings():
+            self.settings = self.settings.model_copy(update={"lifecycle": LifecycleSettings.model_validate(lc_yaml)})
         self._owns_db = db is None
         self.db = db or Database(self.settings.database.url, echo=self.settings.database.echo)
         self.repo = StateRepository(self.db)
@@ -93,13 +109,24 @@ class OrganismRuntime:
         self.registry = registry or AgentRegistry(repo=self.repo)
         if registry is None and auto_load_agents:
             self.registry.load_from_config(get_agent_config(), llm_settings=self.settings.llm)
+        self.state_machine = TaskStateMachine(self.repo)
+        self.execution_backend: ExecutionBackendInterface = execution_backend or LocalSubprocessBackend()
         self.orchestrator = AgentOrchestrator(
             registry=self.registry,
             governance=self.governance,
             repo=self.repo,
             max_retries=self.settings.governance.budget.max_task_retries,
             llm_gateway=self.llm_gateway,
+            backend=self.execution_backend,
+            state_machine=self.state_machine,
         )
+        self.outbox = OutboxDispatcher(
+            self.repo,
+            poll_interval=self.settings.lifecycle.outbox_poll_interval,
+            batch_size=self.settings.lifecycle.outbox_batch_size,
+            base_backoff_seconds=self.settings.lifecycle.outbox_base_backoff_seconds,
+        )
+        self.finalizer: TaskFinalizer | None = None
 
         # Memory
         if memory_backend is not None:
@@ -129,6 +156,27 @@ class OrganismRuntime:
             self.memory.backend.agent_id = identity["memory_agent_id"]
 
         self.lifecycle = LifecycleManager(self.organism_id, self.repo)
+        self.finalizer = TaskFinalizer(
+            organism_id=self.organism_id,
+            repo=self.repo,
+            perception=self.perception,
+            drives=self.drives,
+            brain=self.brain,
+            governance=self.governance,
+            memory=self.memory,
+            verifier=self.orchestrator.verifier,
+            llm_gateway=self.llm_gateway,
+        )
+
+        async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
+            eid = (ev.get("payload") or {}).get("execution_id")
+            if not eid:
+                return {"skipped": True}
+            res = await self.finalizer.finalize_execution(eid)
+            return {"execution_id": res.execution_id, "already_finalized": res.already_finalized, "goal_achieved": res.goal_achieved}
+
+        self.outbox.register_handler(OutboxEventType.EXECUTION_FINALIZE, "outbox_finalizer", _handle_finalize_event)
+
         self.loop = AutonomousLoop(
             organism_id=self.organism_id,
             settings=self.settings,
@@ -142,15 +190,20 @@ class OrganismRuntime:
             orchestrator=self.orchestrator,
             memory=self.memory,
             llm_gateway=self.llm_gateway,
+            finalizer=self.finalizer,
+            outbox=self.outbox,
         )
+        self.finalizer._on_learning = self.loop._record_learning_signal
         recovery = await self.loop.recover()
         self.scheduler = OrganismScheduler(self.loop, self.lifecycle, self.settings.runtime)
         if start_scheduler:
+            self.outbox.start()
             self.scheduler.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))
         return {"organism_id": str(self.organism_id), "recovery": recovery}
 
     async def stop(self) -> None:
+        await self.outbox.stop()
         if self.scheduler is not None:
             await self.scheduler.stop()
         elif self.lifecycle is not None:

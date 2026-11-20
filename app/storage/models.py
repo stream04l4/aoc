@@ -223,6 +223,9 @@ class AgentTaskRow(Base):
     verification: Mapped[list] = mapped_column(JsonType, default=list)
     required_capability: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32))
+    state_version: Mapped[int] = mapped_column(Integer, default=1)
+    finalized_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=1)
     tried_agents: Mapped[list] = mapped_column(JsonType, default=list)
@@ -239,9 +242,15 @@ class AgentExecutionRow(Base):
     task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_tasks.id"), index=True)
     agent_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32))
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    process_identity: Mapped[dict] = mapped_column(JsonType, default=dict)
+    thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     started_at: Mapped[datetime] = mapped_column(TS, default=_now)
     completed_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     result: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
     stdout: Mapped[str | None] = mapped_column(Text, nullable=True)
     stderr: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -395,3 +404,54 @@ class PolicyEvaluation(Base):
     violations: Mapped[list] = mapped_column(JsonType, default=list)
     reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+# ── durable task lifecycle & transactional outbox/inbox (P1-2) ──────────────
+class TaskLifecycleEvent(Base):
+    __tablename__ = "task_lifecycle_events"
+    __table_args__ = (
+        UniqueConstraint("task_id", "state_version", name="uq_task_lifecycle_ver"),
+        UniqueConstraint("idempotency_key", name="uq_task_lifecycle_idem"),
+        Index("ix_task_lifecycle_task", "task_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_tasks.id"))
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agent_executions.id"), nullable=True)
+    state_version: Mapped[int] = mapped_column(Integer)
+    from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(32))
+    actor: Mapped[str] = mapped_column(String(64), default="orchestrator")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload: Mapped[dict] = mapped_column(JsonType, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+    __table_args__ = (Index("ix_outbox_dispatch", "status", "next_retry_at"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    event_type: Mapped[str] = mapped_column(String(64))
+    aggregate_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    aggregate_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    payload: Mapped[dict] = mapped_column(JsonType, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending|processing|dispatched|dead_letter
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    next_retry_at: Mapped[datetime] = mapped_column(TS, default=_now)
+    locked_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    dispatched_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class InboxEvent(Base):
+    __tablename__ = "inbox_events"
+    __table_args__ = (UniqueConstraint("consumer_name", "idempotency_key", name="uq_inbox_consumer_key"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    consumer_name: Mapped[str] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    event_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    processed_at: Mapped[datetime] = mapped_column(TS, default=_now)
+    result_summary: Mapped[dict] = mapped_column(JsonType, default=dict)

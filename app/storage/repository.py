@@ -7,10 +7,13 @@ they never import SQLAlchemy sessions themselves.
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.storage.database import Database
 from app.storage.models import (
@@ -27,13 +30,16 @@ from app.storage.models import (
     DriveStateRow,
     EventLog,
     GoalHistory,
+    InboxEvent,
     MemoryIndex,
     ObservationRecord,
     OrganismIdentity,
     OrganismState,
+    OutboxEvent,
     PolicyEvaluation,
     ResourceUsage,
     SystemConfig,
+    TaskLifecycleEvent,
     WorldState,
 )
 
@@ -60,6 +66,20 @@ def _jsonable(obj: Any) -> Any:
 class StateRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[AsyncSession]:
+        """Unit-of-work transactional scope shared across multiple repository writes."""
+        async with self.db.session() as session:
+            yield session
+
+    @asynccontextmanager
+    async def _use_session(self, session: AsyncSession | None = None) -> AsyncIterator[AsyncSession]:
+        if session is not None:
+            yield session
+        else:
+            async with self.db.session() as own:
+                yield own
 
     # ── identity / organism state ───────────────────────────────────────────
     async def get_or_create_identity(self, name: str, version: str, traits: dict | None = None) -> dict:
@@ -208,6 +228,58 @@ class StateRepository:
             await s.flush()
             return row.id
 
+    async def get_observation_for_cycle(self, cycle_id: uuid.UUID, phase: str = "pre") -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(ObservationRecord)
+                    .where(ObservationRecord.cycle_id == cycle_id, ObservationRecord.phase == phase)
+                    .order_by(ObservationRecord.created_at.desc())
+                )
+            ).scalars().first()
+            if row is None:
+                return None
+            return {
+                "observation_id": str(row.id),
+                "timestamp": row.observed_at,
+                "system_state": row.system_state,
+                "environment_state": row.environment_state,
+                "available_resources": row.available_resources,
+                "active_tasks": row.active_tasks,
+                "external_events": row.external_events,
+                "sensor_status": row.sensor_status,
+                "confidence": row.confidence,
+            }
+
+    async def get_drive_history_for_cycle(self, cycle_id: uuid.UUID, phase: str = "pre") -> list[dict]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(DriveHistory)
+                    .where(DriveHistory.cycle_id == cycle_id, DriveHistory.phase == phase)
+                    .order_by(DriveHistory.created_at.asc())
+                )
+            ).scalars().all()
+            return [
+                {
+                    "drive_type": r.drive_type,
+                    "satisfaction": r.satisfaction,
+                    "deficit": r.deficit,
+                    "urgency": r.urgency,
+                    "confidence": r.confidence,
+                    "persistence": r.persistence,
+                    "trend": r.trend,
+                    "dimensions": r.dimensions,
+                    "updated_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    async def get_default_organism_id(self) -> uuid.UUID | None:
+        async with self.db.session() as s:
+            row = (await s.execute(select(OrganismIdentity).order_by(OrganismIdentity.created_at.asc()))).scalars().first()
+            return row.id if row else None
+
     async def upsert_world_item(
         self,
         kind: str,
@@ -216,8 +288,9 @@ class StateRepository:
         status: str | None = None,
         source: str | None = None,
         is_simulated: bool | None = None,
+        session: AsyncSession | None = None,
     ) -> dict:
-        async with self.db.session() as s:
+        async with self._use_session(session) as s:
             row = (
                 await s.execute(select(WorldState).where(WorldState.kind == kind, WorldState.key == key))
             ).scalar_one_or_none()
@@ -357,8 +430,9 @@ class StateRepository:
         note: str = "",
         actual_outcome: dict | None = None,
         measured_change: dict | None = None,
+        session: AsyncSession | None = None,
     ) -> None:
-        async with self.db.session() as s:
+        async with self._use_session(session) as s:
             g = await s.get(ActiveGoal, goal_id)
             if g is None:
                 return
@@ -526,11 +600,13 @@ class StateRepository:
             await s.flush()
             return t.id
 
-    async def update_task(self, task_id: uuid.UUID, **values: Any) -> None:
-        values = {k: _jsonable(v) for k, v in values.items()}
-        values["updated_at"] = utcnow()
-        async with self.db.session() as s:
-            await s.execute(update(AgentTaskRow).where(AgentTaskRow.id == task_id).values(**values))
+    async def update_task(
+        self, task_id: uuid.UUID, session: AsyncSession | None = None, **values: Any
+    ) -> None:
+        clean = {k: (v if k in {"finalized_at"} else _jsonable(v)) for k, v in values.items()}
+        clean["updated_at"] = utcnow()
+        async with self._use_session(session) as s:
+            await s.execute(update(AgentTaskRow).where(AgentTaskRow.id == task_id).values(**clean))
 
     async def claim_task_for_approval(
         self,
@@ -583,6 +659,9 @@ class StateRepository:
             "verification": t.verification,
             "required_capability": t.required_capability,
             "status": t.status,
+            "state_version": t.state_version,
+            "finalized_at": t.finalized_at,
+            "idempotency_key": t.idempotency_key,
             "attempt": t.attempt,
             "max_attempts": t.max_attempts,
             "tried_agents": t.tried_agents,
@@ -591,20 +670,61 @@ class StateRepository:
             "updated_at": t.updated_at,
         }
 
-    async def create_execution(self, task_id: uuid.UUID, agent_id: str, status: str, execution_id: uuid.UUID | None = None) -> uuid.UUID:
-        async with self.db.session() as s:
-            e = AgentExecutionRow(id=execution_id or uuid.uuid4(), task_id=task_id, agent_id=agent_id, status=status)
+    async def create_execution(
+        self,
+        task_id: uuid.UUID,
+        agent_id: str,
+        status: str,
+        execution_id: uuid.UUID | None = None,
+        attempt_number: int = 1,
+        idempotency_key: str | None = None,
+        runner_id: str | None = None,
+        session: AsyncSession | None = None,
+    ) -> uuid.UUID:
+        async with self._use_session(session) as s:
+            e = AgentExecutionRow(
+                id=execution_id or uuid.uuid4(),
+                task_id=task_id,
+                agent_id=agent_id,
+                status=status,
+                attempt_number=attempt_number,
+                idempotency_key=idempotency_key,
+                runner_id=runner_id,
+            )
             s.add(e)
             await s.flush()
             return e.id
 
-    async def update_execution(self, execution_id: uuid.UUID, **values: Any) -> None:
+    async def update_execution(
+        self, execution_id: uuid.UUID, session: AsyncSession | None = None, **values: Any
+    ) -> None:
         clean = {}
         for k, v in values.items():
-            clean[k] = v if k in {"started_at", "completed_at"} else _jsonable(v)
+            clean[k] = v if k in {"started_at", "completed_at", "finalized_at"} else _jsonable(v)
         clean["updated_at"] = utcnow()
-        async with self.db.session() as s:
+        async with self._use_session(session) as s:
             await s.execute(update(AgentExecutionRow).where(AgentExecutionRow.id == execution_id).values(**clean))
+
+    async def list_unfinalized_terminal_executions(self, limit: int = 50) -> list[dict]:
+        """Return executions that reached a terminal execution status on a terminal task but are not finalized."""
+        terminal_task_statuses = ["SUCCEEDED", "FAILED", "CANCELLED", "ABANDONED"]
+        terminal_exec_statuses = ["SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED"]
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(AgentExecutionRow)
+                    .join(AgentTaskRow, AgentExecutionRow.task_id == AgentTaskRow.id)
+                    .where(
+                        AgentExecutionRow.finalized_at.is_(None),
+                        AgentTaskRow.finalized_at.is_(None),
+                        AgentExecutionRow.status.in_(terminal_exec_statuses),
+                        AgentTaskRow.status.in_(terminal_task_statuses),
+                    )
+                    .order_by(AgentExecutionRow.completed_at.asc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [self._exec_dict(e) for e in rows]
 
     async def get_execution(self, execution_id: uuid.UUID) -> dict | None:
         async with self.db.session() as s:
@@ -630,9 +750,15 @@ class StateRepository:
             "task_id": str(e.task_id),
             "agent_id": e.agent_id,
             "status": e.status,
+            "attempt_number": e.attempt_number,
+            "idempotency_key": e.idempotency_key,
+            "runner_id": e.runner_id,
             "pid": e.pid,
+            "process_identity": e.process_identity,
+            "thread_id": e.thread_id,
             "started_at": e.started_at,
             "completed_at": e.completed_at,
+            "finalized_at": e.finalized_at,
             "result": e.result,
             "stdout": e.stdout,
             "stderr": e.stderr,
@@ -642,9 +768,9 @@ class StateRepository:
         }
 
     # ── memory index ────────────────────────────────────────────────────────
-    async def add_memory_index(self, **fields: Any) -> uuid.UUID:
+    async def add_memory_index(self, session: AsyncSession | None = None, **fields: Any) -> uuid.UUID:
         fields = {k: (_jsonable(v) if k != "cycle_id" else v) for k, v in fields.items()}
-        async with self.db.session() as s:
+        async with self._use_session(session) as s:
             m = MemoryIndex(**fields)
             s.add(m)
             await s.flush()
@@ -1020,6 +1146,156 @@ class StateRepository:
                 }
                 for r in rows
             ]
+
+    # ── durable task lifecycle & outbox/inbox (P1-2) ────────────────────────
+    async def list_task_lifecycle_events(self, task_id: uuid.UUID) -> list[dict]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(TaskLifecycleEvent)
+                    .where(TaskLifecycleEvent.task_id == task_id)
+                    .order_by(TaskLifecycleEvent.state_version.asc())
+                )
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "task_id": str(r.task_id),
+                    "execution_id": str(r.execution_id) if r.execution_id else None,
+                    "state_version": r.state_version,
+                    "from_status": r.from_status,
+                    "to_status": r.to_status,
+                    "actor": r.actor,
+                    "reason": r.reason,
+                    "idempotency_key": r.idempotency_key,
+                    "payload": r.payload,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    async def enqueue_outbox_event(
+        self,
+        event_type: str,
+        idempotency_key: str,
+        payload: dict[str, Any],
+        aggregate_type: str | None = None,
+        aggregate_id: uuid.UUID | None = None,
+        max_attempts: int = 5,
+        next_retry_at: datetime | None = None,
+        session: AsyncSession | None = None,
+    ) -> uuid.UUID | None:
+        """Atomically enqueue an outbox event (idempotent on idempotency_key)."""
+        async with self._use_session(session) as s:
+            existing = (
+                await s.execute(select(OutboxEvent.id).where(OutboxEvent.idempotency_key == idempotency_key))
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            ev = OutboxEvent(
+                event_type=event_type,
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                idempotency_key=idempotency_key,
+                payload=_jsonable(payload),
+                status="pending",
+                attempts=0,
+                max_attempts=max_attempts,
+                next_retry_at=next_retry_at or utcnow(),
+            )
+            s.add(ev)
+            await s.flush()
+            return ev.id
+
+    async def list_outbox_events(
+        self,
+        status: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        async with self.db.session() as s:
+            q = select(OutboxEvent)
+            if status:
+                q = q.where(OutboxEvent.status == status)
+            if event_type:
+                q = q.where(OutboxEvent.event_type == event_type)
+            rows = (await s.execute(q.order_by(OutboxEvent.created_at.desc()).limit(limit))).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "event_type": r.event_type,
+                    "aggregate_type": r.aggregate_type,
+                    "aggregate_id": str(r.aggregate_id) if r.aggregate_id else None,
+                    "idempotency_key": r.idempotency_key,
+                    "payload": r.payload,
+                    "status": r.status,
+                    "attempts": r.attempts,
+                    "max_attempts": r.max_attempts,
+                    "next_retry_at": r.next_retry_at,
+                    "dispatched_at": r.dispatched_at,
+                    "last_error": r.last_error,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    async def has_inbox_event(
+        self, consumer_name: str, idempotency_key: str, session: AsyncSession | None = None
+    ) -> bool:
+        async with self._use_session(session) as s:
+            found = (
+                await s.execute(
+                    select(InboxEvent.id).where(
+                        InboxEvent.consumer_name == consumer_name,
+                        InboxEvent.idempotency_key == idempotency_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            return found is not None
+
+    async def mark_inbox_processed(
+        self,
+        consumer_name: str,
+        idempotency_key: str,
+        event_type: str | None = None,
+        result_summary: dict[str, Any] | None = None,
+        session: AsyncSession | None = None,
+    ) -> bool:
+        """Record consumption in inbox_events. Returns True if newly recorded, False if duplicate."""
+        async with self._use_session(session) as s:
+            existing = (
+                await s.execute(
+                    select(InboxEvent.id).where(
+                        InboxEvent.consumer_name == consumer_name,
+                        InboxEvent.idempotency_key == idempotency_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return False
+            s.add(
+                InboxEvent(
+                    consumer_name=consumer_name,
+                    idempotency_key=idempotency_key,
+                    event_type=event_type,
+                    processed_at=utcnow(),
+                    result_summary=_jsonable(result_summary or {}),
+                )
+            )
+            try:
+                await s.flush()
+                return True
+            except IntegrityError:
+                return False
+
+    async def replay_outbox_event(self, event_id: uuid.UUID) -> bool:
+        async with self.db.session() as s:
+            res = await s.execute(
+                update(OutboxEvent)
+                .where(OutboxEvent.id == event_id)
+                .values(status="pending", attempts=0, next_retry_at=utcnow(), locked_at=None, last_error=None)
+            )
+            return (res.rowcount or 0) == 1
 
 
 def day_start(now: datetime | None = None) -> datetime:
