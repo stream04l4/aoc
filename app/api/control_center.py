@@ -464,7 +464,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                         "agent_id": a.agent_id,
                         "name": a.name,
                         "enabled": a.enabled,
-                        "healthy": bool((a.probe or {}).get("available", False)),
+                        "healthy": bool((a.probe or {}).get("ok", False)),
                         "version": (a.probe or {}).get("version"),
                     }
                     for a in agents
@@ -1097,7 +1097,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "name": a.name,
                     "agent_type": a.agent_type,
                     "enabled": a.enabled,
-                    "healthy": bool((a.probe or {}).get("available", False)),
+                    "healthy": bool((a.probe or {}).get("ok", False)),
                     "experimental": a.experimental,
                     "version": (a.probe or {}).get("version"),
                     "capabilities": a.capabilities,
@@ -1669,7 +1669,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "agent_id": a.agent_id,
                     "name": a.name,
                     "enabled": a.enabled,
-                    "healthy": bool((a.probe or {}).get("available", False)),
+                    "healthy": bool((a.probe or {}).get("ok", False)),
                     "stats": a.stats,
                 }
                 for a in agents
