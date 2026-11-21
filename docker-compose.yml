@@ -42,9 +42,12 @@ services:
       AOC_EMBEDDING__PROVIDER: ${AOC_EMBEDDING__PROVIDER:-local_onnx}
       AOC_RUNNER__ENABLED: ${AOC_RUNNER__ENABLED:-true}
       AOC_RUNNER__SOCKET_PATH: /run/aoc-runner/runner.sock
+      AOC_KERNEL_V3__AFFECT_ENABLED: ${AOC_KERNEL_V3__AFFECT_ENABLED:-true}
+      AOC_KERNEL_V3__WORLD_POLL_ON_PERCEIVE: ${AOC_KERNEL_V3__WORLD_POLL_ON_PERCEIVE:-true}
     ports:
       - "127.0.0.1:9200:9200"
     volumes:
+      - .:/home/ubuntu/aoc:ro
       - ./config:/app/config:ro
       - ./frontend/dist:/app/frontend/dist:ro
       - ./.cache/embeddings:/app/.cache/embeddings
