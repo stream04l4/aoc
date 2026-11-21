@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.types import Uuid
+from sqlalchemy.types import TypeDecorator, Uuid
 
 
 def _now() -> datetime:
@@ -32,6 +32,42 @@ def _now() -> datetime:
 
 JsonType = JSON().with_variant(JSONB(), "postgresql")
 TS = DateTime(timezone=True)
+
+
+class VectorType(TypeDecorator):
+    """Dialect-aware embedding vector type: pgvector.Vector on PostgreSQL, JSON list[float] on SQLite."""
+
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            try:
+                from pgvector.sqlalchemy import Vector
+
+                return dialect.type_descriptor(Vector())
+            except ImportError:
+                return dialect.type_descriptor(JSONB())
+        return dialect.type_descriptor(JSON())
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return [float(x) for x in value]
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return [float(x) for x in value]
+        if hasattr(value, "tolist"):
+            return [float(x) for x in value.tolist()]
+        if isinstance(value, str):
+            raw = value.strip().strip("[]")
+            if not raw:
+                return []
+            return [float(part) for part in raw.split(",")]
+        return [float(x) for x in value]
 
 
 class Base(DeclarativeBase):
@@ -277,8 +313,39 @@ class MemoryIndex(Base):
     cycle_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     sync_status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|synced|failed
     sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_status: Mapped[str] = mapped_column(String(24), default="pending")  # pending|embedded|failed
+    reliability: Mapped[float] = mapped_column(Float, default=0.8)
+    information_gain: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
     updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class EmbeddingModelRegistry(Base):
+    __tablename__ = "embedding_model_registry"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    model_key: Mapped[str] = mapped_column(String(128), unique=True)
+    provider: Mapped[str] = mapped_column(String(32), default="local_onnx")  # remote_openai | local_onnx | hash_fallback
+    model_name: Mapped[str] = mapped_column(String(128))
+    model_version: Mapped[str] = mapped_column(String(64))
+    dimensions: Mapped[int] = mapped_column(Integer)
+    normalized: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class MemoryEmbedding(Base):
+    __tablename__ = "memory_embeddings"
+    __table_args__ = (
+        UniqueConstraint("memory_id", "model_id", name="uq_mem_emb_model"),
+        Index("ix_mem_emb_model", "model_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    memory_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("memory_index.id", ondelete="CASCADE"))
+    model_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("embedding_model_registry.id"))
+    dimensions: Mapped[int] = mapped_column(Integer)
+    embedding: Mapped[list[float]] = mapped_column(VectorType)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
 
 
 # ── audit ───────────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 from app.agents.registry import AgentRegistry
@@ -10,12 +11,15 @@ from app.cognition.brain import CognitionBrain
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import BrainInterface
 from app.core.config import (
+    EmbeddingSettings,
     LifecycleSettings,
     RunnerSettings,
     Settings,
     get_agent_config,
     get_drive_config,
+    get_embedding_config,
     get_lifecycle_config,
+    get_memory_config,
     get_policy_config,
     get_runner_config,
     get_settings,
@@ -25,9 +29,12 @@ from app.core.loop import AutonomousLoop
 from app.core.scheduler import OrganismScheduler
 from app.drives.engine import DriveEngine
 from app.governance.policy import GovernanceManager
+from app.memory.embedding import EmbeddingInterface, EmbeddingService, build_embedding_provider
 from app.memory.experience_manager import ExperienceManager
+from app.memory.info_gain import InformationGainEvaluator
 from app.memory.interfaces import MemoryInterface
 from app.memory.letta_adapter import LettaAdapter
+from app.memory.retrieval import HybridRetrievalEngine
 from app.observability.logging import configure_logging, get_logger
 from app.orchestration.backend import ExecutionBackendInterface, LocalSubprocessBackend
 from app.orchestration.finalizer import TaskFinalizer
@@ -58,6 +65,7 @@ class OrganismRuntime:
         llm_probe_fn=None,
         llm_gateway: LLMGatewayInterface | None = None,
         execution_backend: ExecutionBackendInterface | None = None,
+        embedding_provider: EmbeddingInterface | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         lc_yaml = get_lifecycle_config()
@@ -66,6 +74,15 @@ class OrganismRuntime:
         rn_yaml = get_runner_config()
         if rn_yaml and self.settings.runner == RunnerSettings():
             self.settings = self.settings.model_copy(update={"runner": RunnerSettings.model_validate(rn_yaml)})
+        mem_yaml = get_memory_config()
+        # Only load embedding.yaml automatically if caller didn't override Settings.embedding and cache/config is intended
+        emb_yaml = get_embedding_config()
+        if embedding_provider is None and self.settings.embedding == EmbeddingSettings() and emb_yaml:
+            # Keep unit tests offline-safe: only auto-enable local_onnx if model cache exists or explicitly configured
+            emb_cfg = EmbeddingSettings.model_validate(emb_yaml)
+            if emb_cfg.provider == "local_onnx" and not Path(emb_cfg.cache_dir).exists():
+                emb_cfg = emb_cfg.model_copy(update={"provider": "hash_fallback"})
+            self.settings = self.settings.model_copy(update={"embedding": emb_cfg})
         self._owns_db = db is None
         self.db = db or Database(self.settings.database.url, echo=self.settings.database.echo)
         self.repo = StateRepository(self.db)
@@ -147,6 +164,30 @@ class OrganismRuntime:
         )
         self.finalizer: TaskFinalizer | None = None
 
+        # Semantic Embedding, Hybrid Retrieval & Async Outbox Memory (P1-4)
+        eff_emb_provider = embedding_provider or build_embedding_provider(self.settings.embedding)
+        self.embedding_service = EmbeddingService(self.repo, eff_emb_provider)
+        ret_cfg = (mem_yaml or {}).get("hybrid_retrieval") or {}
+        self.retrieval_engine = HybridRetrievalEngine(
+            self.repo,
+            self.embedding_service,
+            w_vec=float(ret_cfg.get("w_vec", 0.45)),
+            w_txt=float(ret_cfg.get("w_txt", 0.20)),
+            w_rec=float(ret_cfg.get("w_rec", 0.15)),
+            w_rel=float(ret_cfg.get("w_rel", 0.10)),
+            w_imp=float(ret_cfg.get("w_imp", 0.10)),
+            recency_half_life_hours=float(ret_cfg.get("recency_half_life_hours", 168.0)),
+            candidate_pool_size=int(ret_cfg.get("candidate_pool_size", 120)),
+        )
+        ig_cfg = (mem_yaml or {}).get("info_gain") or {}
+        self.info_gain_evaluator = InformationGainEvaluator(
+            sim_floor=float(ig_cfg.get("semantic_novelty_sim_floor", 0.25)),
+            sim_ceil=float(ig_cfg.get("semantic_novelty_sim_ceil", 0.92)),
+            duplicate_sim_threshold=float(ig_cfg.get("duplicate_sim_threshold", 0.92)),
+            corroboration_sim_min=float(ig_cfg.get("corroboration_sim_min", 0.72)),
+            corroboration_bonus=float(ig_cfg.get("corroboration_bonus", 0.35)),
+        )
+
         # Memory
         if memory_backend is not None:
             backend: MemoryInterface | None = memory_backend
@@ -158,7 +199,16 @@ class OrganismRuntime:
             )
         else:
             backend = None
-        self.memory = ExperienceManager(self.repo, backend=backend)
+        async_sync = bool((mem_yaml or {}).get("async_outbox_sync", True))
+        embed_on_write = bool((mem_yaml or {}).get("embed_on_write", True))
+        self.memory = ExperienceManager(
+            self.repo,
+            backend=backend,
+            embedding_service=self.embedding_service,
+            retrieval_engine=self.retrieval_engine,
+            outbox_enabled=async_sync,
+            embed_on_write=embed_on_write,
+        )
 
         self.loop: AutonomousLoop | None = None
         self.scheduler: OrganismScheduler | None = None
@@ -185,6 +235,8 @@ class OrganismRuntime:
             memory=self.memory,
             verifier=self.orchestrator.verifier,
             llm_gateway=self.llm_gateway,
+            embedding_service=self.embedding_service,
+            info_gain_evaluator=self.info_gain_evaluator,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -194,7 +246,21 @@ class OrganismRuntime:
             res = await self.finalizer.finalize_execution(eid)
             return {"execution_id": res.execution_id, "already_finalized": res.already_finalized, "goal_achieved": res.goal_achieved}
 
+        async def _handle_memory_embed(ev: dict[str, Any]) -> dict[str, Any]:
+            mid = (ev.get("payload") or {}).get("memory_id")
+            if not mid:
+                return {"skipped": True}
+            return await self.embedding_service.embed_memory_record(uuid.UUID(mid))
+
+        async def _handle_memory_sync_letta(ev: dict[str, Any]) -> dict[str, Any]:
+            mid = (ev.get("payload") or {}).get("memory_id")
+            if not mid:
+                return {"skipped": True}
+            return await self.memory.sync_memory_to_letta(uuid.UUID(mid))
+
         self.outbox.register_handler(OutboxEventType.EXECUTION_FINALIZE, "outbox_finalizer", _handle_finalize_event)
+        self.outbox.register_handler(OutboxEventType.MEMORY_EMBED, "outbox_memory_embed", _handle_memory_embed)
+        self.outbox.register_handler(OutboxEventType.MEMORY_SYNC_LETTA, "outbox_memory_letta", _handle_memory_sync_letta)
 
         self.loop = AutonomousLoop(
             organism_id=self.organism_id,

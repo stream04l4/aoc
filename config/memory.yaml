@@ -1,0 +1,20 @@
+# Semantic Memory, Hybrid Retrieval & Four-Factor Information Gain Configuration (V2.0 P1-4)
+async_outbox_sync: true
+embed_on_write: true
+
+hybrid_retrieval:
+  w_vec: 0.45
+  w_txt: 0.20
+  w_rec: 0.15
+  w_rel: 0.10
+  w_imp: 0.10
+  recency_half_life_hours: 168.0
+  candidate_pool_size: 120
+
+info_gain:
+  semantic_novelty_sim_floor: 0.25
+  semantic_novelty_sim_ceil: 0.92
+  duplicate_sim_threshold: 0.92
+  corroboration_sim_min: 0.72
+  corroboration_bonus: 0.35
+  default_source_reliability: 0.80

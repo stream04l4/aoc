@@ -16,6 +16,11 @@ dependencies = [
     "prometheus-client>=0.20",
     "psutil>=6.0",
     "pyyaml>=6.0",
+    "numpy>=1.26",
+    "onnxruntime>=1.19",
+    "tokenizers>=0.20",
+    "huggingface-hub>=0.25",
+    "pgvector>=0.3.5",
 ]
 
 [dependency-groups]

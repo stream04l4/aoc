@@ -139,6 +139,25 @@ class RunnerSettings(BaseModel):
     auth_token: SecretStr | None = None
 
 
+class EmbeddingSettings(BaseModel):
+    provider: str = "hash_fallback"  # local_onnx | remote_openai | hash_fallback
+    model_key: str = "BAAI/bge-small-zh-v1.5:onnx-qint8"
+    model_name: str = "BAAI/bge-small-zh-v1.5"
+    model_version: str = "onnx-qint8"
+    dimensions: int = 512
+    normalized: bool = True
+    max_length: int = 256
+    query_prefix: str = "为这个句子生成表示以用于检索相关文章："
+    passage_prefix: str = ""
+    cache_dir: str = str(PROJECT_ROOT / ".cache" / "embeddings")
+    onnx_threads: int = 2
+    remote_endpoint: str = "http://80.158.109.51:9999/v1"
+    remote_model: str = "BAAI/bge-m3"
+    remote_api_key: SecretStr | None = None
+    timeout_seconds: float = 15.0
+    fallback_on_error: bool = True
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -169,6 +188,7 @@ class Settings(BaseSettings):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     lifecycle: LifecycleSettings = Field(default_factory=LifecycleSettings)
     runner: RunnerSettings = Field(default_factory=RunnerSettings)
+    embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -211,3 +231,13 @@ def get_lifecycle_config() -> dict[str, Any]:
 @lru_cache
 def get_runner_config() -> dict[str, Any]:
     return load_yaml("runner.yaml")
+
+
+@lru_cache
+def get_embedding_config() -> dict[str, Any]:
+    return load_yaml("embedding.yaml")
+
+
+@lru_cache
+def get_memory_config() -> dict[str, Any]:
+    return load_yaml("memory.yaml")

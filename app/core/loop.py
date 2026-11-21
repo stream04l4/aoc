@@ -52,6 +52,7 @@ from app.drives.engine import DriveEngine
 from app.drives.interfaces import DriveContext, DriveDecision, DriveState, KnowledgeGap
 from app.governance.interfaces import GovernanceInterface
 from app.memory.experience_manager import ExperienceManager
+from app.memory.retrieval import build_contextual_query
 from app.observability.logging import get_logger
 from app.observability.metrics import CYCLE_DURATION, CYCLES_TOTAL
 from app.orchestration.finalizer import TaskFinalizer
@@ -145,12 +146,20 @@ class AutonomousLoop:
         if self.lifecycle.state == LifecycleState.STOPPED:
             await self.lifecycle.transition(LifecycleState.INITIALIZING, reason="restarting from stopped state")
 
-        # Hydrate last learning timestamp from semantic memories if present
-        sem = await self.repo.list_memory_index(memory_type=MemoryType.SEMANTIC.value, limit=1)
-        if sem:
-            self._last_learning_at = sem[0]["created_at"]
-            self._last_info_gain = 0.5
-            self._last_info_gain_at = sem[0]["created_at"]
+        # Hydrate last learning timestamp & persisted information_gain from DB (removes hardcoded 0.5, V2.0 P1-4)
+        latest_mem = await self.repo.get_latest_learning_memory()
+        if latest_mem is not None:
+            self._last_learning_at = latest_mem["created_at"]
+            ig = latest_mem.get("information_gain")
+            self._last_info_gain = float(ig) if ig is not None else 0.0
+            self._last_info_gain_at = latest_mem["created_at"]
+        else:
+            sem = await self.repo.list_memory_index(memory_type=MemoryType.SEMANTIC.value, limit=1)
+            if sem:
+                self._last_learning_at = sem[0]["created_at"]
+                ig = sem[0].get("information_gain")
+                self._last_info_gain = float(ig) if ig is not None else 0.0
+                self._last_info_gain_at = sem[0]["created_at"]
 
         summary = {
             "closed_interrupted_cycles": closed_cycles,
@@ -268,7 +277,13 @@ class AutonomousLoop:
 
             # ── 4. SELF ASSESSMENT ──────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="SELF_ASSESSMENT")
-            recalled_memories = await self.memory.recall(query="", limit=8)
+            active_goals_for_recall = await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=3)
+            recall_query = build_contextual_query(
+                observation=pre_obs,
+                drives=list(prev_drives.values()),
+                active_goals=active_goals_for_recall,
+            )
+            recalled_memories = await self.memory.recall(query=recall_query, limit=8)
             mem_dicts = [m.model_dump(mode="json") for m in recalled_memories]
 
             assessment: AssessmentResult | None = None

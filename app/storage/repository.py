@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Iterable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,10 +28,12 @@ from app.storage.models import (
     DecisionLog,
     DriveHistory,
     DriveStateRow,
+    EmbeddingModelRegistry,
     EventLog,
     ExecutionRecoveryRecord,
     GoalHistory,
     InboxEvent,
+    MemoryEmbedding,
     MemoryIndex,
     ObservationRecord,
     OrganismIdentity,
@@ -807,6 +809,24 @@ class StateRepository:
                 q = q.where(MemoryIndex.created_at >= since)
             return (await s.execute(q)).scalar_one()
 
+    async def get_memory_by_id(self, memory_id: uuid.UUID) -> dict | None:
+        async with self.db.session() as s:
+            m = await s.get(MemoryIndex, memory_id)
+            return self._mem_dict(m) if m else None
+
+    async def get_latest_learning_memory(self) -> dict | None:
+        """Return most recent semantic/procedural memory with persisted information_gain (replaces hardcoded 0.5)."""
+        async with self.db.session() as s:
+            m = (
+                await s.execute(
+                    select(MemoryIndex)
+                    .where(MemoryIndex.memory_type.in_(["semantic", "procedural", "episodic"]))
+                    .order_by(MemoryIndex.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return self._mem_dict(m) if m else None
+
     @staticmethod
     def _mem_dict(m: MemoryIndex) -> dict:
         return {
@@ -821,8 +841,347 @@ class StateRepository:
             "tags": m.tags,
             "cycle_id": str(m.cycle_id) if m.cycle_id else None,
             "sync_status": m.sync_status,
+            "sync_error": m.sync_error,
+            "embedding_status": m.embedding_status,
+            "reliability": m.reliability,
+            "information_gain": m.information_gain,
             "created_at": m.created_at,
         }
+
+    # ── semantic embeddings & hybrid retrieval (P1-4) ───────────────────────
+    async def upsert_embedding_model(
+        self,
+        *,
+        model_key: str,
+        provider: str,
+        model_name: str,
+        model_version: str,
+        dimensions: int,
+        normalized: bool = True,
+        activate: bool = True,
+    ) -> dict:
+        async with self.db.session() as s:
+            if activate:
+                await s.execute(update(EmbeddingModelRegistry).values(is_active=False))
+            row = (
+                await s.execute(
+                    select(EmbeddingModelRegistry).where(EmbeddingModelRegistry.model_key == model_key)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = EmbeddingModelRegistry(
+                    model_key=model_key,
+                    provider=provider,
+                    model_name=model_name,
+                    model_version=model_version,
+                    dimensions=dimensions,
+                    normalized=normalized,
+                    is_active=activate,
+                )
+                s.add(row)
+            else:
+                if row.dimensions != dimensions:
+                    raise ValueError(
+                        f"Model '{model_key}' already registered with dim={row.dimensions}, cannot overwrite with dim={dimensions}"
+                    )
+                row.provider = provider
+                row.model_name = model_name
+                row.model_version = model_version
+                row.normalized = normalized
+                if activate:
+                    row.is_active = True
+            await s.flush()
+            return self._emb_model_dict(row)
+
+    async def get_active_embedding_model(self) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(EmbeddingModelRegistry).where(EmbeddingModelRegistry.is_active.is_(True))
+                )
+            ).scalars().first()
+            return self._emb_model_dict(row) if row else None
+
+    async def list_embedding_models(self) -> list[dict]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(select(EmbeddingModelRegistry).order_by(EmbeddingModelRegistry.created_at.desc()))
+            ).scalars().all()
+            return [self._emb_model_dict(r) for r in rows]
+
+    @staticmethod
+    def _emb_model_dict(r: EmbeddingModelRegistry) -> dict:
+        return {
+            "id": str(r.id),
+            "model_key": r.model_key,
+            "provider": r.provider,
+            "model_name": r.model_name,
+            "model_version": r.model_version,
+            "dimensions": r.dimensions,
+            "normalized": r.normalized,
+            "is_active": r.is_active,
+            "created_at": r.created_at,
+        }
+
+    async def upsert_memory_embedding(
+        self,
+        *,
+        memory_id: uuid.UUID,
+        model_id: uuid.UUID,
+        dimensions: int,
+        embedding: list[float],
+        content_hash: str,
+    ) -> uuid.UUID:
+        if len(embedding) != dimensions:
+            raise ValueError(f"Embedding vector length {len(embedding)} != declared dimensions {dimensions}")
+        async with self.db.session() as s:
+            model = await s.get(EmbeddingModelRegistry, model_id)
+            if model is not None and model.dimensions != dimensions:
+                raise ValueError(
+                    f"Dimension mismatch: model {model.model_key} expects {model.dimensions}, got {dimensions}"
+                )
+            existing = (
+                await s.execute(
+                    select(MemoryEmbedding).where(
+                        MemoryEmbedding.memory_id == memory_id,
+                        MemoryEmbedding.model_id == model_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                row = MemoryEmbedding(
+                    memory_id=memory_id,
+                    model_id=model_id,
+                    dimensions=dimensions,
+                    embedding=[float(x) for x in embedding],
+                    content_hash=content_hash,
+                )
+                s.add(row)
+                await s.flush()
+                return row.id
+            existing.dimensions = dimensions
+            existing.embedding = [float(x) for x in embedding]
+            existing.content_hash = content_hash
+            existing.created_at = utcnow()
+            await s.flush()
+            return existing.id
+
+    async def list_memories_missing_embedding(self, model_id: uuid.UUID, limit: int = 200) -> list[dict]:
+        async with self.db.session() as s:
+            subq = select(MemoryEmbedding.memory_id).where(MemoryEmbedding.model_id == model_id)
+            rows = (
+                await s.execute(
+                    select(MemoryIndex)
+                    .where(~MemoryIndex.id.in_(subq))
+                    .order_by(MemoryIndex.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [self._mem_dict(m) for m in rows]
+
+    async def fetch_hybrid_memory_candidates(
+        self,
+        *,
+        query: str = "",
+        model_id: uuid.UUID | None = None,
+        query_vector: list[float] | None = None,
+        memory_types: list[str] | None = None,
+        limit: int = 120,
+    ) -> list[dict]:
+        """Fetch memory candidates joined ONLY with embeddings of the active model_id (never mixes dimensions)."""
+        async with self.db.session() as s:
+            is_pg = s.bind is not None and s.bind.dialect.name == "postgresql"
+            if is_pg and model_id is not None and query_vector is not None:
+                # Native PostgreSQL pgvector + pg_trgm fast path when extensions are installed
+                try:
+                    vec_literal = "[" + ",".join(f"{float(x):.6f}" for x in query_vector) + "]"
+                    type_clause = "AND m.memory_type = ANY(:mtypes)" if memory_types else ""
+                    sql = text(
+                        f"""
+                        SELECT m.id, m.memory_type, m.external_id, m.title, m.summary, m.content_hash,
+                               m.source, m.importance, m.tags, m.cycle_id, m.sync_status, m.sync_error,
+                               m.embedding_status, m.reliability, m.information_gain, m.created_at,
+                               CASE WHEN e.embedding IS NOT NULL
+                                    THEN GREATEST(0.0, 1.0 - (e.embedding <=> CAST(:qvec AS vector)))
+                                    ELSE NULL END AS pg_vec_sim,
+                               CASE WHEN :qtext <> ''
+                                    THEN GREATEST(
+                                        similarity(m.title || ' ' || m.summary, :qtext),
+                                        word_similarity(:qtext, m.title || ' ' || m.summary)
+                                    )
+                                    ELSE 0.0 END AS pg_trgm_sim
+                        FROM memory_index m
+                        LEFT JOIN memory_embeddings e
+                               ON e.memory_id = m.id AND e.model_id = :mid
+                        WHERE 1=1 {type_clause}
+                        ORDER BY COALESCE(
+                            CASE WHEN e.embedding IS NOT NULL THEN 1.0 - (e.embedding <=> CAST(:qvec AS vector)) END,
+                            0.0
+                        ) DESC, m.created_at DESC
+                        LIMIT :lim
+                        """
+                    )
+                    params: dict[str, Any] = {
+                        "qvec": vec_literal,
+                        "qtext": query,
+                        "mid": model_id,
+                        "lim": limit,
+                    }
+                    if memory_types:
+                        params["mtypes"] = memory_types
+                    res = (await s.execute(sql, params)).mappings().all()
+                    return [
+                        {
+                            "memory_id": str(r["id"]),
+                            "memory_type": r["memory_type"],
+                            "external_id": r["external_id"],
+                            "title": r["title"],
+                            "summary": r["summary"],
+                            "content_hash": r["content_hash"],
+                            "source": r["source"],
+                            "importance": float(r["importance"]),
+                            "tags": list(r["tags"] or []),
+                            "cycle_id": str(r["cycle_id"]) if r["cycle_id"] else None,
+                            "sync_status": r["sync_status"],
+                            "sync_error": r["sync_error"],
+                            "embedding_status": r["embedding_status"],
+                            "reliability": float(r["reliability"]),
+                            "information_gain": r["information_gain"],
+                            "created_at": r["created_at"],
+                            "pg_vec_sim": float(r["pg_vec_sim"]) if r["pg_vec_sim"] is not None else None,
+                            "pg_trgm_sim": float(r["pg_trgm_sim"]) if r["pg_trgm_sim"] is not None else None,
+                            "embedding": None,
+                        }
+                        for r in res
+                    ]
+                except Exception:
+                    # Fallback cleanly if PG instance lacks pgvector/pg_trgm extension
+                    await s.rollback()
+
+            q = select(MemoryIndex)
+            if memory_types:
+                q = q.where(MemoryIndex.memory_type.in_(memory_types))
+            mem_rows = (
+                await s.execute(q.order_by(MemoryIndex.created_at.desc()).limit(limit))
+            ).scalars().all()
+            mem_ids = [m.id for m in mem_rows]
+
+            emb_map: dict[uuid.UUID, list[float]] = {}
+            if model_id is not None and mem_ids:
+                emb_rows = (
+                    await s.execute(
+                        select(MemoryEmbedding).where(
+                            MemoryEmbedding.model_id == model_id,
+                            MemoryEmbedding.memory_id.in_(mem_ids),
+                        )
+                    )
+                ).scalars().all()
+                for er in emb_rows:
+                    emb_map[er.memory_id] = list(er.embedding)
+
+            out: list[dict] = []
+            for m in mem_rows:
+                d = self._mem_dict(m)
+                d["embedding"] = emb_map.get(m.id)
+                d["pg_vec_sim"] = None
+                d["pg_trgm_sim"] = None
+                out.append(d)
+            return out
+
+    async def list_embeddings_for_model(self, model_id: uuid.UUID, limit: int = 100) -> list[dict]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(MemoryEmbedding, MemoryIndex)
+                    .join(MemoryIndex, MemoryEmbedding.memory_id == MemoryIndex.id)
+                    .where(MemoryEmbedding.model_id == model_id)
+                    .order_by(MemoryIndex.created_at.desc())
+                    .limit(limit)
+                )
+            ).all()
+            return [
+                {
+                    "memory_id": str(m.id),
+                    "content_hash": m.content_hash,
+                    "source": m.source,
+                    "title": m.title,
+                    "summary": m.summary,
+                    "embedding": list(e.embedding),
+                    "dimensions": e.dimensions,
+                }
+                for e, m in rows
+            ]
+
+    async def get_memory_embedding_stats(self) -> dict[str, Any]:
+        async with self.db.session() as s:
+            status_rows = (
+                await s.execute(
+                    select(MemoryIndex.embedding_status, func.count(MemoryIndex.id)).group_by(
+                        MemoryIndex.embedding_status
+                    )
+                )
+            ).all()
+            by_status = {str(st): int(cnt) for st, cnt in status_rows}
+            models = (
+                await s.execute(select(EmbeddingModelRegistry).order_by(EmbeddingModelRegistry.created_at.desc()))
+            ).scalars().all()
+            model_counts = (
+                await s.execute(
+                    select(MemoryEmbedding.model_id, func.count(MemoryEmbedding.id)).group_by(
+                        MemoryEmbedding.model_id
+                    )
+                )
+            ).all()
+            cnt_map = {str(mid): int(cnt) for mid, cnt in model_counts}
+            return {
+                "by_status": by_status,
+                "total_memories": sum(by_status.values()),
+                "models": [
+                    {**self._emb_model_dict(m), "embedded_count": cnt_map.get(str(m.id), 0)} for m in models
+                ],
+            }
+
+    async def get_memory_sync_stats(self) -> dict[str, Any]:
+        async with self.db.session() as s:
+            sync_rows = (
+                await s.execute(
+                    select(MemoryIndex.sync_status, func.count(MemoryIndex.id)).group_by(MemoryIndex.sync_status)
+                )
+            ).all()
+            outbox_rows = (
+                await s.execute(
+                    select(OutboxEvent.status, func.count(OutboxEvent.id))
+                    .where(OutboxEvent.event_type.in_(["memory.sync_letta", "memory.embed"]))
+                    .group_by(OutboxEvent.status)
+                )
+            ).all()
+            return {
+                "memory_index_by_sync_status": {str(st): int(cnt) for st, cnt in sync_rows},
+                "outbox_by_status": {str(st): int(cnt) for st, cnt in outbox_rows},
+            }
+
+    async def replay_memory_sync_outbox(self, event_type: str | None = None, limit: int = 50) -> int:
+        """Reset dead_letter / failed memory outbox events back to pending for retry."""
+        target_types = [event_type] if event_type else ["memory.sync_letta", "memory.embed"]
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(OutboxEvent.id)
+                    .where(
+                        OutboxEvent.event_type.in_(target_types),
+                        OutboxEvent.status.in_(["dead_letter", "pending"]),
+                    )
+                    .limit(limit)
+                )
+            ).scalars().all()
+            if not rows:
+                return 0
+            await s.execute(
+                update(OutboxEvent)
+                .where(OutboxEvent.id.in_(rows))
+                .values(status="pending", attempts=0, next_retry_at=utcnow(), locked_at=None, last_error=None)
+            )
+            return len(rows)
 
     # ── audit / logs ────────────────────────────────────────────────────────
     async def log_event(

@@ -51,6 +51,18 @@ class EmbeddingRequest(BaseModel):
     model: str = "aoc-local-embed-1024"
 
 
+class MemorySearchRequest(BaseModel):
+    query: str = ""
+    memory_types: list[str] | None = None
+    limit: int = 10
+
+
+class MemorySyncReplayRequest(BaseModel):
+    event_type: str | None = None
+    limit: int = 50
+    dispatch_now: bool = True
+
+
 def create_app(
     settings: Settings | None = None,
     db: Database | None = None,
@@ -240,6 +252,50 @@ def create_app(
         items = await _rt().memory.recall(query=query, memory_types=types, limit=min(max(limit, 1), 100))
         return [it.model_dump(mode="json") for it in items]
 
+    @app.post("/v2/memories/search")
+    async def search_memories_v2(
+        req: MemorySearchRequest, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
+        scored = await _rt().memory.search_hybrid(
+            query=req.query,
+            memory_types=req.memory_types,
+            limit=min(max(req.limit, 1), 100),
+        )
+        return [s.model_dump(mode="json") for s in scored]
+
+    @app.get("/v2/memories/embeddings/status")
+    async def memory_embeddings_status_v2(
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        stats = await rt.repo.get_memory_embedding_stats()
+        stats["active_provider"] = rt.embedding_service.spec.model_dump(mode="json")
+        stats["embedding_healthy"] = rt.embedding_service.healthy
+        return stats
+
+    @app.get("/v2/memories/sync/status")
+    async def memory_sync_status_v2(
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        stats = await rt.repo.get_memory_sync_stats()
+        stats["letta_available"] = rt.memory.backend_available
+        return stats
+
+    @app.post("/v2/memories/sync/replay")
+    async def memory_sync_replay_v2(
+        req: MemorySyncReplayRequest = MemorySyncReplayRequest(),
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        requeued = await rt.repo.replay_memory_sync_outbox(
+            event_type=req.event_type, limit=min(max(req.limit, 1), 200)
+        )
+        dispatched = 0
+        if req.dispatch_now and rt.outbox is not None:
+            dispatched = await rt.outbox.dispatch_once(batch_size=min(max(req.limit, 1), 50))
+        return {"requeued": requeued, "dispatched": dispatched}
+
     @app.get("/events")
     async def list_events(
         limit: int = 50, event_type: str | None = None, _: Principal = Depends(require_scope(SCOPE_READ))
@@ -376,10 +432,21 @@ def create_app(
         from app.memory.local_embeddings import embed_batch
 
         inputs = [req.input] if isinstance(req.input, str) else list(req.input)
-        vecs = embed_batch(inputs, dim=cfg.memory.embedding_dim)
+        rt = _rt()
+        model_used = req.model
+        vecs: list[list[float]] | None = None
+        if rt.embedding_service is not None:
+            try:
+                res = await rt.embedding_service.provider.embed_texts(inputs, is_query=False)
+                vecs = res.vectors
+                model_used = res.model_key
+            except Exception:
+                vecs = None
+        if vecs is None:
+            vecs = embed_batch(inputs, dim=cfg.memory.embedding_dim)
         return {
             "object": "list",
-            "model": req.model,
+            "model": model_used,
             "data": [
                 {"object": "embedding", "index": i, "embedding": v}
                 for i, v in enumerate(vecs)

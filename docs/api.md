@@ -48,3 +48,7 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `POST` | `/v2/tasks/{task_id}/reconcile` | Reconcile task/execution state against Host Agent Runner (Bearer `control`) |
 | `GET` | `/v2/runners` | List registered host systemd Agent Runners and heartbeat status (Bearer `read`) |
 | `GET` | `/v2/runners/{runner_id}/executions` | Inspect executions tracked by a specific Host Agent Runner (Bearer `read`) |
+| `POST` | `/v2/memories/search` | Hybrid semantic + trigram + recency + reliability + importance memory search (Bearer `read`) |
+| `GET` | `/v2/memories/embeddings/status` | Active embedding provider, registered models, and embedding coverage stats (Bearer `read`) |
+| `GET` | `/v2/memories/sync/status` | PostgreSQL memory_index vs Letta Outbox synchronization stats (Bearer `read`) |
+| `POST` | `/v2/memories/sync/replay` | Replay dead-letter/pending memory embedding or Letta sync outbox events (Bearer `control`) |

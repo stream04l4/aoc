@@ -1,0 +1,20 @@
+# Switchable Embedding Service Configuration (V2.0 P1-4)
+# Empirically selected via 200-doc bilingual benchmark (25 ZH + 25 EN queries):
+#   BAAI/bge-small-zh-v1.5:onnx-qint8 -> 153.8MB RSS (<600MB), 5.08ms P95, 117.11ms batch-32, 98.0% Recall@5 (100% ZH / 96% EN)
+# Switchable to intfloat/multilingual-e5-small:onnx-qint8 (384d, 523.8MB RSS, 100% Recall@5) or remote_openai (BAAI/bge-m3).
+provider: local_onnx
+model_key: "BAAI/bge-small-zh-v1.5:onnx-qint8"
+model_name: "BAAI/bge-small-zh-v1.5"
+model_version: "onnx-qint8"
+dimensions: 512
+normalized: true
+max_length: 256
+query_prefix: "为这个句子生成表示以用于检索相关文章："
+passage_prefix: ""
+cache_dir: "/home/ubuntu/aoc/.cache/embeddings"
+onnx_threads: 2
+# Remote OpenAI-compatible endpoint (used when provider: remote_openai)
+remote_endpoint: "http://80.158.109.51:9999/v1"
+remote_model: "BAAI/bge-m3"
+timeout_seconds: 15.0
+fallback_on_error: true

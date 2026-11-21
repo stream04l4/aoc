@@ -1,6 +1,8 @@
 services:
   aoc-postgres:
-    image: postgres:16-alpine
+    # NOTE: Switching from postgres:16-alpine to Debian-based pgvector requires pg_dump -> fresh volume restore
+    # (never mount an Alpine musl data directory directly into a Debian glibc container).
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
     container_name: aoc-postgres
     restart: unless-stopped
     environment:

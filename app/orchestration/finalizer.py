@@ -35,7 +35,9 @@ from app.core.enums import DriveType, GoalStatus, MemoryType, TaskStatus
 from app.drives.engine import DriveEngine
 from app.drives.interfaces import DriveContext, DriveState, KnowledgeGap
 from app.governance.interfaces import GovernanceInterface
+from app.memory.embedding import EmbeddingError, EmbeddingService
 from app.memory.experience_manager import ExperienceManager, compute_content_hash
+from app.memory.info_gain import ExistingMemorySample, InformationGainEvaluator
 from app.memory.interfaces import MemoryItem
 from app.observability.logging import get_logger
 from app.orchestration.verifier import ResultVerifier
@@ -77,6 +79,8 @@ class TaskFinalizer:
         verifier: ResultVerifier | None = None,
         llm_gateway: LLMGatewayInterface | None = None,
         on_learning: Callable[[datetime, float], None] | None = None,
+        embedding_service: EmbeddingService | None = None,
+        info_gain_evaluator: InformationGainEvaluator | None = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -88,6 +92,8 @@ class TaskFinalizer:
         self.verifier = verifier or ResultVerifier()
         self.llm_gateway = llm_gateway
         self._on_learning = on_learning
+        self.embedding_service = embedding_service
+        self.info_gain_evaluator = info_gain_evaluator or InformationGainEvaluator()
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -275,6 +281,54 @@ class TaskFinalizer:
                     update={"goal_achieved": False, "resolved_topic": None, "acquired_skill": None}
                 )
 
+            # 3b. Compute deterministic Four-Factor Information Gain (V2.0 P1-4, Task Book 5.4.3)
+            measured_info_gain = 0.0
+            info_gain_details: dict[str, Any] = {}
+            if eval_res.goal_achieved:
+                candidate_text = "\n".join([eval_res.summary, *eval_res.learned_facts]).strip()
+                existing_samples: list[ExistingMemorySample] = []
+                new_emb: list[float] | None = None
+                if self.embedding_service is not None and candidate_text:
+                    try:
+                        mid_active, new_emb = await self.embedding_service.embed_query(candidate_text)
+                        emb_rows = await self.repo.list_embeddings_for_model(mid_active, limit=80)
+                        existing_samples = [
+                            ExistingMemorySample(
+                                memory_id=r["memory_id"],
+                                content_hash=r["content_hash"],
+                                source=r["source"],
+                                text=f"{r['title']}\n{r['summary']}",
+                                embedding=r["embedding"],
+                            )
+                            for r in emb_rows
+                        ]
+                    except EmbeddingError as exc:
+                        logger.warning("finalizer.info_gain_embed_degraded", error=str(exc))
+                if not existing_samples:
+                    recent_mems = await self.repo.list_memory_index(limit=60)
+                    existing_samples = [
+                        ExistingMemorySample(
+                            memory_id=r["memory_id"],
+                            content_hash=r["content_hash"],
+                            source=r["source"],
+                            text=f"{r['title']}\n{r['summary']}",
+                        )
+                        for r in recent_mems
+                    ]
+                ig_breakdown = self.info_gain_evaluator.evaluate(
+                    new_text=candidate_text,
+                    new_facts=eval_res.learned_facts,
+                    new_source=f"execution:{exec_key}",
+                    new_embedding=new_emb,
+                    existing_memories=existing_samples,
+                    source_reliability=0.9 if verification_passed else 0.3,
+                    goal_relevance=1.0,
+                    verification_confidence=1.0 if verification_passed else 0.0,
+                    learning_progress_factor=1.0,
+                )
+                measured_info_gain = ig_breakdown.information_gain
+                info_gain_details = ig_breakdown.model_dump(mode="json")
+
             # 4. Atomic Transaction: World State + Memory Index + Outbox + Finalized Markers + Inbox
             now = utcnow()
             memory_ids: list[str] = []
@@ -384,12 +438,24 @@ class TaskFinalizer:
                             tags=item.tags,
                             cycle_id=cycle_uuid,
                             sync_status="pending",
+                            embedding_status="pending",
+                            reliability=0.9 if verification_passed else 0.5,
+                            information_gain=measured_info_gain if eval_res.goal_achieved else 0.0,
                             session=s,
                         )
                         mid = str(idx_id)
                         memory_ids.append(mid)
                         memory_writes.append({"stored_index_id": mid, "deduplicated": False, "memory_type": item.memory_type})
-                        # Enqueue async Letta sync & future embedding via Transactional Outbox
+                        # Enqueue async Embedding & Letta sync via Transactional Outbox (V2.0 P1-4)
+                        if self.embedding_service is not None:
+                            await self.repo.enqueue_outbox_event(
+                                event_type=OutboxEventType.MEMORY_EMBED,
+                                idempotency_key=f"embed:{mid}",
+                                payload={"memory_id": mid},
+                                aggregate_type="memory",
+                                aggregate_id=idx_id,
+                                session=s,
+                            )
                         await self.repo.enqueue_outbox_event(
                             event_type=OutboxEventType.MEMORY_SYNC_LETTA,
                             idempotency_key=f"sync_letta:{mid}",
@@ -404,12 +470,16 @@ class TaskFinalizer:
                 updated_outcome = dict(task_row.get("outcome") or {})
                 updated_outcome["goal_achieved"] = eval_res.goal_achieved
                 updated_outcome["finalized_at"] = now.isoformat()
+                if info_gain_details:
+                    updated_outcome["info_gain_breakdown"] = info_gain_details
                 await self.repo.update_task(task_uuid, finalized_at=now, outcome=updated_outcome, session=s)
 
             # Notify in-memory learning tracker (used by CuriosityDriveEvaluator)
             info_gain = 0.0
-            if eval_res.goal_achieved and (eval_res.information_gain > 0 or eval_res.learned_facts):
-                info_gain = max(eval_res.information_gain, 0.25 if eval_res.learned_facts else 0.0)
+            if eval_res.goal_achieved and (measured_info_gain > 0 or eval_res.information_gain > 0 or eval_res.learned_facts):
+                info_gain = measured_info_gain if info_gain_details else max(
+                    eval_res.information_gain, 0.25 if eval_res.learned_facts else 0.0
+                )
                 if self._on_learning is not None:
                     self._on_learning(now, info_gain)
 
