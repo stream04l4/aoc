@@ -1,0 +1,201 @@
+{
+  "schema_version": "v3_baseline_metrics_v1",
+  "collected_at": "2026-11-21T20:54:01.366769+00:00",
+  "window_hours": 24.0,
+  "window_since": "2026-11-20T20:54:01.366769+00:00",
+  "system": {
+    "alembic_version": "0008_p1_9_affect",
+    "extensions": {
+      "pg_trgm": "1.6",
+      "plpgsql": "1.0",
+      "vector": "0.8.7"
+    },
+    "organism": {
+      "name": "AOC-001",
+      "version": "1.0.0",
+      "lifecycle_state": "SLEEPING",
+      "cycle_count": 284
+    },
+    "tables_total": 38,
+    "table_counts": {
+      "action_plans": 157,
+      "active_goals": 158,
+      "affect_history": 0,
+      "agent_executions": 178,
+      "agent_registry": 3,
+      "agent_tasks": 151,
+      "alembic_version": 1,
+      "api_credentials": 0,
+      "approval_records": 1,
+      "capability_evidence": 146,
+      "capability_profiles": 9,
+      "cycle_records": 273,
+      "decision_logs": 676,
+      "drive_history": 2058,
+      "drive_states": 3,
+      "embedding_model_registry": 1,
+      "event_logs": 1129,
+      "execution_recovery_records": 0,
+      "goal_history": 316,
+      "inbox_events": 1132,
+      "memory_embeddings": 345,
+      "memory_index": 346,
+      "observation_records": 420,
+      "organism_identity": 1,
+      "organism_state": 1,
+      "outbox_events": 986,
+      "policy_evaluations": 157,
+      "resource_usage": 1083,
+      "runner_registry": 1,
+      "self_model_versions": 147,
+      "sensor_checkpoints": 1,
+      "skill_registry": 0,
+      "skill_validation_results": 0,
+      "system_config": 0,
+      "task_lifecycle_events": 1060,
+      "world_event_sources": 3,
+      "world_events": 5,
+      "world_states": 51
+    }
+  },
+  "cycles": {
+    "total": 244,
+    "by_outcome": {
+      "SUCCEEDED": 115,
+      "IDLE": 50,
+      "BUDGET_DEFERRED": 36,
+      "ACTION_FAILED": 32,
+      "POLICY_DENIED": 6,
+      "INTERRUPTED": 3,
+      "COMPLETED": 1,
+      "REQUIRES_APPROVAL": 1
+    }
+  },
+  "tasks_and_executions": {
+    "tasks_total": 150,
+    "tasks_by_status": {
+      "SUCCEEDED": 134,
+      "FAILED": 16
+    },
+    "retried_tasks": 19,
+    "retry_rate": 0.1267,
+    "executions_total": 178,
+    "retry_attempts": 32,
+    "l0_write_intent_tasks": 6,
+    "l0_write_intent_failed": 6,
+    "unfinalized_terminal_tasks": 4,
+    "unfinalized_terminal_execs": 0
+  },
+  "goals": {
+    "total": 157,
+    "unique_keys": 59,
+    "repeated_key_goals": 98,
+    "repetition_rate": 0.6242
+  },
+  "tokens_and_ig": {
+    "llm_calls": 875,
+    "total_tokens": 22023372.0,
+    "tokens_by_source": {
+      "codex": 12763226.0,
+      "brain_gateway": 9260146.0
+    },
+    "calls_by_source": {
+      "brain_gateway": 706,
+      "codex": 169
+    },
+    "failed_task_tokens": 2931802.0,
+    "failed_task_token_ratio": 0.1331,
+    "new_memories_window": 345,
+    "memories_with_ig": 345,
+    "sum_information_gain": 37.3199,
+    "avg_information_gain": 0.1082,
+    "verified_ig_per_1m_tokens": 1.6946
+  },
+  "state_snapshot": {
+    "drives": [
+      {
+        "drive_type": "curiosity",
+        "satisfaction": 0.8769,
+        "deficit": 0.1231,
+        "curiosity_ig_dim": 0.0957
+      },
+      {
+        "drive_type": "reproduction",
+        "satisfaction": 0.5382,
+        "deficit": 0.4618,
+        "curiosity_ig_dim": null
+      },
+      {
+        "drive_type": "survival",
+        "satisfaction": 0.98,
+        "deficit": 0.02,
+        "curiosity_ig_dim": null
+      }
+    ],
+    "capabilities": [
+      {
+        "capability_key": "knowledge_summarization",
+        "maturity_status": "VALIDATED",
+        "sample_count": 98,
+        "estimated_success_rate": 0.77
+      },
+      {
+        "capability_key": "general_task",
+        "maturity_status": "VALIDATED",
+        "sample_count": 23,
+        "estimated_success_rate": 0.84
+      },
+      {
+        "capability_key": "repository_analysis",
+        "maturity_status": "VALIDATED",
+        "sample_count": 18,
+        "estimated_success_rate": 0.8
+      },
+      {
+        "capability_key": "system_diagnosis",
+        "maturity_status": "VALIDATED",
+        "sample_count": 5,
+        "estimated_success_rate": 0.8571
+      },
+      {
+        "capability_key": "research",
+        "maturity_status": "ACQUIRED",
+        "sample_count": 2,
+        "estimated_success_rate": 0.75
+      },
+      {
+        "capability_key": "code_review",
+        "maturity_status": "AVAILABLE",
+        "sample_count": 0,
+        "estimated_success_rate": 0.5
+      },
+      {
+        "capability_key": "coding",
+        "maturity_status": "AVAILABLE",
+        "sample_count": 0,
+        "estimated_success_rate": 0.5
+      },
+      {
+        "capability_key": "debugging",
+        "maturity_status": "AVAILABLE",
+        "sample_count": 0,
+        "estimated_success_rate": 0.5
+      },
+      {
+        "capability_key": "terminal",
+        "maturity_status": "AVAILABLE",
+        "sample_count": 0,
+        "estimated_success_rate": 0.5
+      }
+    ],
+    "skills_by_status": {},
+    "memory_sync_all_time": {
+      "synced": 346
+    },
+    "outbox_all_time": {
+      "dispatched": 986
+    },
+    "world_events_total": 5,
+    "affect_history_total": 0
+  }
+}
