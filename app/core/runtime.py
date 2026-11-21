@@ -426,6 +426,7 @@ class OrganismRuntime:
             world_pipeline=self.world_pipeline,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
+        self.finalizer._on_prediction_error = self.loop._record_prediction_error
         if self.world_pipeline is not None and (self._sensors_cfg or {}).get("sources"):
             await self.world_pipeline.sync_configured_sources(self._sensors_cfg["sources"])
         recovery = await self.loop.recover()

@@ -42,7 +42,7 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
       <Card>
         <CardHeader
           title="数字环境传感器状态（RSS / Git / Web）"
-          subtitle={`poll_on_perceive = ${String(data.poll_on_perceive)} · 重要性入库阈值 = ${data.importance_threshold}`}
+          subtitle={`poll_on_perceive = ${String(data.poll_on_perceive)} · 重要性入库阈值 = ${data.importance_threshold} · 允许白名单域 ${(data.allowed_domains || []).length} 个（支持好奇心受控动态扩展）`}
           icon={<Radio className="h-4 w-4" />}
         />
         <div className="grid grid-cols-1 gap-3 p-4 md:grid-cols-3">
@@ -104,6 +104,51 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
               </div>
             )}
           </div>
+        </Card>
+      )}
+
+      {/* V3.1 Lightweight World Hypotheses (Strict separation of unverified hypotheses vs verified facts) */}
+      {Array.isArray(data.hypotheses) && (
+        <Card>
+          <CardHeader
+            title="轻量世界假设追踪（World Hypotheses · V3.1）"
+            subtitle="复用 digital_world_state(kind=hypothesis)，严格区分未验证假设与经确定性验证的观察事实（0 新增重型图谱表）"
+            action={<StatusBadge value="ok" label={`${data.hypotheses.length} 条假设`} />}
+          />
+          {data.hypotheses.length === 0 ? (
+            <div className="px-5 py-4 text-xs text-slate-500">
+              当前暂无待验证或已验证的世界假设；当大脑在探索中提出 hypothesis_to_test 时将自动记录并由确定性验收更新结论。
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-200/70 dark:divide-slate-800/80">
+              {data.hypotheses.slice(0, 15).map((h: any) => (
+                <div key={h.id} className="px-4 py-3 space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold font-mono text-slate-900 dark:text-slate-100 truncate">
+                      {h.key}
+                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-[11px] font-mono text-slate-400">
+                        置信度 {Number(h.confidence ?? 0.5).toFixed(2)} · 证据 {h.evidence_count ?? 0}
+                      </span>
+                      <StatusBadge value={h.status || 'unverified'} />
+                    </div>
+                  </div>
+                  {h.claim && (
+                    <p className="text-xs text-slate-600 dark:text-slate-300">{h.claim}</p>
+                  )}
+                  {h.last_verdict_summary && (
+                    <p className="text-[11px] text-cyan-600 dark:text-cyan-400">
+                      最近验证：{h.last_verdict_summary}
+                    </p>
+                  )}
+                  <div className="text-[10px] font-mono text-slate-400">
+                    来源：{h.source} · 更新：{formatTime(h.updated_at)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </Card>
       )}
 
@@ -189,7 +234,7 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
         <Card className="lg:col-span-5">
           <CardHeader title="工作环境态（world_states 知识话题）" subtitle="直接驱动 Curiosity 欲望的开放与已解决主题" />
           <div className="divide-y divide-slate-200/70 max-h-[540px] overflow-y-auto dark:divide-slate-800/80">
-            {(data.world_states || []).map((w: any) => (
+            {(data.world_states || []).filter((w: any) => w.kind !== 'hypothesis').map((w: any) => (
               <div key={w.id} className="flex items-start justify-between gap-3 px-4 py-3">
                 <div className="min-w-0">
                   <div className="text-xs font-medium font-mono truncate">{w.key}</div>

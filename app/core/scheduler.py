@@ -80,17 +80,21 @@ class OrganismScheduler:
                         next_wake_at=wake_at,
                     )
                 elif outcome == "IDLE":
-                    sleep_s = self.settings.idle_sleep_seconds
+                    factor = self._extract_reflection_factor(result)
+                    sleep_s = round(self.settings.idle_sleep_seconds * factor, 2)
+                    note = f" (affect×{factor:.2f})" if factor != 1.0 else ""
                     await self.lifecycle.transition(
                         LifecycleState.SLEEPING,
-                        reason=f"sleeping {sleep_s}s after IDLE cycle",
+                        reason=f"sleeping {sleep_s}s after IDLE cycle{note}",
                         next_wake_at=utcnow() + timedelta(seconds=sleep_s),
                     )
                 else:
-                    sleep_s = self.settings.cycle_interval_seconds
+                    factor = self._extract_reflection_factor(result)
+                    sleep_s = round(self.settings.cycle_interval_seconds * factor, 2)
+                    note = f" (affect×{factor:.2f})" if factor != 1.0 else ""
                     await self.lifecycle.transition(
                         LifecycleState.SLEEPING,
-                        reason=f"sleeping {sleep_s}s until next cycle",
+                        reason=f"sleeping {sleep_s}s until next cycle{note}",
                         next_wake_at=utcnow() + timedelta(seconds=sleep_s),
                     )
 
@@ -106,6 +110,20 @@ class OrganismScheduler:
                 await self.lifecycle.wait_for_wake(timeout_seconds=backoff)
 
         logger.info("scheduler.exited", cycles_executed=self._cycles_executed)
+
+    def _extract_reflection_factor(self, cycle_result: dict) -> float:
+        """Read bounded Affect reflection_interval_factor in [0.85, 1.15] (V3.1)."""
+        try:
+            dec = cycle_result.get("decision") or {}
+            aff = (dec.get("constraints") or {}).get("affect_modulation") or {}
+            if not aff.get("enabled"):
+                return 1.0
+            raw = float(aff.get("reflection_interval_factor", 1.0))
+            if raw != raw:
+                return 1.0
+            return round(max(0.85, min(1.15, raw)), 4)
+        except (TypeError, ValueError):
+            return 1.0
 
     def _compute_throttle_sleep(self, cycle_result: dict) -> float:
         max_slice = max(1.0, float(self.settings.throttled_max_sleep_seconds))

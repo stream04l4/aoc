@@ -362,11 +362,17 @@ class AgentOrchestrator:
         goal_id: uuid.UUID | None = None,
         plan_id: uuid.UUID | None = None,
         cycle_id: uuid.UUID | None = None,
+        retry_backoff_multiplier: float = 1.0,
     ) -> dict[str, Any]:
         """Persist a task from an approved ActionPlan and dispatch it asynchronously."""
         task_uuid = uuid.uuid4()
         task_id = str(task_uuid)
         workspace = self.governance.prepare_workspace(task_id)
+        safe_backoff_mult = max(1.0, min(1.15, float(retry_backoff_multiplier or 1.0)))
+        res_budget: dict[str, Any] = {
+            "sandbox_mode": verdict.sandbox_mode,
+            "retry_backoff_multiplier": round(safe_backoff_mult, 4),
+        }
 
         adapter, _routing_dec = await self.router.select(
             preferred_agent=plan.assigned_agent,
@@ -387,7 +393,7 @@ class AgentOrchestrator:
                 expected_output=plan.expected_output,
                 workspace=workspace,
                 timeout_seconds=verdict.effective_timeout_seconds,
-                resource_budget={"sandbox_mode": verdict.sandbox_mode},
+                resource_budget=res_budget,
                 permission_level=verdict.effective_level,
                 success_criteria=plan.success_criteria,
                 verification=[v.model_dump(mode="json") for v in plan.verification],
@@ -416,7 +422,7 @@ class AgentOrchestrator:
             expected_output=plan.expected_output,
             workspace=workspace,
             timeout_seconds=verdict.effective_timeout_seconds,
-            resource_budget={"sandbox_mode": verdict.sandbox_mode},
+            resource_budget=res_budget,
             permission_level=verdict.effective_level,
             success_criteria=plan.success_criteria,
             verification=[v.model_dump(mode="json") for v in plan.verification],
@@ -767,14 +773,19 @@ class AgentOrchestrator:
                     finalized_at=utcnow(),
                     verification=superseded_ver,
                 )
+                raw_backoff_mult = float((task_row.get("resource_budget") or {}).get("retry_backoff_multiplier", 1.0) or 1.0)
+                backoff_mult = max(1.0, min(1.15, raw_backoff_mult))
+                backoff_seconds = round(min(5.0, max(0.0, (backoff_mult - 1.0) * 10.0)), 3)
                 await self.state_machine.transition(
                     task_uuid,
                     TaskStatus.RETRY_WAIT,
                     execution_id=exec_uuid,
                     actor="orchestrator",
-                    reason=f"attempt {attempt} failed ({fail_reason}); scheduling retry",
+                    reason=f"attempt {attempt} failed ({fail_reason}); scheduling retry (backoff={backoff_seconds}s)",
                     idempotency_key=f"retry_wait:{execution.execution_id}",
                 )
+                if backoff_seconds > 0.0:
+                    await asyncio.sleep(backoff_seconds)
                 await self.state_machine.transition(
                     task_uuid,
                     TaskStatus.QUEUED,
@@ -788,7 +799,12 @@ class AgentOrchestrator:
                     selected=next_adapter.capability.agent_id,
                     alternatives=sorted(tried),
                     reason=f"Previous attempt {attempt} on '{execution.agent_id}' failed ({fail_reason}); retrying on '{next_adapter.capability.agent_id}'",
-                    payload={"task_id": str(task_uuid), "attempt": attempt + 1},
+                    payload={
+                        "task_id": str(task_uuid),
+                        "attempt": attempt + 1,
+                        "retry_backoff_multiplier": round(backoff_mult, 4),
+                        "backoff_seconds": backoff_seconds,
+                    },
                     cycle_id=cycle_uuid,
                 )
                 await self._launch_attempt(task_uuid, next_adapter.capability.agent_id, sandbox_mode, cycle_id=cycle_uuid)

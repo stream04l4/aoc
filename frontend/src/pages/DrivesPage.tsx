@@ -166,12 +166,27 @@ export function DrivesPage({
             )}
 
             {data.affect.enabled && data.affect.current_modulation && (
-              <div className="flex flex-wrap gap-3 text-[11px] font-mono text-slate-500">
-                <span>Curiosity Δ: {Number(data.affect.current_modulation.curiosity_priority_delta || 0).toFixed(4)}</span>
-                <span>·</span>
-                <span>Reproduction Δ: {Number(data.affect.current_modulation.reproduction_priority_delta || 0).toFixed(4)}</span>
-                <span>·</span>
-                <span>Retry Backoff ×{Number(data.affect.current_modulation.retry_backoff_multiplier || 1).toFixed(3)}</span>
+              <div className="space-y-2">
+                <div className="flex flex-wrap gap-3 text-[11px] font-mono text-slate-500">
+                  <span>Curiosity Δ: {Number(data.affect.current_modulation.curiosity_priority_delta || 0).toFixed(4)}</span>
+                  <span>·</span>
+                  <span>Reproduction Δ: {Number(data.affect.current_modulation.reproduction_priority_delta || 0).toFixed(4)}</span>
+                  <span>·</span>
+                  <span>Retry Backoff ×{Number(data.affect.current_modulation.retry_backoff_multiplier || 1).toFixed(3)}</span>
+                  <span>·</span>
+                  <span>Reflection ×{Number(data.affect.current_modulation.reflection_interval_factor || 1).toFixed(3)}</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5 text-[10px]">
+                  {data.affect.brain_read_only_injected && (
+                    <StatusBadge value="ok" label="大脑只读感知已接入" />
+                  )}
+                  {data.affect.confidence_evidence_anchored && (
+                    <StatusBadge value="ok" label="Confidence 已锚定能力证据" />
+                  )}
+                  {data.affect.runtime_hooks?.retry_backoff_active && (
+                    <StatusBadge value="ok" label="退避与节律已接线" />
+                  )}
+                </div>
               </div>
             )}
 
@@ -309,6 +324,77 @@ export function DrivesPage({
           </div>
         </Card>
       </div>
+
+      {/* V3.1 Expected IG vs Verified IG Prediction-Error Calibration */}
+      {data.ig_calibration && (
+        <Card>
+          <CardHeader
+            title="预期 IG vs 实测 IG 校准（Prediction Error · V3.1）"
+            subtitle="实测误差（verified_ig - predicted_ig）作为惊喜/落差信号回灌至情绪内核"
+          />
+          {data.ig_calibration.length === 0 ? (
+            <div className="px-5 py-4 text-xs text-slate-500">当前时间窗内尚无带预期/实测 IG 记录的目标。</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-slate-200/70 text-[11px] text-slate-500 dark:border-slate-800">
+                  <tr>
+                    <th className="px-4 py-2.5">目标标题</th>
+                    <th className="px-4 py-2.5">欲望</th>
+                    <th className="px-4 py-2.5">预期 IG</th>
+                    <th className="px-4 py-2.5">实测 IG</th>
+                    <th className="px-4 py-2.5">误差 (Surprise)</th>
+                    <th className="px-4 py-2.5">状态</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200/70 dark:divide-slate-800/80">
+                  {data.ig_calibration.slice(0, 15).map((g: any) => {
+                    const errVal = g.prediction_error;
+                    const errColor =
+                      errVal == null
+                        ? 'text-slate-400'
+                        : errVal > 0.05
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : errVal < -0.15
+                            ? 'text-rose-500'
+                            : 'text-slate-600 dark:text-slate-300';
+                    return (
+                      <tr key={g.goal_id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
+                        <td className="px-4 py-2 max-w-xs truncate">
+                          {g.cycle_id ? (
+                            <button
+                              onClick={() => onOpenCycle(g.cycle_id)}
+                              className="text-left text-cyan-600 hover:underline dark:text-cyan-400 cursor-pointer truncate max-w-xs block"
+                              title={g.title}
+                            >
+                              {g.title}
+                            </button>
+                          ) : (
+                            <span title={g.title}>{g.title}</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 font-mono">{g.drive_type}</td>
+                        <td className="px-4 py-2 font-mono">
+                          {g.predicted_ig != null ? Number(g.predicted_ig).toFixed(3) : '—'}
+                        </td>
+                        <td className="px-4 py-2 font-mono">
+                          {g.verified_ig != null ? Number(g.verified_ig).toFixed(3) : '—'}
+                        </td>
+                        <td className={`px-4 py-2 font-mono font-medium ${errColor}`}>
+                          {errVal != null ? `${errVal >= 0 ? '+' : ''}${Number(errVal).toFixed(3)}` : '—'}
+                        </td>
+                        <td className="px-4 py-2">
+                          <StatusBadge value={g.status} />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
     </div>
   );
 }

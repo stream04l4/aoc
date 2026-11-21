@@ -67,6 +67,8 @@ class AffectModulator(AffectModulatorInterface):
         idle_cycles: int = 0,
         low_ig_streak: int = 0,
         world_event_novelty: float = 0.0,
+        self_model_confidence: float | None = None,
+        prediction_surprise: float = 0.0,
     ) -> tuple[AffectState, str]:
         """Pure deterministic event-driven state transition (strictly bounded)."""
         d = self.cfg.decay_rate
@@ -109,6 +111,24 @@ class AffectModulator(AffectModulatorInterface):
             boredom *= max(0.5, 1.0 - 0.4 * novelty)
             reasons.append(f"world_novelty={novelty:.2f}")
 
+        # V3.1: Prediction error (verified_ig - predicted_ig) modulates surprise/satisfaction
+        surprise = max(-1.0, min(1.0, float(prediction_surprise or 0.0)))
+        if surprise > 0.05:
+            valence += 0.18 * surprise
+            arousal += 0.12 * surprise
+            boredom *= max(0.5, 1.0 - 0.35 * surprise)
+            reasons.append(f"positive_surprise=+{surprise:.2f}")
+        elif surprise < -0.15:
+            frustration += 0.12 * abs(surprise)
+            boredom += 0.10 * abs(surprise)
+            reasons.append(f"negative_surprise={surprise:.2f}")
+
+        # V3.1: Anchor Confidence smoothly to evidence-backed SelfModel capability confidence
+        if self_model_confidence is not None:
+            sm_conf = max(0.0, min(1.0, float(self_model_confidence)))
+            confidence = 0.70 * confidence + 0.30 * sm_conf
+            reasons.append(f"self_model_conf={sm_conf:.2f}")
+
         new_state = AffectState(
             valence=valence,
             arousal=arousal,
@@ -138,6 +158,8 @@ class AffectModulator(AffectModulatorInterface):
                 idle_cycles=int(ev.get("idle_cycles", 0)),
                 low_ig_streak=int(ev.get("low_ig_streak", 0)),
                 world_event_novelty=float(ev.get("world_event_novelty", 0.0)),
+                self_model_confidence=ev.get("self_model_confidence"),
+                prediction_surprise=float(ev.get("prediction_surprise", 0.0)),
             )
         return cur
 
@@ -190,6 +212,8 @@ class AffectModulator(AffectModulatorInterface):
         trigger_event_id: str | None = None,
         low_ig_streak: int = 0,
         world_event_novelty: float = 0.0,
+        self_model_confidence: float | None = None,
+        prediction_surprise: float = 0.0,
     ) -> tuple[AffectState, AffectModulation]:
         if not self.enabled:
             return self._state, AffectModulation(
@@ -221,6 +245,8 @@ class AffectModulator(AffectModulatorInterface):
             idle_cycles=idle_cycles,
             low_ig_streak=low_ig_streak,
             world_event_novelty=world_event_novelty,
+            self_model_confidence=self_model_confidence,
+            prediction_surprise=prediction_surprise,
         )
         self._state = new_state
         mod = self.compute_modulation(new_state)
@@ -259,6 +285,8 @@ class AffectModulator(AffectModulatorInterface):
         trigger_event_id: str | None = None,
         low_ig_streak: int = 0,
         world_event_novelty: float = 0.0,
+        self_model_confidence: float | None = None,
+        prediction_surprise: float = 0.0,
     ) -> AffectModulation:
         """Fault-isolated entrypoint for AutonomousLoop: NEVER raises; falls back to neutral V1.0 policy."""
         if not self.enabled:
@@ -273,6 +301,8 @@ class AffectModulator(AffectModulatorInterface):
                 trigger_event_id=trigger_event_id,
                 low_ig_streak=low_ig_streak,
                 world_event_novelty=world_event_novelty,
+                self_model_confidence=self_model_confidence,
+                prediction_surprise=prediction_surprise,
             )
             return mod
         except Exception as exc:

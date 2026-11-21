@@ -689,6 +689,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 "3_arbitration": (
                     {
                         "decision": cycle.decision,
+                        "affect_snapshot": bo.get("affect_snapshot"),
                         "audit_logs": [
                             {
                                 "id": str(d.id),
@@ -709,6 +710,19 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 "5_goal_generation": (
                     {
                         "proposal": bo.get("goal"),
+                        "goal_candidates": bo.get("goal_candidates") or [],
+                        "goal_dedup": bo.get("goal_dedup"),
+                        "ranking_logs": [
+                            {
+                                "id": str(d.id),
+                                "selected": d.selected,
+                                "reason": d.reason,
+                                "payload": d.payload,
+                                "created_at": _iso(d.created_at),
+                            }
+                            for d in decisions
+                            if d.decision_type in {"goal_ranking", "goal_dedup", "active_perception_source"}
+                        ],
                         "persisted_goals": [
                             {
                                 "goal_id": str(g.id),
@@ -719,6 +733,9 @@ def create_control_center_router(get_runtime) -> APIRouter:
                                 "success_criteria": g.success_criteria,
                                 "expected_outcome": g.expected_outcome,
                                 "related_key": g.related_key,
+                                "predicted_ig": g.predicted_ig,
+                                "verified_ig": g.verified_ig,
+                                "cooldown_until": _iso(g.cooldown_until),
                                 "created_at": _iso(g.created_at),
                             }
                             for g in goals
@@ -933,9 +950,17 @@ def create_control_center_router(get_runtime) -> APIRouter:
 
             # Compare predicted vs measured satisfaction changes from recent cycles
             c_q = select(CycleRecord).order_by(desc(CycleRecord.started_at)).limit(40)
+            ig_g_q = (
+                select(ActiveGoal)
+                .where(or_(ActiveGoal.predicted_ig.is_not(None), ActiveGoal.verified_ig.is_not(None)))
+                .order_by(desc(ActiveGoal.created_at))
+                .limit(30)
+            )
             if since is not None:
                 c_q = c_q.where(CycleRecord.started_at >= since)
+                ig_g_q = ig_g_q.where(ActiveGoal.created_at >= since)
             c_rows = (await s.execute(c_q)).scalars().all()
+            ig_goal_rows = (await s.execute(ig_g_q)).scalars().all()
 
         affect_hist = (await rt.repo.list_affect_history(org_id, limit=80)) if org_id else []
         affect_hist_asc = list(reversed(affect_hist))
@@ -1003,9 +1028,33 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 for a in arb_rows
             ],
             "predicted_vs_measured": predicted_vs_measured,
+            "ig_calibration": [
+                {
+                    "goal_id": str(g.id),
+                    "cycle_id": str(g.cycle_id) if g.cycle_id else None,
+                    "drive_type": g.drive_type,
+                    "title": g.title,
+                    "status": g.status,
+                    "predicted_ig": round(float(g.predicted_ig), 4) if g.predicted_ig is not None else None,
+                    "verified_ig": round(float(g.verified_ig), 4) if g.verified_ig is not None else None,
+                    "prediction_error": (
+                        round(float(g.verified_ig) - float(g.predicted_ig), 4)
+                        if (g.predicted_ig is not None and g.verified_ig is not None)
+                        else None
+                    ),
+                    "created_at": _iso(g.created_at),
+                }
+                for g in ig_goal_rows
+            ],
             "affect": {
                 "enabled": bool(rt.affect and rt.affect.enabled),
                 "maximum_influence": float(rt.affect.cfg.maximum_influence) if rt.affect else 0.15,
+                "brain_read_only_injected": True,
+                "confidence_evidence_anchored": True,
+                "runtime_hooks": {
+                    "retry_backoff_active": True,
+                    "scheduler_interval_active": True,
+                },
                 "current_state": affect_state,
                 "current_modulation": affect_mod,
                 "history": [
@@ -1565,9 +1614,33 @@ def create_control_center_router(get_runtime) -> APIRouter:
             if rt.settings.kernel_v3.world_poll_on_perceive is not None
             else bool(sensors_cfg.get("poll_on_perceive", False))
         )
+        hypotheses = []
+        for w in ws_rows:
+            if w.kind != "hypothesis":
+                continue
+            val = w.value if isinstance(w.value, dict) else {}
+            ev_list = val.get("evidence") if isinstance(val.get("evidence"), list) else []
+            hypotheses.append(
+                {
+                    "id": str(w.id),
+                    "key": w.key,
+                    "status": w.status,
+                    "claim": val.get("claim", ""),
+                    "verification_hint": val.get("verification_hint", ""),
+                    "confidence": val.get("confidence", 0.5),
+                    "evidence_count": len(ev_list),
+                    "evidence": ev_list[-5:],
+                    "last_verdict_summary": val.get("last_verdict_summary"),
+                    "source": w.source,
+                    "updated_at": _iso(w.updated_at),
+                }
+            )
+
         return {
             "poll_on_perceive": eff_poll_on_perceive,
             "importance_threshold": float(sensors_cfg.get("importance_threshold", 0.45)),
+            "allowed_domains": list(sensors_cfg.get("allowed_domains") or []),
+            "hypotheses": hypotheses,
             "mcp_tools": {
                 "in_loop_enabled": bool(rt.settings.kernel_v3.mcp_in_loop_enabled),
                 "max_calls_per_cycle": int(rt.settings.kernel_v3.max_mcp_calls_per_cycle),

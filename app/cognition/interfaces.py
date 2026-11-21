@@ -57,7 +57,20 @@ class GoalProposal(BaseModel):
     success_criteria: list[str] = Field(default_factory=list)
     expected_outcome: dict[str, Any] = Field(default_factory=dict)
     rationale: str = ""
+    # V3.1: predicted information gain (0..1) for prediction-error calibration & multi-candidate scoring
+    predicted_ig: float = 0.0
+    # V3.1: optional 1-2 backup candidate goals (single LLM call, deterministic kernel fallback if primary duplicates)
+    alternative_goals: list[dict[str, Any]] = Field(default_factory=list)
+    # V3.1: optional lightweight world hypothesis {key, claim, verification_hint} (stored in digital_world_state)
+    hypothesis_to_test: dict[str, Any] | None = None
+    # V3.1: optional allowlist-governed curiosity source discovery {source_id, sensor_type, url, name}
+    discover_world_source: dict[str, Any] | None = None
     usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("predicted_ig")
+    @classmethod
+    def _clamp_predicted_ig(cls, v: float) -> float:
+        return clamp01(v)
 
 
 class VerificationSpec(BaseModel):
@@ -117,6 +130,9 @@ class CognitiveContext(BaseModel):
     available_agents: list[dict[str, Any]] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     validated_skills: list[dict[str, Any]] = Field(default_factory=list)
+    # V3.1: Read-only internal affect snapshot & lightweight unverified/recent world hypotheses
+    affect_state: dict[str, Any] | None = None
+    active_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -139,11 +155,22 @@ class EvaluationResult(BaseModel):
     learned_facts: list[str] = Field(default_factory=list)
     acquired_skill: str | None = None
     resolved_topic: str | None = None
+    # V3.1: Lightweight hypothesis verification outcome (confirmed ONLY when verification_passed=True)
+    hypothesis_key: str | None = None
+    hypothesis_verdict: str | None = None  # confirmed | refuted | inconclusive
     should_persist_memory: bool = False
     memory_type: str = MemoryType.EPISODIC.value
     memory_importance: float = 0.5
     notes: str = ""
     usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("hypothesis_verdict")
+    @classmethod
+    def _validate_hyp_verdict(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        val = str(v).strip().lower()
+        return val if val in {"confirmed", "refuted", "inconclusive"} else None
 
     @field_validator("information_gain", "memory_importance")
     @classmethod

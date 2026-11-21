@@ -228,6 +228,42 @@ export function MindPage({
               <p className="mt-2.5 rounded-lg bg-slate-100/80 px-3 py-2 text-[11px] text-slate-600 dark:bg-slate-900 dark:text-slate-400">
                 诚实审计声明：本页仅展示 PostgreSQL 实际落盘的结构化输入、输出与审计依据，绝不伪造或补写模型隐藏 Chain-of-Thought；未落盘步骤明确标注“未记录”。
               </p>
+              {(trace.steps?.['3_arbitration']?.affect_snapshot ||
+                trace.steps?.['10_outcome_evaluation']?.evaluation?.prediction_calibration) && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5 px-3 py-2 text-[11px] font-mono">
+                  {trace.steps?.['3_arbitration']?.affect_snapshot && (
+                    <span className="text-slate-600 dark:text-slate-300">
+                      大脑只读情绪快照：V={Number(trace.steps['3_arbitration'].affect_snapshot.valence ?? 0).toFixed(2)} · A=
+                      {Number(trace.steps['3_arbitration'].affect_snapshot.arousal ?? 0).toFixed(2)} · C=
+                      {Number(trace.steps['3_arbitration'].affect_snapshot.confidence ?? 0).toFixed(2)} · F=
+                      {Number(trace.steps['3_arbitration'].affect_snapshot.frustration ?? 0).toFixed(2)} · B=
+                      {Number(trace.steps['3_arbitration'].affect_snapshot.boredom ?? 0).toFixed(2)}
+                    </span>
+                  )}
+                  {trace.steps?.['10_outcome_evaluation']?.evaluation?.prediction_calibration && (
+                    <span className="text-cyan-700 dark:text-cyan-300">
+                      IG 预测校准：预期{' '}
+                      {Number(
+                        trace.steps['10_outcome_evaluation'].evaluation.prediction_calibration.predicted_ig ?? 0,
+                      ).toFixed(3)}{' '}
+                      → 实测{' '}
+                      {Number(
+                        trace.steps['10_outcome_evaluation'].evaluation.prediction_calibration.verified_ig ?? 0,
+                      ).toFixed(3)}{' '}
+                      (Δ{' '}
+                      {Number(
+                        trace.steps['10_outcome_evaluation'].evaluation.prediction_calibration.prediction_error ?? 0,
+                      ) >= 0
+                        ? '+'
+                        : ''}
+                      {Number(
+                        trace.steps['10_outcome_evaluation'].evaluation.prediction_calibration.prediction_error ?? 0,
+                      ).toFixed(3)}
+                      )
+                    </span>
+                  )}
+                </div>
+              )}
             </Card>
 
             <div className="space-y-3">
@@ -269,7 +305,36 @@ export function MindPage({
                     </button>
 
                     {open && (
-                      <div className="border-t border-slate-200/70 px-4 py-3 dark:border-slate-800/80">
+                      <div className="border-t border-slate-200/70 px-4 py-3 space-y-3 dark:border-slate-800/80">
+                        {step.key === '5_goal_generation' &&
+                          Array.isArray(payload?.goal_candidates) &&
+                          payload.goal_candidates.length > 0 && (
+                            <div className="rounded-lg border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-900/50">
+                              <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-2">
+                                多候选目标确定性评分与去重回退（V3.1）
+                              </div>
+                              <div className="space-y-1.5">
+                                {payload.goal_candidates.map((cand: any) => (
+                                  <div
+                                    key={cand.index}
+                                    className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono rounded-md bg-white/80 px-2.5 py-1.5 dark:bg-slate-950/60"
+                                  >
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <StatusBadge
+                                        value={cand.selected ? 'SUCCEEDED' : cand.dedup_decision === 'ACCEPT' ? 'IDLE' : 'REJECTED'}
+                                        label={cand.selected ? '胜出' : cand.dedup_decision === 'ACCEPT' ? '备选' : cand.dedup_reason || '拦截'}
+                                      />
+                                      <span className="text-slate-400">[{cand.source === 'primary' ? '主' : '备'}]</span>
+                                      <span className="truncate text-slate-700 dark:text-slate-200">{cand.title}</span>
+                                    </div>
+                                    <span className="text-slate-500 shrink-0">
+                                      pred_ig={Number(cand.predicted_ig ?? 0).toFixed(2)} · score={Number(cand.score ?? 0).toFixed(3)}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         {!hasData ? (
                           <p className="text-xs italic text-slate-400">
                             该步骤在此 Cycle 中未执行或数据库中未记录（例如 IDLE / POLICY_DENIED / 跨周期阶段）。

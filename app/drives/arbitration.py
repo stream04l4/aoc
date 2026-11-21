@@ -64,6 +64,10 @@ class DriveArbitrator:
                 "curiosity_priority_delta": max(-affect_cap, min(affect_cap, float(affect_modulation.get("curiosity_priority_delta", 0.0)))),
                 "reproduction_priority_delta": max(-affect_cap, min(affect_cap, float(affect_modulation.get("reproduction_priority_delta", 0.0)))),
                 "retry_backoff_multiplier": max(1.0, min(1.0 + affect_cap, float(affect_modulation.get("retry_backoff_multiplier", 1.0)))),
+                "reflection_interval_factor": max(
+                    1.0 - affect_cap,
+                    min(1.0 + affect_cap, float(affect_modulation.get("reflection_interval_factor", 1.0))),
+                ),
                 "reason": str(affect_modulation.get("reason", "")),
             }
 

@@ -291,3 +291,134 @@ class GoalDedupEngine:
             cooldown_until=None,
             notes=["Goal is novel and outside cooldown windows"],
         )
+
+
+class GoalCandidateScore(BaseModel):
+    index: int
+    source: str  # "primary" | "alternative"
+    title: str
+    related_key: str | None = None
+    predicted_ig: float = 0.0
+    dedup_decision: str = "ACCEPT"
+    dedup_reason: str | None = None
+    score: float = 0.0
+    selected: bool = False
+
+
+class GoalSelectionResult(BaseModel):
+    selected_proposal: GoalProposal | None = None
+    selected_dedup: GoalDedupDecision
+    used_alternative: bool = False
+    candidates: list[GoalCandidateScore] = Field(default_factory=list)
+
+
+def select_best_goal_candidate(
+    *,
+    primary: GoalProposal,
+    drive_type: str,
+    recent_goals: list[dict[str, Any]],
+    dedup_engine: GoalDedupEngine,
+    now: datetime | None = None,
+    affect_state: dict[str, Any] | None = None,
+) -> GoalSelectionResult:
+    """Evaluate primary + up to 2 alternative_goals through GoalDedupEngine and deterministically pick best.
+
+    Eliminates unnecessary IDLE cycles when the primary goal hits dedup/cooldown by transparently
+    scoring and selecting the highest-value novel backup candidate (all within ONE LLM call).
+    """
+    cand_proposals: list[tuple[str, GoalProposal]] = [("primary", primary)]
+    for raw_alt in (primary.alternative_goals or [])[:2]:
+        if not isinstance(raw_alt, dict):
+            continue
+        alt_title = str(raw_alt.get("title") or "").strip()
+        if not alt_title:
+            continue
+        try:
+            alt_pred_ig = float(raw_alt.get("predicted_ig", 0.35) or 0.35)
+        except (TypeError, ValueError):
+            alt_pred_ig = 0.35
+        cand_proposals.append(
+            (
+                "alternative",
+                GoalProposal(
+                    should_act=True,
+                    title=alt_title[:500],
+                    description=str(raw_alt.get("description") or primary.description or "")[:1000],
+                    drive_type=drive_type,
+                    related_key=(str(raw_alt["related_key"]).strip() if raw_alt.get("related_key") else None),
+                    success_criteria=list(raw_alt.get("success_criteria") or primary.success_criteria or []),
+                    expected_outcome=dict(raw_alt.get("expected_outcome") or {}),
+                    rationale=str(raw_alt.get("rationale") or "Alternative candidate fallback"),
+                    predicted_ig=max(0.0, min(1.0, alt_pred_ig)),
+                    hypothesis_to_test=raw_alt.get("hypothesis_to_test") if isinstance(raw_alt.get("hypothesis_to_test"), dict) else None,
+                    discover_world_source=raw_alt.get("discover_world_source") if isinstance(raw_alt.get("discover_world_source"), dict) else None,
+                ),
+            )
+        )
+
+    boredom = float((affect_state or {}).get("boredom", 0.0) or 0.0)
+    frustration = float((affect_state or {}).get("frustration", 0.0) or 0.0)
+
+    scored: list[tuple[float, int, str, GoalProposal, GoalDedupDecision]] = []
+    audit_rows: list[GoalCandidateScore] = []
+    first_dedup: GoalDedupDecision | None = None
+
+    for idx, (src, prop) in enumerate(cand_proposals):
+        dec = dedup_engine.evaluate(
+            proposal=prop,
+            drive_type=drive_type,
+            recent_goals=recent_goals,
+            now=now,
+        )
+        if first_dedup is None:
+            first_dedup = dec
+
+        pred_ig = max(0.0, min(1.0, float(prop.predicted_ig or 0.0)))
+        if dec.decision == "ACCEPT":
+            # Explainable deterministic utility score:
+            # predicted_ig (0.50) + novelty (0.25) + specificity/hypothesis bonus (0.15) + primary tie-break (0.10)
+            novelty_term = max(0.0, 1.0 - float(dec.similarity or 0.0))
+            specificity = 0.10 if prop.related_key else 0.0
+            if prop.hypothesis_to_test:
+                specificity += 0.05
+            # When bored, reward higher expected IG slightly more; when frustrated, slightly favor focused related_key goals
+            affect_fit = 0.05 * boredom * pred_ig + (0.04 * frustration if prop.related_key else 0.0)
+            primary_bonus = 0.10 if src == "primary" else 0.0
+            score = round(0.50 * pred_ig + 0.25 * novelty_term + specificity + affect_fit + primary_bonus, 4)
+            scored.append((score, -idx, src, prop, dec))
+        else:
+            score = 0.0
+
+        audit_rows.append(
+            GoalCandidateScore(
+                index=idx,
+                source=src,
+                title=prop.title[:160],
+                related_key=prop.related_key,
+                predicted_ig=round(pred_ig, 4),
+                dedup_decision=dec.decision,
+                dedup_reason=dec.reason_code,
+                score=score,
+                selected=False,
+            )
+        )
+
+    if scored:
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, neg_idx, best_src, best_prop, best_dec = scored[0]
+        best_idx = -neg_idx
+        audit_rows[best_idx].selected = True
+        return GoalSelectionResult(
+            selected_proposal=best_prop,
+            selected_dedup=best_dec,
+            used_alternative=(best_src == "alternative"),
+            candidates=audit_rows,
+        )
+
+    assert first_dedup is not None
+    return GoalSelectionResult(
+        selected_proposal=None,
+        selected_dedup=first_dedup,
+        used_alternative=False,
+        candidates=audit_rows,
+    )

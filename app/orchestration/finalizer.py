@@ -85,6 +85,7 @@ class TaskFinalizer:
         self_model: Any = None,
         skill_registry: Any = None,
         skill_auto_crystallize: bool = True,
+        on_prediction_error: Callable[[float], None] | None = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -96,6 +97,7 @@ class TaskFinalizer:
         self.verifier = verifier or ResultVerifier()
         self.llm_gateway = llm_gateway
         self._on_learning = on_learning
+        self._on_prediction_error = on_prediction_error
         self.embedding_service = embedding_service
         self.info_gain_evaluator = info_gain_evaluator or InformationGainEvaluator()
         self.self_model = self_model
@@ -282,10 +284,15 @@ class TaskFinalizer:
                     should_persist_memory=True,
                 )
 
-            # Hard invariant (Task Book 17.7): LLM cannot declare success if verification failed
-            if not verification_passed and eval_res.goal_achieved:
+            # Hard invariant (Task Book 17.7): LLM cannot declare success or confirm hypotheses if verification failed
+            if not verification_passed and (eval_res.goal_achieved or eval_res.hypothesis_verdict == "confirmed"):
                 eval_res = eval_res.model_copy(
-                    update={"goal_achieved": False, "resolved_topic": None, "acquired_skill": None}
+                    update={
+                        "goal_achieved": False,
+                        "resolved_topic": None,
+                        "acquired_skill": None,
+                        "hypothesis_verdict": None,
+                    }
                 )
 
             # 3b. Compute deterministic Four-Factor Information Gain (V2.0 P1-4, Task Book 5.4.3)
@@ -397,6 +404,39 @@ class TaskFinalizer:
                                 source=f"execution:{exec_key}",
                                 session=s,
                             )
+
+                # V3.1: Lightweight Hypothesis Verdict Update (observed facts vs unverified hypotheses)
+                hyp_key = eval_res.hypothesis_key or (goal_dict.get("expected_outcome") or {}).get("hypothesis_key")
+                hyp_verdict = eval_res.hypothesis_verdict
+                if hyp_key and hyp_verdict:
+                    # Hard guard: NEVER mark hypothesis confirmed unless deterministic verification passed
+                    eff_verdict = hyp_verdict if (verification_passed or hyp_verdict != "confirmed") else "inconclusive"
+                    existing_hyps = await self.repo.list_world_items(kind="hypothesis")
+                    prev_hyp = next((h for h in existing_hyps if h.get("key") == str(hyp_key)), None)
+                    prev_val = dict(prev_hyp.get("value") or {}) if prev_hyp and isinstance(prev_hyp.get("value"), dict) else {}
+                    ev_list = list(prev_val.get("evidence") or [])
+                    ev_list.append(
+                        {
+                            "execution_id": exec_key,
+                            "verdict": eff_verdict,
+                            "verified": verification_passed,
+                            "summary": eval_res.summary[:300],
+                            "observed_at": now.isoformat(),
+                        }
+                    )
+                    new_conf = 0.9 if eff_verdict == "confirmed" else (0.15 if eff_verdict == "refuted" else 0.45)
+                    prev_val["evidence"] = ev_list[-10:]
+                    prev_val["confidence"] = new_conf
+                    prev_val["last_verdict_summary"] = eval_res.summary[:300]
+                    prev_val["verified_at"] = now.isoformat()
+                    await self.repo.upsert_world_item(
+                        kind="hypothesis",
+                        key=str(hyp_key)[:120],
+                        value=prev_val,
+                        status=eff_verdict,
+                        source=f"execution:{exec_key}",
+                        session=s,
+                    )
 
                 # Persist memories atomically into memory_index + enqueue async Letta/Embed outbox events
                 items_to_store: list[MemoryItem] = []
@@ -626,7 +666,7 @@ class TaskFinalizer:
                     actual_outcome=expected_vs_actual["actual_outcome"],
                     measured_change=measured_change,
                 )
-                # V3.0 M1: persist deterministic verified_ig & cooldown onto active_goals
+                # V3.0 M1 + V3.1: persist deterministic verified_ig, cooldown, and prediction_error calibration
                 verified_ig_val = round(float(measured_info_gain), 4) if eval_res.goal_achieved else 0.0
                 cooldown_at = compute_cooldown_until(
                     now=now,
@@ -636,11 +676,27 @@ class TaskFinalizer:
                 )
                 await self.repo.update_goal(goal_uuid, verified_ig=verified_ig_val, cooldown_until=cooldown_at)
 
+            # V3.1: Prediction Error calibration (verified_ig - predicted_ig -> feeds Affect surprise!)
+            predicted_ig_raw = (goal_row or {}).get("predicted_ig")
+            verified_ig_final = round(float(measured_info_gain), 4) if eval_res.goal_achieved else 0.0
+            prediction_calibration: dict[str, Any] | None = None
+            if predicted_ig_raw is not None:
+                pred_val = round(float(predicted_ig_raw), 4)
+                pred_err = round(verified_ig_final - pred_val, 4)
+                prediction_calibration = {
+                    "predicted_ig": pred_val,
+                    "verified_ig": verified_ig_final,
+                    "prediction_error": pred_err,
+                }
+                if self._on_prediction_error is not None:
+                    self._on_prediction_error(pred_err)
+
             eval_payload = {
                 **eval_res.model_dump(mode="json"),
                 **expected_vs_actual,
                 "memory_writes": memory_writes,
                 "skill_crystallized": skill_crystallized,
+                "prediction_calibration": prediction_calibration,
                 "finalized_at": now.isoformat(),
             }
             if cycle_uuid is not None:

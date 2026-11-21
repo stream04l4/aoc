@@ -27,7 +27,12 @@ from typing import Any
 from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
-from app.cognition.goal_dedup import GoalDedupEngine, compute_cooldown_until, compute_goal_fingerprint
+from app.cognition.goal_dedup import (
+    GoalDedupEngine,
+    compute_cooldown_until,
+    compute_goal_fingerprint,
+    select_best_goal_candidate,
+)
 from app.cognition.interfaces import (
     ActionPlan,
     AssessmentResult,
@@ -118,6 +123,7 @@ class AutonomousLoop:
         self.world_pipeline = world_pipeline
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
+        self._last_prediction_error: float = 0.0
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -151,10 +157,14 @@ class AutonomousLoop:
             verifier=orchestrator.verifier,
             llm_gateway=llm_gateway,
             on_learning=self._record_learning_signal,
+            on_prediction_error=self._record_prediction_error,
             self_model=self_model,
             skill_registry=skill_registry,
             skill_auto_crystallize=kv3.skill_auto_crystallize_enabled,
         )
+
+    def _record_prediction_error(self, error: float) -> None:
+        self._last_prediction_error = max(-1.0, min(1.0, float(error)))
 
     def _record_learning_signal(self, when: datetime, gain: float) -> None:
         self._last_learning_at = when
@@ -388,10 +398,26 @@ class AutonomousLoop:
             # ── 6. DRIVE ARBITRATION ────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="DRIVE_ARBITRATION")
             affect_mod_payload: dict[str, Any] | None = None
+            affect_state_snapshot: dict[str, Any] | None = None
             if self.affect is not None and getattr(self.affect, "enabled", False):
                 try:
                     ext_events = pre_obs.external_events or []
                     world_novelty = min(1.0, len(ext_events) * 0.25) if ext_events else 0.0
+                    sm_conf: float | None = None
+                    if self.self_model is not None:
+                        try:
+                            caps = await self.self_model.list_capabilities()
+                            sampled = [
+                                float(c.get("estimated_success_rate", 0.5))
+                                for c in caps
+                                if int(c.get("sample_count", 0) or 0) > 0
+                            ]
+                            if sampled:
+                                sm_conf = round(sum(sampled) / len(sampled), 4)
+                        except Exception:
+                            sm_conf = None
+                    pred_surprise = self._last_prediction_error
+                    self._last_prediction_error = 0.0
                     mod = await self.affect.evaluate_safe(
                         recent_execution_statuses=drive_ctx.recent_execution_statuses,
                         last_information_gain=self._last_info_gain,
@@ -401,12 +427,16 @@ class AutonomousLoop:
                         trigger_event_id=f"cycle:{cycle_id}:drive_arbitration",
                         low_ig_streak=self._low_ig_streak,
                         world_event_novelty=world_novelty,
+                        self_model_confidence=sm_conf,
+                        prediction_surprise=pred_surprise,
                     )
                     if mod.enabled:
                         affect_mod_payload = mod.model_dump(mode="json")
+                        affect_state_snapshot = self.affect.state.model_dump(mode="json")
                 except Exception as exc:
                     logger.warning("cycle.affect_fault_degraded", cycle_id=str(cycle_id), error=str(exc))
                     affect_mod_payload = None
+                    affect_state_snapshot = None
 
             decision: DriveDecision = self.drives.arbitrate(
                 pre_drives, now=now, affect_modulation=affect_mod_payload
@@ -471,6 +501,25 @@ class AutonomousLoop:
                     reusable_skills = await self.skill_registry.list_reusable_skills_for_context(limit=8)
                 except Exception as exc:
                     logger.warning("cycle.skill_context_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+            active_hypotheses: list[dict[str, Any]] = []
+            try:
+                hyp_rows = await self.repo.list_world_items(kind="hypothesis")
+                for hr in hyp_rows[:8]:
+                    val = hr.get("value") if isinstance(hr.get("value"), dict) else {}
+                    active_hypotheses.append(
+                        {
+                            "key": hr.get("key"),
+                            "status": hr.get("status", "unverified"),
+                            "claim": val.get("claim", ""),
+                            "verification_hint": val.get("verification_hint", ""),
+                            "confidence": val.get("confidence", 0.5),
+                            "evidence_count": len(val.get("evidence") or []),
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("cycle.hypotheses_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -484,6 +533,8 @@ class AutonomousLoop:
                     else []
                 ),
                 validated_skills=reusable_skills,
+                affect_state=affect_state_snapshot,
+                active_hypotheses=active_hypotheses,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -502,27 +553,49 @@ class AutonomousLoop:
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
-            # V3.0 M1 P0-2: Deterministic Goal Deduplication & Cooldown Gate
+            # V3.0 M1 + V3.1: Multi-Candidate Deterministic Goal Scoring, Deduplication & Cooldown Gate
             goal_fp = compute_goal_fingerprint(
                 drive_type=decision.selected_drive,
                 title=goal_proposal.title,
                 related_key=goal_proposal.related_key,
                 description=goal_proposal.description,
             )
+            goal_candidates_audit: list[dict[str, Any]] = []
             kv3 = self.settings.kernel_v3
             if kv3.goal_dedup_enabled and not bool(decision.constraints.get("emergency_mode")):
                 lookback_h = max(24.0, float(kv3.goal_dedup_window_hours))
                 recent_goals = await self.repo.list_recent_goals(
                     since=now - timedelta(hours=lookback_h), limit=80
                 )
-                dedup_res = self.goal_dedup.evaluate(
-                    proposal=goal_proposal,
+                sel_res = select_best_goal_candidate(
+                    primary=goal_proposal,
                     drive_type=decision.selected_drive,
                     recent_goals=recent_goals,
+                    dedup_engine=self.goal_dedup,
                     now=now,
+                    affect_state=affect_state_snapshot,
                 )
+                goal_candidates_audit = [c.model_dump(mode="json") for c in sel_res.candidates]
+                dedup_res = sel_res.selected_dedup
                 goal_fp = dedup_res.fingerprint
-                if dedup_res.decision in {"REJECT", "DEFER"}:
+                if len(sel_res.candidates) > 1:
+                    await self.repo.log_decision(
+                        decision_type="goal_ranking",
+                        selected=(sel_res.selected_proposal.title[:200] if sel_res.selected_proposal else "ALL_SKIPPED"),
+                        alternatives=[c.title[:120] for c in sel_res.candidates if not c.selected],
+                        reason=(
+                            "Fallback to novel alternative candidate after primary hit dedup/cooldown"
+                            if sel_res.used_alternative
+                            else "Multi-candidate deterministic ranking completed"
+                        ),
+                        payload={
+                            "used_alternative": sel_res.used_alternative,
+                            "candidates": goal_candidates_audit,
+                        },
+                        cycle_id=cycle_id,
+                    )
+
+                if sel_res.selected_proposal is None:
                     dup_uuid = uuid.UUID(dedup_res.duplicate_of) if dedup_res.duplicate_of else None
                     await self.repo.create_goal(
                         self.organism_id,
@@ -537,13 +610,14 @@ class AutonomousLoop:
                         goal_fingerprint=goal_fp,
                         duplicate_of=dup_uuid,
                         cooldown_until=dedup_res.cooldown_until,
+                        predicted_ig=round(float(goal_proposal.predicted_ig or 0.0), 4),
                     )
                     await self.repo.log_decision(
                         decision_type="goal_dedup",
                         selected=dedup_res.decision,
                         alternatives=[],
                         reason="; ".join(dedup_res.notes) or str(dedup_res.reason_code or "duplicate_goal"),
-                        payload=dedup_res.model_dump(mode="json"),
+                        payload={**dedup_res.model_dump(mode="json"), "candidates": goal_candidates_audit},
                         cycle_id=cycle_id,
                     )
                     await self.repo.update_cycle(
@@ -552,6 +626,8 @@ class AutonomousLoop:
                             "assessment": assessment.model_dump(mode="json"),
                             "goal": goal_proposal.model_dump(mode="json"),
                             "goal_dedup": dedup_res.model_dump(mode="json"),
+                            "goal_candidates": goal_candidates_audit,
+                            "affect_snapshot": affect_state_snapshot,
                         },
                     )
                     outcome = "GOAL_DEDUP_SKIPPED"
@@ -570,6 +646,75 @@ class AutonomousLoop:
                         t0,
                     )
                     return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
+                # Adopt the highest-scoring non-duplicate candidate (primary or alternative fallback!)
+                goal_proposal = sel_res.selected_proposal
+
+            # V3.1: Record lightweight world hypothesis (distinct from verified facts) if proposed
+            expected_outcome_payload = dict(goal_proposal.expected_outcome or {})
+            if isinstance(goal_proposal.hypothesis_to_test, dict):
+                h_key = str(goal_proposal.hypothesis_to_test.get("key") or goal_proposal.related_key or "").strip()[:120]
+                h_claim = str(goal_proposal.hypothesis_to_test.get("claim") or "").strip()[:500]
+                if h_key and h_claim:
+                    expected_outcome_payload["hypothesis_key"] = h_key
+                    try:
+                        await self.repo.upsert_world_item(
+                            kind="hypothesis",
+                            key=h_key,
+                            value={
+                                "claim": h_claim,
+                                "verification_hint": str(goal_proposal.hypothesis_to_test.get("verification_hint") or "")[:300],
+                                "confidence": 0.5,
+                                "evidence": [],
+                                "created_cycle_id": str(cycle_id),
+                                "created_at": now.isoformat(),
+                            },
+                            status="unverified",
+                            source=f"cycle:{cycle_id}",
+                        )
+                    except Exception as exc:
+                        logger.warning("cycle.hypothesis_upsert_degraded", error=str(exc))
+
+            # V3.1: Governed Curiosity-Driven Dynamic World Source Discovery (strictly allowlisted)
+            if (
+                decision.selected_drive == DriveType.CURIOSITY.value
+                and isinstance(goal_proposal.discover_world_source, dict)
+                and self.world_pipeline is not None
+            ):
+                src_req = goal_proposal.discover_world_source
+                req_sid = str(src_req.get("source_id") or "").strip()[:80]
+                req_type = str(src_req.get("sensor_type") or "rss").strip().lower()
+                req_url = str(src_req.get("url") or "").strip()
+                req_name = str(src_req.get("name") or req_sid).strip()[:160]
+                if req_sid and req_url:
+                    try:
+                        reg_src = await self.world_pipeline.register_dynamic_source(
+                            source_id=req_sid,
+                            sensor_type=req_type,
+                            name=req_name,
+                            config={"url": req_url, "max_items": 8},
+                            enabled=True,
+                            reliability_score=0.75,
+                            poll_interval_seconds=3600,
+                        )
+                        state_changes["discovered_world_source"] = {"accepted": True, "source_id": reg_src["source_id"]}
+                        await self.repo.log_decision(
+                            decision_type="active_perception_source",
+                            selected="REGISTERED",
+                            alternatives=[],
+                            reason=f"Curiosity registered allowlisted dynamic source '{req_sid}'",
+                            payload={"source_id": req_sid, "sensor_type": req_type, "url": req_url},
+                            cycle_id=cycle_id,
+                        )
+                    except Exception as exc:
+                        state_changes["discovered_world_source"] = {"accepted": False, "source_id": req_sid, "reason": str(exc)}
+                        await self.repo.log_decision(
+                            decision_type="active_perception_source",
+                            selected="REJECTED",
+                            alternatives=[],
+                            reason=f"Dynamic source '{req_sid}' rejected by allowlist/governance: {exc}",
+                            payload={"source_id": req_sid, "sensor_type": req_type, "url": req_url, "error": str(exc)},
+                            cycle_id=cycle_id,
+                        )
 
             goal_id = await self.repo.create_goal(
                 self.organism_id,
@@ -578,10 +723,11 @@ class AutonomousLoop:
                 title=goal_proposal.title[:500],
                 description=goal_proposal.description,
                 success_criteria=goal_proposal.success_criteria,
-                expected_outcome=goal_proposal.expected_outcome,
+                expected_outcome=expected_outcome_payload,
                 related_key=goal_proposal.related_key,
                 status=GoalStatus.ACTIVE.value,
                 goal_fingerprint=goal_fp,
+                predicted_ig=round(float(goal_proposal.predicted_ig or 0.0), 4),
             )
 
             # ── 8. COGNITIVE PLANNING ───────────────────────────────────────
@@ -594,6 +740,8 @@ class AutonomousLoop:
                 brain_output={
                     "assessment": assessment.model_dump(mode="json"),
                     "goal": goal_proposal.model_dump(mode="json"),
+                    "goal_candidates": goal_candidates_audit,
+                    "affect_snapshot": affect_state_snapshot,
                 },
                 plan=plan.model_dump(mode="json"),
             )
@@ -781,8 +929,16 @@ class AutonomousLoop:
                     plan = plan.model_copy(update={"description": enriched_desc})
 
             await self.repo.update_cycle(cycle_id, phase="AGENT_DISPATCH")
+            retry_backoff_mult = float(
+                ((decision.constraints or {}).get("affect_modulation") or {}).get("retry_backoff_multiplier", 1.0) or 1.0
+            )
             dispatch_info = await self.orchestrator.submit_plan(
-                plan=plan, verdict=verdict, goal_id=goal_id, plan_id=plan_id, cycle_id=cycle_id
+                plan=plan,
+                verdict=verdict,
+                goal_id=goal_id,
+                plan_id=plan_id,
+                cycle_id=cycle_id,
+                retry_backoff_multiplier=retry_backoff_mult,
             )
             task_id = dispatch_info["task_id"]
 

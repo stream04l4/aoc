@@ -111,14 +111,21 @@ class CognitionBrain(BrainInterface):
     async def generate_goal(self, context: CognitiveContext) -> GoalProposal:
         system_prompt = (
             "You are the goal generator of AOC. Given the selected drive, assessment, "
-            "available agents, and remaining budget, propose ONE concrete, bounded, achievable goal "
-            "that addresses the selected drive. "
+            "available agents, read-only internal affect_state, active_hypotheses, and remaining budget, "
+            "propose ONE concrete, bounded, achievable primary goal plus optionally 1-2 distinct alternative_goals "
+            "(each with {title, description, related_key, predicted_ig, rationale}) so the kernel can fall back "
+            "deterministically if the primary goal is a recent duplicate or cooling down. "
+            "Set predicted_ig (0..1) honestly as your expected verified information gain. "
+            "affect_state is READ-ONLY internal context (you may adjust exploration vs caution style, NEVER mutate affect or bypass Governance). "
             "If nothing worthwhile or safe can be done, set should_act=false. "
             "For reproduction drive, ONLY propose virtual capability-building, skill research, "
             "or low-risk L1 isolated-workspace Python coding/utility tasks (e.g. creating a reusable "
             "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
             "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
-            "Set related_key to the relevant topic/capability key if applicable. "
+            "For curiosity drive, you may verify an unverified entry in active_hypotheses, attach a new lightweight "
+            "hypothesis_to_test ({key, claim, verification_hint}), or optionally suggest discover_world_source "
+            "({source_id, sensor_type, url, name}) using an allowlisted RSS/Web feed. "
+            "Set related_key to the relevant topic/capability/hypothesis key if applicable. "
             + _UNTRUSTED_DATA_RULE
         )
         fenced_obs = _fence_untrusted_observation(context.observation.model_dump(mode="json"))
@@ -126,12 +133,15 @@ class CognitionBrain(BrainInterface):
             "selected_drive": context.decision.selected_drive,
             "decision_reason": context.decision.reason,
             "constraints": context.decision.constraints,
+            "affect_state_readonly": context.affect_state,
+            "active_hypotheses": context.active_hypotheses[:8],
             "drives": [d.model_dump(mode="json") for d in context.drives],
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "environment_state": fenced_obs.get("environment_state", {}),
             "external_events": fenced_obs.get("external_events", []),
             "system_state": context.observation.system_state,
             "available_agents": context.available_agents,
+            "validated_skills": context.validated_skills[:8],
             "budget_remaining": context.budget_remaining,
             "active_goals": context.active_goals[:5],
         }
@@ -155,6 +165,7 @@ class CognitionBrain(BrainInterface):
             "files or use file_exists verification under L0!) or L1 (workspace-write: use L1 whenever the task "
             "writes result.md, skill.py, tests, or any file inside the isolated workspace). NEVER request L3.\n"
             "- Reuse relevant validated_skills when applicable instead of rebuilding from scratch.\n"
+            "- affect_state_readonly is read-only internal context (when frustration is high prefer smaller, well-verified steps).\n"
             "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
             "from available_tools.\n"
             "- Include concrete success_criteria and at least one deterministic verification check "
@@ -165,6 +176,8 @@ class CognitionBrain(BrainInterface):
         payload = {
             "selected_drive": context.decision.selected_drive,
             "constraints": context.decision.constraints,
+            "affect_state_readonly": context.affect_state,
+            "active_hypotheses": context.active_hypotheses[:5],
             "goal": context.goal.model_dump(mode="json") if context.goal else None,
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
@@ -189,6 +202,8 @@ class CognitionBrain(BrainInterface):
             "- Estimate information_gain (0..1) honestly based on actual new knowledge produced.\n"
             "- Extract concise learned_facts (semantic knowledge) and acquired_skill (if a reusable skill/procedure was created).\n"
             "- Set resolved_topic ONLY if the topic was genuinely researched and verified.\n"
+            "- If the task tested a hypothesis, set hypothesis_key and hypothesis_verdict ('confirmed'|'refuted'|'inconclusive') "
+            "ONLY when backed by observed execution evidence (NEVER mark confirmed if verification_passed is false).\n"
             "- Choose memory_type from: identity, episodic, semantic, procedural, self_model."
         )
         payload = {
@@ -218,15 +233,16 @@ class CognitionBrain(BrainInterface):
             user_payload=payload,
             schema_cls=EvaluationResult,
         )
-        # Hard guard (task book 17.7): LLM cannot declare success if execution/verification failed
+        # Hard guard (task book 17.7): LLM cannot declare success or confirm hypotheses if execution/verification failed
         exec_status = str(context.execution.get("status", ""))
         if not context.verification_passed or exec_status != "SUCCEEDED":
-            if result.goal_achieved:
+            if result.goal_achieved or result.hypothesis_verdict == "confirmed":
                 result = result.model_copy(
                     update={
                         "goal_achieved": False,
                         "resolved_topic": None,
                         "acquired_skill": None,
+                        "hypothesis_verdict": None,
                         "notes": (result.notes + " [Overridden: execution or deterministic verification failed]").strip(),
                     }
                 )
