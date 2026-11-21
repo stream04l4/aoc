@@ -71,3 +71,4 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `GET` | `/v2/capabilities` | Evidence-driven capability profiles with Beta-Binomial posterior & 90% confidence bounds (Bearer `read`) |
 | `GET` | `/v2/skills` | Registered skills with live SHA-256 artifact integrity checks (Bearer `read`) |
 | `GET` | `/v2/skills/{skill_id}` | Detailed skill metadata, artifact checksum integrity, and validation test history (Bearer `read`) |
+| `GET` | `/v2/lifecycle` | V2 organism lifecycle state, quota throttle markers, and optional `affect_enabled` summary (Bearer `read`) |

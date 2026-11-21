@@ -664,6 +664,29 @@ def create_app(
         except ApprovalDeniedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    @app.get("/v2/lifecycle")
+    async def get_lifecycle_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
+        rt = _rt()
+        state = await rt.repo.get_organism_state(rt.organism_id) if rt.organism_id else None
+        affect_summary = (
+            rt.affect.summary()
+            if getattr(rt, "affect", None) is not None
+            else {"affect_enabled": False, "maximum_influence": 0.15, "state": None}
+        )
+        return {
+            "organism_id": str(rt.organism_id) if rt.organism_id else None,
+            "lifecycle_state": (state or {}).get("lifecycle_state"),
+            "previous_state": (state or {}).get("previous_state"),
+            "state_reason": (state or {}).get("state_reason"),
+            "cycle_count": (state or {}).get("cycle_count", 0),
+            "pause_requested": (state or {}).get("pause_requested", False),
+            "quota_reset_at": (state or {}).get("quota_reset_at"),
+            "throttled_reason": (state or {}).get("throttled_reason"),
+            "next_wake_at": (state or {}).get("next_wake_at"),
+            "affect_enabled": affect_summary["affect_enabled"],
+            "affect": affect_summary,
+        }
+
     @app.get("/v2/self-model")
     async def get_self_model_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
         rt = _rt()

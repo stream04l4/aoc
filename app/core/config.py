@@ -273,3 +273,8 @@ def get_sensors_config() -> dict[str, Any]:
 @lru_cache
 def get_self_model_config() -> dict[str, Any]:
     return load_yaml("self_model.yaml")
+
+
+@lru_cache
+def get_affect_config() -> dict[str, Any]:
+    return load_yaml("affect.yaml")

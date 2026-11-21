@@ -19,6 +19,7 @@ from app.storage.database import Database
 from app.storage.models import (
     ActionPlanRow,
     ActiveGoal,
+    AffectHistoryRow,
     AgentExecutionRow,
     AgentRegistryRow,
     AgentTaskRow,
@@ -134,6 +135,7 @@ class StateRepository:
                 "state_reason": st.state_reason,
                 "current_cycle_id": st.current_cycle_id,
                 "cycle_count": st.cycle_count,
+                "emotion_reserved": st.emotion_reserved or {},
                 "pause_requested": st.pause_requested,
                 "quota_reset_at": st.quota_reset_at,
                 "throttled_reason": st.throttled_reason,
@@ -2517,6 +2519,66 @@ class StateRepository:
                     "checks": r.checks,
                     "stdout_excerpt": r.stdout_excerpt,
                     "executed_at": r.executed_at,
+                }
+                for r in rows
+            ]
+
+    # ── optional affect history (P1-9, disabled by default) ─────────────────
+    async def record_affect_history(
+        self,
+        *,
+        organism_id: uuid.UUID,
+        valence: float,
+        arousal: float,
+        confidence: float,
+        frustration: float,
+        boredom: float,
+        modulation_applied: dict[str, Any] | None = None,
+        trigger_reason: str = "",
+        cycle_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        async with self.db.session() as s:
+            row = AffectHistoryRow(
+                organism_id=organism_id,
+                cycle_id=cycle_id,
+                valence=float(valence),
+                arousal=float(arousal),
+                confidence=float(confidence),
+                frustration=float(frustration),
+                boredom=float(boredom),
+                modulation_applied=_jsonable(modulation_applied or {}),
+                trigger_reason=trigger_reason[:1000],
+                created_at=utcnow(),
+            )
+            s.add(row)
+            await s.flush()
+            return row.id
+
+    async def list_affect_history(
+        self, organism_id: uuid.UUID, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(AffectHistoryRow)
+                    .where(AffectHistoryRow.organism_id == organism_id)
+                    .order_by(AffectHistoryRow.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "organism_id": str(r.organism_id),
+                    "cycle_id": str(r.cycle_id) if r.cycle_id else None,
+                    "valence": float(r.valence),
+                    "arousal": float(r.arousal),
+                    "confidence": float(r.confidence),
+                    "frustration": float(r.frustration),
+                    "boredom": float(r.boredom),
+                    "modulation_applied": r.modulation_applied or {},
+                    "trigger_reason": r.trigger_reason,
+                    "created_at": r.created_at,
                 }
                 for r in rows
             ]

@@ -36,6 +36,7 @@ class DriveArbitrator:
         states: dict[str, DriveState],
         now: datetime | None = None,
         constraints: dict[str, Any] | None = None,
+        affect_modulation: dict[str, Any] | None = None,
     ) -> DriveDecision:
         now = now or utcnow()
         out_constraints = dict(constraints or {})
@@ -48,6 +49,23 @@ class DriveArbitrator:
         risk_penalty = float(self.arb.get("risk_penalty", 0.15))
         surv_crit = float(self.arb.get("survival_critical_threshold", 0.30))
         min_conf = float(self.arb.get("min_confidence", 0.20))
+
+        # Optional bounded Affect modulation (P1-9, disabled by default; NEVER touches Survival CRITICAL or safety)
+        affect_active = bool(isinstance(affect_modulation, dict) and affect_modulation.get("enabled") is True)
+        affect_cap = (
+            max(0.0, min(0.15, float(affect_modulation.get("maximum_influence", 0.15))))
+            if affect_active
+            else 0.0
+        )
+        if affect_active:
+            out_constraints["affect_modulation"] = {
+                "enabled": True,
+                "maximum_influence": affect_cap,
+                "curiosity_priority_delta": max(-affect_cap, min(affect_cap, float(affect_modulation.get("curiosity_priority_delta", 0.0)))),
+                "reproduction_priority_delta": max(-affect_cap, min(affect_cap, float(affect_modulation.get("reproduction_priority_delta", 0.0)))),
+                "retry_backoff_multiplier": max(1.0, min(1.0 + affect_cap, float(affect_modulation.get("retry_backoff_multiplier", 1.0)))),
+                "reason": str(affect_modulation.get("reason", "")),
+            }
 
         scores: dict[str, dict[str, Any]] = {}
         for dtype, st in states.items():
@@ -68,10 +86,17 @@ class DriveArbitrator:
             )
             eff_inhib = 1.0 if is_surv_emergency else inhib_factor
 
+            affect_delta = 0.0
+            if affect_active and dtype == DriveType.CURIOSITY.value:
+                affect_delta = out_constraints["affect_modulation"]["curiosity_priority_delta"]
+            elif affect_active and dtype == DriveType.REPRODUCTION.value:
+                affect_delta = out_constraints["affect_modulation"]["reproduction_priority_delta"]
+
             raw = (
                 base * p_factor * eff_inhib
                 - cost_penalty * st.estimated_cost
                 - risk_penalty * st.estimated_risk
+                + affect_delta
             )
             priority = max(0.0, raw)
             eligible = st.confidence >= min_conf
@@ -82,6 +107,7 @@ class DriveArbitrator:
                 "drive_weight": d_weight,
                 "persistence_factor": round(p_factor, 4),
                 "inhibition_factor": round(eff_inhib, 4),
+                "affect_delta": round(affect_delta, 4),
                 "cost_penalty": round(cost_penalty * st.estimated_cost, 4),
                 "risk_penalty": round(risk_penalty * st.estimated_risk, 4),
                 "satisfaction": round(st.satisfaction, 4),

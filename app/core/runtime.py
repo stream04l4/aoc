@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from app.affect.modulator import AffectModulator
 from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
@@ -15,6 +16,7 @@ from app.core.config import (
     LifecycleSettings,
     RunnerSettings,
     Settings,
+    get_affect_config,
     get_agent_config,
     get_drive_config,
     get_embedding_config,
@@ -291,8 +293,10 @@ class OrganismRuntime:
         self.mcp_manager.load_from_config(get_agent_config())
 
         self._self_model_cfg: dict[str, Any] = get_self_model_config()
+        self._affect_cfg: dict[str, Any] = get_affect_config()
         self.self_model: SelfModelManager | None = None
         self.skill_registry: SkillRegistryManager | None = None
+        self.affect: AffectModulator | None = None
 
         self.loop: AutonomousLoop | None = None
         self.scheduler: OrganismScheduler | None = None
@@ -328,6 +332,13 @@ class OrganismRuntime:
             skill_registry=self.skill_registry,
         )
         self.skill_registry.self_model = self.self_model
+
+        # Optional bounded Affect modulation layer (V2.0 P1-9, disabled by default)
+        self.affect = AffectModulator(
+            organism_id=self.organism_id,
+            repo=self.repo,
+            config=self._affect_cfg,
+        )
 
         self.finalizer = TaskFinalizer(
             organism_id=self.organism_id,
@@ -402,6 +413,7 @@ class OrganismRuntime:
             approval_service=self.approval_service,
             self_model=self.self_model,
             skill_registry=self.skill_registry,
+            affect=self.affect,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         if self.world_pipeline is not None and (self._sensors_cfg or {}).get("sources"):

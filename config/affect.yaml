@@ -1,0 +1,11 @@
+# Optional Lightweight Affect Modulation Layer (V2.0 P1-9)
+# Disabled by default; strictly bounded and forbidden from touching
+# Governance (L0-L3), Budget, Approvals, Survival CRITICAL, or Shutdown.
+
+enabled: false
+maximum_influence: 0.15           # Hard upper bound on any behavioral modulation delta
+decay_rate: 0.15                  # Per-cycle decay back toward neutral baseline
+failure_frustration_step: 0.22    # Frustration gain per verified failure
+success_valence_step: 0.18        # Valence gain per verified success
+info_gain_valence_weight: 0.35    # Extra valence lift from measured information gain
+idle_boredom_step: 0.14           # Boredom gain per cycle without new learning/exploration

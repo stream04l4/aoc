@@ -679,3 +679,20 @@ class SkillValidationResultRow(Base):
     checks: Mapped[list] = mapped_column(JsonType, default=list)
     stdout_excerpt: Mapped[str] = mapped_column(Text, default="")
     executed_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+# ── optional bounded affect modulation history (P1-9, disabled by default) ──
+class AffectHistoryRow(Base):
+    __tablename__ = "affect_history"
+    __table_args__ = (Index("ix_affect_history_org_time", "organism_id", "created_at"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    organism_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organism_identity.id"))
+    cycle_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    valence: Mapped[float] = mapped_column(Float, default=0.0)
+    arousal: Mapped[float] = mapped_column(Float, default=0.2)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    frustration: Mapped[float] = mapped_column(Float, default=0.0)
+    boredom: Mapped[float] = mapped_column(Float, default=0.0)
+    modulation_applied: Mapped[dict] = mapped_column(JsonType, default=dict)
+    trigger_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)

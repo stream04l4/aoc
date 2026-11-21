@@ -89,6 +89,7 @@ class AutonomousLoop:
         approval_service: Any = None,
         self_model: Any = None,
         skill_registry: Any = None,
+        affect: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -106,6 +107,8 @@ class AutonomousLoop:
         self.approval_service = approval_service
         self.self_model = self_model
         self.skill_registry = skill_registry
+        self.affect = affect
+        self._consecutive_idle_cycles: int = 0
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -153,6 +156,11 @@ class AutonomousLoop:
             ]
             await self.self_model.sync_declared_capabilities(agent_caps)
             await self.self_model.get_latest_snapshot()
+        if self.affect is not None:
+            try:
+                await self.affect.load_from_db()
+            except Exception as exc:
+                logger.warning("loop.affect_load_degraded", error=str(exc))
         mem_info = await self.memory.initialize(
             self.organism_id,
             self.settings.organism.name,
@@ -350,7 +358,25 @@ class AutonomousLoop:
 
             # ── 6. DRIVE ARBITRATION ────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="DRIVE_ARBITRATION")
-            decision: DriveDecision = self.drives.arbitrate(pre_drives, now=now)
+            affect_mod_payload: dict[str, Any] | None = None
+            if self.affect is not None and getattr(self.affect, "enabled", False):
+                try:
+                    mod = await self.affect.evaluate_safe(
+                        recent_execution_statuses=drive_ctx.recent_execution_statuses,
+                        last_information_gain=self._last_info_gain,
+                        idle_cycles=self._consecutive_idle_cycles,
+                        cycle_id=cycle_id,
+                        trigger_reason="drive_arbitration",
+                    )
+                    if mod.enabled:
+                        affect_mod_payload = mod.model_dump(mode="json")
+                except Exception as exc:
+                    logger.warning("cycle.affect_fault_degraded", cycle_id=str(cycle_id), error=str(exc))
+                    affect_mod_payload = None
+
+            decision: DriveDecision = self.drives.arbitrate(
+                pre_drives, now=now, affect_modulation=affect_mod_payload
+            )
             await self.repo.log_decision(
                 decision_type="drive_arbitration",
                 selected=decision.selected_drive,
@@ -371,6 +397,7 @@ class AutonomousLoop:
 
             # IDLE check (Scenario D: never force a task when all drives are satisfied)
             if decision.selected_drive == NO_DRIVE:
+                self._consecutive_idle_cycles += 1
                 outcome = "IDLE"
                 await self.lifecycle.transition(LifecycleState.IDLE, reason=decision.reason, cycle_id=cycle_id)
                 await self._finalize_cycle(
@@ -383,6 +410,7 @@ class AutonomousLoop:
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
+            self._consecutive_idle_cycles = 0
             # If another task is still running in-flight (concurrency limit), do not double-dispatch
             budget = await self.governance.check_budget()
             if not budget.allowed:

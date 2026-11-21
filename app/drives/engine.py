@@ -50,8 +50,11 @@ class DriveEngine(DriveEngineInterface):
         states: dict[str, DriveState],
         constraints: dict[str, Any] | None = None,
         now: datetime | None = None,
+        affect_modulation: dict[str, Any] | None = None,
     ) -> DriveDecision:
-        decision = self.arbitrator.arbitrate(states, now=now, constraints=constraints)
+        decision = self.arbitrator.arbitrate(
+            states, now=now, constraints=constraints, affect_modulation=affect_modulation
+        )
         for dtype, info in decision.scores.items():
             DRIVE_PRIORITY.labels(drive=dtype).set(info["priority"])
         return decision
