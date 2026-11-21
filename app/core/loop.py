@@ -87,6 +87,8 @@ class AutonomousLoop:
         finalizer: TaskFinalizer | None = None,
         outbox: OutboxDispatcher | None = None,
         approval_service: Any = None,
+        self_model: Any = None,
+        skill_registry: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -102,6 +104,8 @@ class AutonomousLoop:
         self.llm_gateway = llm_gateway
         self.outbox = outbox
         self.approval_service = approval_service
+        self.self_model = self_model
+        self.skill_registry = skill_registry
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -121,6 +125,8 @@ class AutonomousLoop:
             verifier=orchestrator.verifier,
             llm_gateway=llm_gateway,
             on_learning=self._record_learning_signal,
+            self_model=self_model,
+            skill_registry=skill_registry,
         )
 
     def _record_learning_signal(self, when: datetime, gain: float) -> None:
@@ -135,6 +141,18 @@ class AutonomousLoop:
         )
         orch_rec = await self.orchestrator.recover_on_startup()
         probes = await self.registry.probe_all()
+        # V2.0 P1-7: Register external Agent static capabilities ONLY as DECLARED/AVAILABLE (never ACQUIRED)
+        if self.self_model is not None:
+            agent_caps = [
+                (
+                    cap.agent_id,
+                    list(cap.capabilities),
+                    bool(probes.get(cap.agent_id).ok) if probes.get(cap.agent_id) is not None else False,
+                )
+                for cap in self.registry.list_capabilities()
+            ]
+            await self.self_model.sync_declared_capabilities(agent_caps)
+            await self.self_model.get_latest_snapshot()
         mem_info = await self.memory.initialize(
             self.organism_id,
             self.settings.organism.name,
@@ -694,6 +712,15 @@ class AutonomousLoop:
         cur_done = await self.repo.count_goals_since(DriveType.CURIOSITY.value, GoalStatus.ACHIEVED.value, since_7d)
         cur_failed = await self.repo.count_goals_since(DriveType.CURIOSITY.value, GoalStatus.FAILED.value, since_7d)
 
+        if self.self_model is not None:
+            acquired_caps, validated_caps = await self.self_model.get_evidence_backed_capabilities()
+        else:
+            acquired_caps = list(env.get("capabilities_acquired") or [])
+            validated_caps = []
+        validated_skill_count: int | None = None
+        if self.skill_registry is not None:
+            validated_skill_count = await self.skill_registry.count_validated_skills(verify_integrity=True)
+
         return DriveContext(
             now=now,
             observation=obs,
@@ -704,11 +731,14 @@ class AutonomousLoop:
                 "tokens_used": budget.tokens_used_today,
                 "tokens_limit": budget.tokens_limit_per_day,
             },
-            capabilities_acquired=list(env.get("capabilities_acquired") or []),
+            capabilities_acquired=acquired_caps,
+            validated_capabilities=validated_caps,
+            validated_skill_count=validated_skill_count,
             procedural_skill_count=proc_count,
             capability_goals_completed_recent=cap_goals_done,
             memory_available=self.memory.backend_available,
             identity_persisted=True,
+            knowledge_transfer_readiness=1.0 if sem_recent > 0 else 0.5,
             open_knowledge_gaps=list(gaps_by_topic.values()),
             unknown_topics=env_topics,
             exploration_attempted_recent=cur_done + cur_failed,

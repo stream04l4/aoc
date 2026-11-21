@@ -37,6 +37,9 @@ class AgentRegistry:
     def get_probe(self, agent_id: str) -> AgentProbeResult | None:
         return self._probes.get(agent_id)
 
+    def list_capabilities(self) -> list[AgentCapability]:
+        return [adapter.capability for adapter in self._adapters.values()]
+
     def load_from_config(
         self,
         cfg: dict[str, Any] | None = None,

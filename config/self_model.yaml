@@ -1,0 +1,15 @@
+# Dynamic Self Model & Skill Registry configuration (V2.0 P1-7)
+# Controls Beta-Binomial capability posterior, maturity promotion thresholds,
+# isolated skill validation, and Letta `self_model` Core Block projection.
+
+alpha_prior: 1.0
+beta_prior: 1.0
+minimum_samples: 3
+confidence_threshold: 0.55        # Lower bound at confidence_level required for VALIDATED
+confidence_level: 0.90            # One-sided 90% lower bound (10th percentile of Beta posterior)
+skill_validation_required: true   # Skills stay DRAFT until executable assertion tests pass
+skill_test_timeout_seconds: 15.0  # Timeout per isolated skill validation run
+skill_storage_dir: /home/ubuntu/aoc-workspaces/skills
+deprecate_after_failures: 5       # Minimum samples before low success rate triggers DEPRECATED
+deprecate_max_success_rate: 0.25  # Posterior mean at/below which capability is DEPRECATED
+sync_letta_via_outbox: true       # Project every new self_model_versions row to Letta via Outbox

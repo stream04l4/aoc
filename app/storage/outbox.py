@@ -35,12 +35,14 @@ class OutboxEventType:
     MEMORY_EMBED = "memory.embed"
     MEMORY_SYNC_LETTA = "memory.sync_letta"
     NOTIFICATION_DISPATCH = "notification.dispatch"
+    SELF_MODEL_SYNC_LETTA = "self_model.sync_letta"
 
     ALLOWED = {
         EXECUTION_FINALIZE,
         MEMORY_EMBED,
         MEMORY_SYNC_LETTA,
         NOTIFICATION_DISPATCH,
+        SELF_MODEL_SYNC_LETTA,
     }
 
 

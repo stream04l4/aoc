@@ -278,10 +278,28 @@ async def test_scenario_d_idle_when_all_drives_satisfied(db: Database, tmp_path)
     try:
         for cap in ("coding", "research", "repository_analysis", "system_diagnosis", "knowledge_summarization"):
             await rt.repo.upsert_world_item("capability", cap, {}, status="acquired")
+            await rt.repo.upsert_capability_profile(
+                organism_id=rt.organism_id,
+                capability_key=cap,
+                maturity_status="VALIDATED",
+                alpha=4.0,
+                beta=1.0,
+                sample_count=3,
+                estimated_success_rate=0.80,
+                confidence_low=0.56,
+                confidence_high=0.97,
+            )
         for i in range(10):
             await rt.repo.add_memory_index(
                 memory_type=MemoryType.PROCEDURAL.value, title=f"p{i}", summary=f"skill {i}",
                 content_hash=f"ph{i}", source="seed", importance=0.8, tags=[], sync_status="synced"
+            )
+            await rt.repo.create_or_update_skill(
+                skill_key=f"seed_skill_{i}",
+                version="1.0.0",
+                capability_key="coding",
+                description=f"Validated seed skill {i}",
+                status="VALIDATED",
             )
         for i in range(5):
             await rt.repo.add_memory_index(

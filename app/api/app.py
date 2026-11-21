@@ -664,6 +664,59 @@ def create_app(
         except ApprovalDeniedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    @app.get("/v2/self-model")
+    async def get_self_model_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
+        rt = _rt()
+        if rt.self_model is None:
+            raise HTTPException(status_code=503, detail="SelfModelManager not initialized")
+        return await rt.self_model.get_latest_snapshot()
+
+    @app.get("/v2/self-model/history")
+    async def get_self_model_history_v2(
+        limit: int = 20, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
+        rt = _rt()
+        if rt.self_model is None:
+            raise HTTPException(status_code=503, detail="SelfModelManager not initialized")
+        return await rt.self_model.list_history(limit=min(max(limit, 1), 100))
+
+    @app.get("/v2/capabilities")
+    async def list_capabilities_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
+        rt = _rt()
+        if rt.self_model is None:
+            raise HTTPException(status_code=503, detail="SelfModelManager not initialized")
+        return await rt.self_model.list_capabilities()
+
+    @app.get("/v2/skills")
+    async def list_skills_v2(
+        status: str | None = None,
+        capability_key: str | None = None,
+        limit: int = 100,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        rt = _rt()
+        if rt.skill_registry is None:
+            raise HTTPException(status_code=503, detail="SkillRegistryManager not initialized")
+        return await rt.skill_registry.list_skills_with_integrity(
+            status=status, capability_key=capability_key, limit=min(max(limit, 1), 200)
+        )
+
+    @app.get("/v2/skills/{skill_id}")
+    async def get_skill_v2(
+        skill_id: str, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> dict[str, Any]:
+        rt = _rt()
+        if rt.skill_registry is None:
+            raise HTTPException(status_code=503, detail="SkillRegistryManager not initialized")
+        try:
+            sid = uuid.UUID(skill_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid skill_id UUID") from exc
+        detail = await rt.skill_registry.get_skill_detail(sid)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        return detail
+
     @app.post("/v1/embeddings")
     async def local_embeddings(
         req: EmbeddingRequest, _: Principal = Depends(require_scope(SCOPE_INTERNAL))

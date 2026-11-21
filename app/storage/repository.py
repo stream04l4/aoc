@@ -24,6 +24,8 @@ from app.storage.models import (
     AgentTaskRow,
     ApiCredential,
     ApprovalRecord,
+    CapabilityEvidenceRow,
+    CapabilityProfileRow,
     CycleRecord,
     DecisionLog,
     DriveHistory,
@@ -42,7 +44,10 @@ from app.storage.models import (
     PolicyEvaluation,
     ResourceUsage,
     RunnerRegistryRow,
+    SelfModelVersionRow,
     SensorCheckpoint,
+    SkillRegistryRow,
+    SkillValidationResultRow,
     SystemConfig,
     TaskLifecycleEvent,
     WorldEventRow,
@@ -595,9 +600,24 @@ class StateRepository:
                     "enabled": r.enabled,
                     "experimental": r.experimental,
                     "probe": r.probe,
+                    "stats": r.stats or {},
                 }
                 for r in rows
             ]
+
+    async def update_agent_stats(
+        self, agent_id: str, stats: dict[str, Any], session: AsyncSession | None = None
+    ) -> bool:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(select(AgentRegistryRow).where(AgentRegistryRow.agent_id == agent_id))
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            row.stats = _jsonable(stats)
+            row.updated_at = utcnow()
+            await s.flush()
+            return True
 
     async def create_task(self, **fields: Any) -> uuid.UUID:
         fields = {k: (_jsonable(v) if k not in {"id", "plan_id", "goal_id", "cycle_id"} else v) for k, v in fields.items()}
@@ -2055,6 +2075,448 @@ class StateRepository:
                     "metadata": r.meta,
                     "observed_at": r.observed_at,
                     "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    # ── dynamic self model, capability profiles & skill registry (P1-7) ─────
+    @staticmethod
+    def _cap_profile_dict(r: CapabilityProfileRow) -> dict[str, Any]:
+        return {
+            "id": str(r.id),
+            "organism_id": str(r.organism_id),
+            "capability_key": r.capability_key,
+            "maturity_status": r.maturity_status,
+            "alpha": float(r.alpha),
+            "beta": float(r.beta),
+            "sample_count": int(r.sample_count),
+            "estimated_success_rate": float(r.estimated_success_rate),
+            "confidence_low": float(r.confidence_low),
+            "confidence_high": float(r.confidence_high),
+            "updated_at": r.updated_at,
+        }
+
+    async def get_capability_profile(
+        self, organism_id: uuid.UUID, capability_key: str, session: AsyncSession | None = None
+    ) -> dict[str, Any] | None:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(
+                    select(CapabilityProfileRow).where(
+                        CapabilityProfileRow.organism_id == organism_id,
+                        CapabilityProfileRow.capability_key == capability_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            return self._cap_profile_dict(row) if row is not None else None
+
+    async def upsert_capability_profile(
+        self,
+        *,
+        organism_id: uuid.UUID,
+        capability_key: str,
+        maturity_status: str,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        sample_count: int = 0,
+        estimated_success_rate: float = 0.5,
+        confidence_low: float = 0.0,
+        confidence_high: float = 1.0,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(
+                    select(CapabilityProfileRow).where(
+                        CapabilityProfileRow.organism_id == organism_id,
+                        CapabilityProfileRow.capability_key == capability_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = CapabilityProfileRow(
+                    organism_id=organism_id,
+                    capability_key=capability_key,
+                    maturity_status=maturity_status,
+                    alpha=float(alpha),
+                    beta=float(beta),
+                    sample_count=int(sample_count),
+                    estimated_success_rate=float(estimated_success_rate),
+                    confidence_low=float(confidence_low),
+                    confidence_high=float(confidence_high),
+                    updated_at=now,
+                )
+                s.add(row)
+            else:
+                row.maturity_status = maturity_status
+                row.alpha = float(alpha)
+                row.beta = float(beta)
+                row.sample_count = int(sample_count)
+                row.estimated_success_rate = float(estimated_success_rate)
+                row.confidence_low = float(confidence_low)
+                row.confidence_high = float(confidence_high)
+                row.updated_at = now
+            await s.flush()
+            return self._cap_profile_dict(row)
+
+    async def list_capability_profiles(
+        self,
+        organism_id: uuid.UUID,
+        *,
+        statuses: list[str] | None = None,
+        session: AsyncSession | None = None,
+    ) -> list[dict[str, Any]]:
+        async with self._use_session(session) as s:
+            q = select(CapabilityProfileRow).where(CapabilityProfileRow.organism_id == organism_id)
+            if statuses:
+                q = q.where(CapabilityProfileRow.maturity_status.in_(statuses))
+            rows = (await s.execute(q.order_by(CapabilityProfileRow.capability_key.asc()))).scalars().all()
+            return [self._cap_profile_dict(r) for r in rows]
+
+    async def add_capability_evidence(
+        self,
+        *,
+        profile_id: uuid.UUID,
+        execution_id: uuid.UUID,
+        task_id: uuid.UUID,
+        outcome: str,
+        weight: float = 1.0,
+        verification_summary: str = "",
+        session: AsyncSession | None = None,
+    ) -> tuple[bool, uuid.UUID | None]:
+        """Insert capability evidence idempotently on (profile_id, execution_id)."""
+        async with self._use_session(session) as s:
+            existing = (
+                await s.execute(
+                    select(CapabilityEvidenceRow.id).where(
+                        CapabilityEvidenceRow.profile_id == profile_id,
+                        CapabilityEvidenceRow.execution_id == execution_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return False, existing
+            row = CapabilityEvidenceRow(
+                profile_id=profile_id,
+                execution_id=execution_id,
+                task_id=task_id,
+                outcome=outcome,
+                weight=float(weight),
+                verification_summary=verification_summary,
+                created_at=utcnow(),
+            )
+            try:
+                async with s.begin_nested():
+                    s.add(row)
+                    await s.flush()
+                return True, row.id
+            except IntegrityError:
+                existing2 = (
+                    await s.execute(
+                        select(CapabilityEvidenceRow.id).where(
+                            CapabilityEvidenceRow.profile_id == profile_id,
+                            CapabilityEvidenceRow.execution_id == execution_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                return False, existing2
+
+    async def list_capability_evidence(
+        self,
+        profile_id: uuid.UUID,
+        *,
+        limit: int = 200,
+        session: AsyncSession | None = None,
+    ) -> list[dict[str, Any]]:
+        async with self._use_session(session) as s:
+            rows = (
+                await s.execute(
+                    select(CapabilityEvidenceRow)
+                    .where(CapabilityEvidenceRow.profile_id == profile_id)
+                    .order_by(CapabilityEvidenceRow.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "profile_id": str(r.profile_id),
+                    "execution_id": str(r.execution_id),
+                    "task_id": str(r.task_id),
+                    "outcome": r.outcome,
+                    "weight": float(r.weight),
+                    "verification_summary": r.verification_summary,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    @staticmethod
+    def _self_model_version_dict(r: SelfModelVersionRow) -> dict[str, Any]:
+        return {
+            "id": str(r.id),
+            "organism_id": str(r.organism_id),
+            "version_number": int(r.version_number),
+            "summary_text": r.summary_text,
+            "profile_snapshot": r.profile_snapshot,
+            "trigger_execution_id": str(r.trigger_execution_id) if r.trigger_execution_id else None,
+            "letta_synced_at": r.letta_synced_at,
+            "created_at": r.created_at,
+        }
+
+    async def create_self_model_version(
+        self,
+        *,
+        organism_id: uuid.UUID,
+        summary_text: str,
+        profile_snapshot: dict[str, Any],
+        trigger_execution_id: uuid.UUID | None = None,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        async with self._use_session(session) as s:
+            max_ver = (
+                await s.execute(
+                    select(func.max(SelfModelVersionRow.version_number)).where(
+                        SelfModelVersionRow.organism_id == organism_id
+                    )
+                )
+            ).scalar_one_or_none()
+            next_ver = int(max_ver or 0) + 1
+            row = SelfModelVersionRow(
+                organism_id=organism_id,
+                version_number=next_ver,
+                summary_text=summary_text,
+                profile_snapshot=_jsonable(profile_snapshot),
+                trigger_execution_id=trigger_execution_id,
+                created_at=utcnow(),
+            )
+            s.add(row)
+            await s.flush()
+            return self._self_model_version_dict(row)
+
+    async def get_self_model_version(
+        self, version_id: uuid.UUID, session: AsyncSession | None = None
+    ) -> dict[str, Any] | None:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(select(SelfModelVersionRow).where(SelfModelVersionRow.id == version_id))
+            ).scalar_one_or_none()
+            return self._self_model_version_dict(row) if row is not None else None
+
+    async def get_latest_self_model_version(
+        self, organism_id: uuid.UUID, session: AsyncSession | None = None
+    ) -> dict[str, Any] | None:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(
+                    select(SelfModelVersionRow)
+                    .where(SelfModelVersionRow.organism_id == organism_id)
+                    .order_by(SelfModelVersionRow.version_number.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return self._self_model_version_dict(row) if row is not None else None
+
+    async def list_self_model_versions(
+        self, organism_id: uuid.UUID, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(SelfModelVersionRow)
+                    .where(SelfModelVersionRow.organism_id == organism_id)
+                    .order_by(SelfModelVersionRow.version_number.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [self._self_model_version_dict(r) for r in rows]
+
+    async def mark_self_model_letta_synced(
+        self, version_id: uuid.UUID, synced_at: datetime | None = None
+    ) -> bool:
+        async with self.db.session() as s:
+            res = await s.execute(
+                update(SelfModelVersionRow)
+                .where(SelfModelVersionRow.id == version_id)
+                .values(letta_synced_at=synced_at or utcnow())
+            )
+            return (res.rowcount or 0) == 1
+
+    @staticmethod
+    def _skill_dict(r: SkillRegistryRow) -> dict[str, Any]:
+        return {
+            "id": str(r.id),
+            "skill_key": r.skill_key,
+            "version": r.version,
+            "capability_key": r.capability_key,
+            "source_task_id": str(r.source_task_id) if r.source_task_id else None,
+            "source_execution_id": str(r.source_execution_id) if r.source_execution_id else None,
+            "description": r.description,
+            "applicable_scenarios": r.applicable_scenarios or [],
+            "steps": r.steps or [],
+            "artifact_path": r.artifact_path,
+            "artifact_checksum": r.artifact_checksum,
+            "test_spec": r.test_spec or {},
+            "permission_level": r.permission_level,
+            "status": r.status,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }
+
+    async def create_or_update_skill(
+        self,
+        *,
+        skill_key: str,
+        version: str,
+        capability_key: str,
+        description: str = "",
+        applicable_scenarios: list[str] | None = None,
+        steps: list[str] | None = None,
+        artifact_path: str | None = None,
+        artifact_checksum: str | None = None,
+        test_spec: dict[str, Any] | None = None,
+        permission_level: str = "L1",
+        status: str = "DRAFT",
+        source_task_id: uuid.UUID | None = None,
+        source_execution_id: uuid.UUID | None = None,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(
+                    select(SkillRegistryRow).where(
+                        SkillRegistryRow.skill_key == skill_key,
+                        SkillRegistryRow.version == version,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = SkillRegistryRow(
+                    skill_key=skill_key,
+                    version=version,
+                    capability_key=capability_key,
+                    source_task_id=source_task_id,
+                    source_execution_id=source_execution_id,
+                    description=description,
+                    applicable_scenarios=_jsonable(applicable_scenarios or []),
+                    steps=_jsonable(steps or []),
+                    artifact_path=artifact_path,
+                    artifact_checksum=artifact_checksum,
+                    test_spec=_jsonable(test_spec or {}),
+                    permission_level=permission_level,
+                    status=status,
+                    created_at=now,
+                    updated_at=now,
+                )
+                s.add(row)
+            else:
+                row.capability_key = capability_key
+                row.description = description
+                row.applicable_scenarios = _jsonable(applicable_scenarios or [])
+                row.steps = _jsonable(steps or [])
+                row.artifact_path = artifact_path
+                row.artifact_checksum = artifact_checksum
+                row.test_spec = _jsonable(test_spec or {})
+                row.permission_level = permission_level
+                row.status = status
+                if source_task_id is not None:
+                    row.source_task_id = source_task_id
+                if source_execution_id is not None:
+                    row.source_execution_id = source_execution_id
+                row.updated_at = now
+            await s.flush()
+            return self._skill_dict(row)
+
+    async def get_skill(
+        self, skill_id: uuid.UUID, session: AsyncSession | None = None
+    ) -> dict[str, Any] | None:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(select(SkillRegistryRow).where(SkillRegistryRow.id == skill_id))
+            ).scalar_one_or_none()
+            return self._skill_dict(row) if row is not None else None
+
+    async def list_skills(
+        self,
+        *,
+        status: str | None = None,
+        capability_key: str | None = None,
+        limit: int = 100,
+        session: AsyncSession | None = None,
+    ) -> list[dict[str, Any]]:
+        async with self._use_session(session) as s:
+            q = select(SkillRegistryRow)
+            if status:
+                q = q.where(SkillRegistryRow.status == status)
+            if capability_key:
+                q = q.where(SkillRegistryRow.capability_key == capability_key)
+            rows = (
+                await s.execute(q.order_by(SkillRegistryRow.updated_at.desc()).limit(limit))
+            ).scalars().all()
+            return [self._skill_dict(r) for r in rows]
+
+    async def update_skill_status(
+        self, skill_id: uuid.UUID, status: str, session: AsyncSession | None = None
+    ) -> bool:
+        async with self._use_session(session) as s:
+            res = await s.execute(
+                update(SkillRegistryRow)
+                .where(SkillRegistryRow.id == skill_id)
+                .values(status=status, updated_at=utcnow())
+            )
+            return (res.rowcount or 0) == 1
+
+    async def record_skill_validation(
+        self,
+        *,
+        skill_id: uuid.UUID,
+        passed: bool,
+        checks: list[dict[str, Any]] | None = None,
+        stdout_excerpt: str = "",
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        async with self._use_session(session) as s:
+            row = SkillValidationResultRow(
+                skill_id=skill_id,
+                passed=bool(passed),
+                checks=_jsonable(checks or []),
+                stdout_excerpt=stdout_excerpt[:4000],
+                executed_at=now,
+            )
+            s.add(row)
+            await s.flush()
+            return {
+                "id": str(row.id),
+                "skill_id": str(row.skill_id),
+                "passed": bool(row.passed),
+                "checks": row.checks,
+                "stdout_excerpt": row.stdout_excerpt,
+                "executed_at": row.executed_at,
+            }
+
+    async def list_skill_validations(
+        self, skill_id: uuid.UUID, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(SkillValidationResultRow)
+                    .where(SkillValidationResultRow.skill_id == skill_id)
+                    .order_by(SkillValidationResultRow.executed_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "skill_id": str(r.skill_id),
+                    "passed": bool(r.passed),
+                    "checks": r.checks,
+                    "stdout_excerpt": r.stdout_excerpt,
+                    "executed_at": r.executed_at,
                 }
                 for r in rows
             ]

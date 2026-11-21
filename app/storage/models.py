@@ -238,6 +238,7 @@ class AgentRegistryRow(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     experimental: Mapped[bool] = mapped_column(Boolean, default=False)
     probe: Mapped[dict] = mapped_column(JsonType, default=dict)
+    stats: Mapped[dict] = mapped_column(JsonType, default=dict)
     updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
 
 
@@ -603,3 +604,78 @@ class WorldEventRow(Base):
     meta: Mapped[dict] = mapped_column("metadata", JsonType, default=dict)
     observed_at: Mapped[datetime] = mapped_column(TS, default=_now)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+# ── dynamic self model, capability profiles & skill registry (P1-7) ─────────
+class SelfModelVersionRow(Base):
+    __tablename__ = "self_model_versions"
+    __table_args__ = (UniqueConstraint("organism_id", "version_number", name="uq_self_model_org_ver"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    organism_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organism_identity.id"))
+    version_number: Mapped[int] = mapped_column(Integer)
+    summary_text: Mapped[str] = mapped_column(Text)
+    profile_snapshot: Mapped[dict] = mapped_column(JsonType, default=dict)
+    trigger_execution_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    letta_synced_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class CapabilityProfileRow(Base):
+    __tablename__ = "capability_profiles"
+    __table_args__ = (UniqueConstraint("organism_id", "capability_key", name="uq_cap_profile_org_key"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    organism_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organism_identity.id"))
+    capability_key: Mapped[str] = mapped_column(String(128))
+    maturity_status: Mapped[str] = mapped_column(String(24), default="DECLARED")  # DECLARED|AVAILABLE|ACQUIRED|VALIDATED|DEPRECATED
+    alpha: Mapped[float] = mapped_column(Float, default=1.0)
+    beta: Mapped[float] = mapped_column(Float, default=1.0)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_success_rate: Mapped[float] = mapped_column(Float, default=0.5)
+    confidence_low: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_high: Mapped[float] = mapped_column(Float, default=1.0)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class CapabilityEvidenceRow(Base):
+    __tablename__ = "capability_evidence"
+    __table_args__ = (UniqueConstraint("profile_id", "execution_id", name="uq_cap_evidence_prof_exec"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    profile_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("capability_profiles.id", ondelete="CASCADE"))
+    execution_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_executions.id"))
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_tasks.id"))
+    outcome: Mapped[str] = mapped_column(String(24))  # verified_success | verified_failure
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    verification_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+class SkillRegistryRow(Base):
+    __tablename__ = "skill_registry"
+    __table_args__ = (UniqueConstraint("skill_key", "version", name="uq_skill_key_ver"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    skill_key: Mapped[str] = mapped_column(String(128))
+    version: Mapped[str] = mapped_column(String(32))
+    capability_key: Mapped[str] = mapped_column(String(128))
+    source_task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agent_tasks.id"), nullable=True)
+    source_execution_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agent_executions.id"), nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    applicable_scenarios: Mapped[list] = mapped_column(JsonType, default=list)
+    steps: Mapped[list] = mapped_column(JsonType, default=list)
+    artifact_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    artifact_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    test_spec: Mapped[dict] = mapped_column(JsonType, default=dict)
+    permission_level: Mapped[str] = mapped_column(String(4), default="L1")
+    status: Mapped[str] = mapped_column(String(24), default="DRAFT")  # DRAFT | VALIDATED | DEPRECATED
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class SkillValidationResultRow(Base):
+    __tablename__ = "skill_validation_results"
+    __table_args__ = (Index("ix_skill_val_skill_time", "skill_id", "executed_at"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    skill_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("skill_registry.id", ondelete="CASCADE"))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    checks: Mapped[list] = mapped_column(JsonType, default=list)
+    stdout_excerpt: Mapped[str] = mapped_column(Text, default="")
+    executed_at: Mapped[datetime] = mapped_column(TS, default=_now)

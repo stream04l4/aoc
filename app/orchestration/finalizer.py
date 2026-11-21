@@ -81,6 +81,8 @@ class TaskFinalizer:
         on_learning: Callable[[datetime, float], None] | None = None,
         embedding_service: EmbeddingService | None = None,
         info_gain_evaluator: InformationGainEvaluator | None = None,
+        self_model: Any = None,
+        skill_registry: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -94,6 +96,8 @@ class TaskFinalizer:
         self._on_learning = on_learning
         self.embedding_service = embedding_service
         self.info_gain_evaluator = info_gain_evaluator or InformationGainEvaluator()
+        self.self_model = self_model
+        self.skill_registry = skill_registry
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -465,6 +469,30 @@ class TaskFinalizer:
                             session=s,
                         )
 
+                # Update Self Model capability_evidence & capability_profiles atomically (V2.0 P1-7)
+                self_model_evidence: dict[str, Any] | None = None
+                if self.self_model is not None:
+                    cap_key = (
+                        eval_res.acquired_skill
+                        or (goal_dict.get("related_key") if selected_drive == DriveType.REPRODUCTION.value else None)
+                        or plan_dict.get("required_capability")
+                        or task_row.get("required_capability")
+                        or "general_task"
+                    )
+                    wall_sec = (exec_row.get("resource_usage") or {}).get("wall_seconds")
+                    self_model_evidence = await self.self_model.record_execution_evidence(
+                        capability_key=str(cap_key),
+                        execution_id=exec_uuid,
+                        task_id=task_uuid,
+                        verified_success=bool(verification_passed and eval_res.goal_achieved),
+                        verification_summary=str(
+                            verification_dict.get("summary") or eval_res.summary or ""
+                        )[:800],
+                        agent_id=exec_row.get("agent_id"),
+                        wall_seconds=float(wall_sec) if wall_sec is not None else None,
+                        session=s,
+                    )
+
                 # Mark execution & task finalized inside the same atomic transaction
                 await self.repo.update_execution(exec_uuid, finalized_at=now, session=s)
                 updated_outcome = dict(task_row.get("outcome") or {})
@@ -472,6 +500,13 @@ class TaskFinalizer:
                 updated_outcome["finalized_at"] = now.isoformat()
                 if info_gain_details:
                     updated_outcome["info_gain_breakdown"] = info_gain_details
+                if self_model_evidence is not None:
+                    updated_outcome["self_model_evidence"] = {
+                        "inserted": self_model_evidence.get("inserted"),
+                        "evidence_id": self_model_evidence.get("evidence_id"),
+                        "capability_key": (self_model_evidence.get("profile") or {}).get("capability_key"),
+                        "maturity_status": (self_model_evidence.get("profile") or {}).get("maturity_status"),
+                    }
                 await self.repo.update_task(task_uuid, finalized_at=now, outcome=updated_outcome, session=s)
 
             # Notify in-memory learning tracker (used by CuriosityDriveEvaluator)
@@ -610,6 +645,15 @@ class TaskFinalizer:
                 last_learning_at = sem[0]["created_at"]
                 last_info_gain = 0.5
 
+        if self.self_model is not None:
+            acquired_caps, validated_caps = await self.self_model.get_evidence_backed_capabilities()
+        else:
+            acquired_caps = list(env.get("capabilities_acquired") or [])
+            validated_caps = []
+        validated_skill_count: int | None = None
+        if self.skill_registry is not None:
+            validated_skill_count = await self.skill_registry.count_validated_skills(verify_integrity=True)
+
         return DriveContext(
             now=now,
             observation=obs,
@@ -620,11 +664,14 @@ class TaskFinalizer:
                 "tokens_used": budget.tokens_used_today,
                 "tokens_limit": budget.tokens_limit_per_day,
             },
-            capabilities_acquired=list(env.get("capabilities_acquired") or []),
+            capabilities_acquired=acquired_caps,
+            validated_capabilities=validated_caps,
+            validated_skill_count=validated_skill_count,
             procedural_skill_count=proc_count,
             capability_goals_completed_recent=cap_goals_done,
             memory_available=self.memory.backend_available,
             identity_persisted=True,
+            knowledge_transfer_readiness=1.0 if sem_recent > 0 else 0.5,
             open_knowledge_gaps=env_topics,
             unknown_topics=env_topics,
             exploration_attempted_recent=cur_done + cur_failed,

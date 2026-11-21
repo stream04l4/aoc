@@ -33,27 +33,40 @@ class ReproductionDriveEvaluator(DriveEvaluator):
         avail_res = obs.available_resources or {}
         notes: list[str] = []
 
-        # 1. Capability coverage
+        # 1. Capability coverage (V2.0 P1-7 / T10 fix):
+        # STRICTLY evidence-driven from capability_profiles(ACQUIRED|VALIDATED).
+        # Static external Agent capabilities in avail_res["agents"]["capabilities"]
+        # contribute ZERO to AOC's own capability coverage.
         cap_score: float | None = None
         if desired:
-            acquired = set(ctx.capabilities_acquired)
-            # Also fold in capabilities reported by healthy agents in observation
-            agents_info = avail_res.get("agents")
-            if isinstance(agents_info, dict) and isinstance(agents_info.get("capabilities"), list):
-                acquired.update(str(c) for c in agents_info["capabilities"])
-            matched = [c for c in desired if c in acquired]
-            missing = [c for c in desired if c not in acquired]
-            cap_score = clamp01(len(matched) / len(desired))
+            acquired = set(ctx.capabilities_acquired) | set(ctx.validated_capabilities)
+            validated = set(ctx.validated_capabilities)
+            acquired_weight = float(self.cfg.get("acquired_capability_credit", 1.0))
+            matched_credit = 0.0
+            missing: list[str] = []
+            for cap in desired:
+                if cap in validated:
+                    matched_credit += 1.0
+                elif cap in acquired:
+                    matched_credit += acquired_weight
+                else:
+                    missing.append(cap)
+            cap_score = clamp01(matched_credit / len(desired))
             if missing:
                 notes.append(f"missing desired capabilities: {', '.join(missing[:5])}")
 
-        # 2. Reusable skills count (procedural memory)
+        # 2. Reusable skills count (V2.0 P1-7: prefer checksum-intact VALIDATED skills from SkillRegistry)
         skill_target = max(1, int(targets.get("skills", 10)))
         skills_score: float | None = None
-        if ctx.procedural_skill_count is not None:
-            skills_score = clamp01(ctx.procedural_skill_count / skill_target)
-            if ctx.procedural_skill_count < skill_target:
-                notes.append(f"reusable skills {ctx.procedural_skill_count}/{skill_target}")
+        effective_skill_count = (
+            ctx.validated_skill_count
+            if ctx.validated_skill_count is not None
+            else ctx.procedural_skill_count
+        )
+        if effective_skill_count is not None:
+            skills_score = clamp01(effective_skill_count / skill_target)
+            if effective_skill_count < skill_target:
+                notes.append(f"validated reusable skills {effective_skill_count}/{skill_target}")
 
         # 3. Completed capability-building goals
         goal_target = max(1, int(targets.get("capability_goals_window", 5)))
@@ -134,6 +147,8 @@ class ReproductionDriveEvaluator(DriveEvaluator):
             checks.append(1.0 if ctx.identity_persisted else 0.0)
         if ctx.memory_available is not None:
             checks.append(1.0 if ctx.memory_available else 0.0)
+        if ctx.knowledge_transfer_readiness is not None:
+            checks.append(clamp01(ctx.knowledge_transfer_readiness))
         agents = avail_res.get("agents")
         if not is_unavailable(agents) and isinstance(agents, dict):
             healthy = extract_number(agents, "healthy_count")

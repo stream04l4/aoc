@@ -22,6 +22,7 @@ from app.core.config import (
     get_memory_config,
     get_policy_config,
     get_runner_config,
+    get_self_model_config,
     get_sensors_config,
     get_settings,
 )
@@ -52,6 +53,8 @@ from app.perception.world.git_sensor import GitWorldSensor
 from app.perception.world.pipeline import WorldEventPipeline
 from app.perception.world.rss_sensor import RSSWorldSensor
 from app.perception.world.web_sensor import WebChangeWorldSensor
+from app.self_model.manager import SelfModelManager
+from app.self_model.skills import SkillRegistryManager
 from app.storage.database import Database
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository
@@ -287,6 +290,10 @@ class OrganismRuntime:
         )
         self.mcp_manager.load_from_config(get_agent_config())
 
+        self._self_model_cfg: dict[str, Any] = get_self_model_config()
+        self.self_model: SelfModelManager | None = None
+        self.skill_registry: SkillRegistryManager | None = None
+
         self.loop: AutonomousLoop | None = None
         self.scheduler: OrganismScheduler | None = None
 
@@ -302,6 +309,26 @@ class OrganismRuntime:
             self.memory.backend.agent_id = identity["memory_agent_id"]
 
         self.lifecycle = LifecycleManager(self.organism_id, self.repo)
+
+        # Dynamic Self Model & Skill Registry (V2.0 P1-7)
+        sm_cfg = dict(self._self_model_cfg or {})
+        ws_root = str(self.settings.governance.workspace_root)
+        if not sm_cfg.get("skill_storage_dir") or ws_root != "/home/ubuntu/aoc-workspaces":
+            sm_cfg["skill_storage_dir"] = str(Path(ws_root) / "skills")
+        self.skill_registry = SkillRegistryManager(
+            repo=self.repo,
+            governance=self.governance,
+            config=sm_cfg,
+        )
+        self.self_model = SelfModelManager(
+            organism_id=self.organism_id,
+            repo=self.repo,
+            config=sm_cfg,
+            memory_backend=self.memory.backend,
+            skill_registry=self.skill_registry,
+        )
+        self.skill_registry.self_model = self.self_model
+
         self.finalizer = TaskFinalizer(
             organism_id=self.organism_id,
             repo=self.repo,
@@ -314,6 +341,8 @@ class OrganismRuntime:
             llm_gateway=self.llm_gateway,
             embedding_service=self.embedding_service,
             info_gain_evaluator=self.info_gain_evaluator,
+            self_model=self.self_model,
+            skill_registry=self.skill_registry,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -335,9 +364,20 @@ class OrganismRuntime:
                 return {"skipped": True}
             return await self.memory.sync_memory_to_letta(uuid.UUID(mid))
 
+        async def _handle_self_model_sync_letta(ev: dict[str, Any]) -> dict[str, Any]:
+            vid = (ev.get("payload") or {}).get("version_id")
+            if not vid or self.self_model is None:
+                return {"skipped": True}
+            return await self.self_model.sync_version_to_letta(vid)
+
         self.outbox.register_handler(OutboxEventType.EXECUTION_FINALIZE, "outbox_finalizer", _handle_finalize_event)
         self.outbox.register_handler(OutboxEventType.MEMORY_EMBED, "outbox_memory_embed", _handle_memory_embed)
         self.outbox.register_handler(OutboxEventType.MEMORY_SYNC_LETTA, "outbox_memory_letta", _handle_memory_sync_letta)
+        self.outbox.register_handler(
+            OutboxEventType.SELF_MODEL_SYNC_LETTA,
+            "outbox_self_model_letta",
+            _handle_self_model_sync_letta,
+        )
         self.outbox.register_handler(
             OutboxEventType.NOTIFICATION_DISPATCH,
             "outbox_telegram_notifier",
@@ -360,6 +400,8 @@ class OrganismRuntime:
             finalizer=self.finalizer,
             outbox=self.outbox,
             approval_service=self.approval_service,
+            self_model=self.self_model,
+            skill_registry=self.skill_registry,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         if self.world_pipeline is not None and (self._sensors_cfg or {}).get("sources"):

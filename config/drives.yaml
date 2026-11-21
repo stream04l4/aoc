@@ -50,12 +50,13 @@ drives:
     urgency_trend_gain: 0.2
     estimated_cost: 0.4
     estimated_risk: 0.2
+    acquired_capability_credit: 1.0  # Credit for ACQUIRED vs VALIDATED (1.0); static Agent caps ALWAYS = 0
     dimension_weights:
-      capability_coverage: 0.30
-      reusable_skills: 0.25
+      capability_coverage: 0.30      # Evidence-backed capability_profiles (ACQUIRED|VALIDATED) only (P1-7)
+      reusable_skills: 0.25          # Checksum-intact VALIDATED skills from skill_registry (P1-7)
       capability_goals: 0.15
       resource_reserve: 0.15
-      expansion_readiness: 0.15
+      expansion_readiness: 0.15      # Identity + memory + knowledge transfer readiness + healthy agents
     targets:
       skills: 10                 # reusable procedural skills considered "fully stocked"
       capability_goals_window: 5 # completed capability goals considered "fully satisfied" (rolling window)

@@ -101,12 +101,16 @@ class DriveContext(BaseModel):
     recent_execution_statuses: list[str] = Field(default_factory=list)
     budget: dict[str, Any] = Field(default_factory=dict)  # tasks_used, tasks_limit, tokens_used, tokens_limit
 
-    # reproduction
+    # reproduction (V2.0 P1-7: evidence-driven capabilities & validated skills only)
     capabilities_acquired: list[str] = Field(default_factory=list)
+    validated_capabilities: list[str] = Field(default_factory=list)
+    validated_skill_count: int | None = None
     procedural_skill_count: int | None = None
     capability_goals_completed_recent: int = 0
     memory_available: bool | None = None
     identity_persisted: bool | None = None
+    self_model_synced: bool | None = None
+    knowledge_transfer_readiness: float | None = None
 
     # curiosity
     open_knowledge_gaps: list[KnowledgeGap] = Field(default_factory=list)

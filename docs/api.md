@@ -66,3 +66,8 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `POST` | `/v2/webhooks/telegram` | Telegram Bot approval callback webhook (`X-Telegram-Bot-Api-Secret-Token` + chat allowlist + nonce TTL) |
 | `GET` | `/v2/tools` | List registered MCP `ToolProvider` tools (explicitly distinct from `GET /agents` `AgentProvider`; Bearer `read`) |
 | `POST` | `/v2/tools/{tool_name}/invoke` | Invoke a guarded MCP tool via `MCPClientManager` with schema, Governance, Budget, and audit checks (Bearer `control`) |
+| `GET` | `/v2/self-model` | Latest versioned dynamic Self Model snapshot (`self_model_versions`) (Bearer `read`) |
+| `GET` | `/v2/self-model/history` | Historical Self Model snapshots ordered by `version_number` descending (Bearer `read`) |
+| `GET` | `/v2/capabilities` | Evidence-driven capability profiles with Beta-Binomial posterior & 90% confidence bounds (Bearer `read`) |
+| `GET` | `/v2/skills` | Registered skills with live SHA-256 artifact integrity checks (Bearer `read`) |
+| `GET` | `/v2/skills/{skill_id}` | Detailed skill metadata, artifact checksum integrity, and validation test history (Bearer `read`) |
