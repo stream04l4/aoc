@@ -428,7 +428,8 @@ class StateRepository:
 
     # ── goals & plans ───────────────────────────────────────────────────────
     async def create_goal(self, organism_id: uuid.UUID, cycle_id: uuid.UUID, **fields: Any) -> uuid.UUID:
-        fields = {k: _jsonable(v) for k, v in fields.items()}
+        preserve = {"duplicate_of", "cooldown_until"}
+        fields = {k: (v if k in preserve else _jsonable(v)) for k, v in fields.items()}
         async with self.db.session() as s:
             g = ActiveGoal(organism_id=organism_id, cycle_id=cycle_id, **fields)
             s.add(g)
@@ -436,6 +437,27 @@ class StateRepository:
             s.add(GoalHistory(goal_id=g.id, from_status=None, to_status=g.status, note="created",
                               expected_outcome=g.expected_outcome or {}))
             return g.id
+
+    async def update_goal(
+        self, goal_id: uuid.UUID, session: AsyncSession | None = None, **values: Any
+    ) -> None:
+        preserve = {"duplicate_of", "cooldown_until", "updated_at"}
+        clean = {k: (v if k in preserve else _jsonable(v)) for k, v in values.items()}
+        clean.setdefault("updated_at", utcnow())
+        async with self._use_session(session) as s:
+            await s.execute(update(ActiveGoal).where(ActiveGoal.id == goal_id).values(**clean))
+
+    async def list_recent_goals(self, since: datetime, limit: int = 80) -> list[dict]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(ActiveGoal)
+                    .where(ActiveGoal.created_at >= since)
+                    .order_by(ActiveGoal.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [self._goal_dict(g) for g in rows]
 
     async def transition_goal(
         self,
@@ -517,6 +539,11 @@ class StateRepository:
             "expected_outcome": g.expected_outcome,
             "related_key": g.related_key,
             "status": g.status,
+            "goal_fingerprint": g.goal_fingerprint,
+            "duplicate_of": str(g.duplicate_of) if g.duplicate_of else None,
+            "cooldown_until": g.cooldown_until,
+            "predicted_ig": g.predicted_ig,
+            "verified_ig": g.verified_ig,
             "created_at": g.created_at,
             "updated_at": g.updated_at,
         }
@@ -530,6 +557,9 @@ class StateRepository:
         verdict: Any,
         status: str,
         plan_hash: str | None = None,
+        preflight_status: str | None = None,
+        preflight_reason_codes: list[str] | None = None,
+        preflight_checked_at: datetime | None = None,
     ) -> uuid.UUID:
         async with self.db.session() as s:
             p = ActionPlanRow(
@@ -540,10 +570,28 @@ class StateRepository:
                 permission_level=permission_level,
                 policy_verdict=_jsonable(verdict),
                 status=status,
+                preflight_status=preflight_status,
+                preflight_reason_codes=_jsonable(preflight_reason_codes) if preflight_reason_codes is not None else None,
+                preflight_checked_at=preflight_checked_at,
             )
             s.add(p)
             await s.flush()
             return p.id
+
+    async def list_recent_plan_hashes(self, since: datetime, limit: int = 100) -> list[str]:
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(ActionPlanRow.plan_hash)
+                    .where(
+                        ActionPlanRow.created_at >= since,
+                        ActionPlanRow.plan_hash.is_not(None),
+                    )
+                    .order_by(ActionPlanRow.created_at.desc())
+                    .limit(limit)
+                )
+            ).all()
+            return [str(r[0]) for r in rows if r[0]]
 
     async def get_plan(self, plan_id: uuid.UUID) -> dict | None:
         async with self.db.session() as s:
@@ -558,6 +606,9 @@ class StateRepository:
                 "plan_hash": p.plan_hash,
                 "permission_level": p.permission_level,
                 "policy_verdict": p.policy_verdict,
+                "preflight_status": p.preflight_status,
+                "preflight_reason_codes": p.preflight_reason_codes,
+                "preflight_checked_at": p.preflight_checked_at,
                 "status": p.status,
                 "created_at": p.created_at,
                 "updated_at": p.updated_at,

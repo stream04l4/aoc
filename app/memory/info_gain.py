@@ -89,6 +89,9 @@ class InformationGainEvaluator:
         goal_relevance: float = 1.0,
         verification_confidence: float = 1.0,
         learning_progress_factor: float = 1.0,
+        topic_resolved: bool = False,
+        new_capability_evidence: bool = False,
+        verified_code_artifact: bool = False,
     ) -> InfoGainBreakdown:
         notes: list[str] = []
         src_rel = clamp01(source_reliability)
@@ -173,6 +176,21 @@ class InformationGainEvaluator:
 
         raw_core = 0.7 * sem_novelty * factual_novelty + 0.3 * evidence_gain
         total = clamp01(raw_core * src_rel * goal_rel * ver_conf * learn_fac)
+
+        # V3.0 M1 deterministic IG v2: concrete verifiable state deltas (strictly gated by ver_conf & non-duplicate)
+        if not is_dup and ver_conf > 0.0:
+            v2_bonus = 0.0
+            if topic_resolved:
+                v2_bonus += 0.15 * ver_conf
+                notes.append("IG v2: verified open world topic resolution (+0.15)")
+            if new_capability_evidence:
+                v2_bonus += 0.12 * ver_conf
+                notes.append("IG v2: new verified capability evidence (+0.12)")
+            if verified_code_artifact:
+                v2_bonus += 0.10 * ver_conf
+                notes.append("IG v2: verified workspace artifact (+0.10)")
+            if v2_bonus > 0.0:
+                total = clamp01(total + v2_bonus)
 
         return InfoGainBreakdown(
             information_gain=round(total, 4),

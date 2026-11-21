@@ -121,10 +121,20 @@ class LLMGateway(LLMGatewayInterface):
         *,
         cycle_id: uuid.UUID | None = None,
         task_id: uuid.UUID | None = None,
+        goal_id: uuid.UUID | None = None,
+        purpose: str | None = None,
         emergency: bool = False,
     ) -> Iterator[None]:
-        """Bind cycle/task/emergency metadata for nested BrainInterface calls without changing signatures."""
-        token = _CALL_SCOPE.set({"cycle_id": cycle_id, "task_id": task_id, "emergency": emergency})
+        """Bind cycle/task/goal/purpose/emergency metadata for nested BrainInterface calls."""
+        token = _CALL_SCOPE.set(
+            {
+                "cycle_id": cycle_id,
+                "task_id": task_id,
+                "goal_id": str(goal_id) if goal_id is not None else None,
+                "purpose": purpose,
+                "emergency": emergency,
+            }
+        )
         try:
             yield
         finally:
@@ -299,6 +309,7 @@ class LLMGateway(LLMGatewayInterface):
 
                 # Mandatory accounting for EVERY attempt (success, retry, or failure)
                 if self.repo is not None:
+                    scope_ctx = _CALL_SCOPE.get()
                     try:
                         await self.repo.record_usage(
                             category="llm",
@@ -307,6 +318,8 @@ class LLMGateway(LLMGatewayInterface):
                             details={
                                 "source": "brain_gateway",
                                 "operation": operation,
+                                "purpose": scope_ctx.get("purpose") or operation,
+                                "goal_id": scope_ctx.get("goal_id"),
                                 "model": usage.model or self.llm_settings.model,
                                 "attempt": attempt,
                                 "prompt_tokens": usage.prompt_tokens,

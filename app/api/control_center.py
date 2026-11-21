@@ -1726,6 +1726,41 @@ def create_control_center_router(get_runtime) -> APIRouter:
             approvals = (await s.execute(ap_q)).scalars().all()
             llm_rows = (await s.execute(ru_q)).scalars().all()
 
+            # V3.0 M1 kernel guard & cognitive efficiency metrics
+            pf_q = select(ActionPlanRow)
+            gd_q = select(ActiveGoal)
+            mi_q = select(MemoryIndex)
+            if since is not None:
+                pf_q = pf_q.where(ActionPlanRow.created_at >= since)
+                gd_q = gd_q.where(ActiveGoal.created_at >= since)
+                mi_q = mi_q.where(MemoryIndex.created_at >= since)
+            plan_rows = (await s.execute(pf_q)).scalars().all()
+            goal_rows = (await s.execute(gd_q)).scalars().all()
+            mem_rows_win = (await s.execute(mi_q)).scalars().all()
+
+            preflight_rejected = 0
+            preflight_reasons: dict[str, int] = {}
+            for pr in plan_rows:
+                if pr.preflight_status == "REJECT":
+                    preflight_rejected += 1
+                    for rc in (pr.preflight_reason_codes or []):
+                        preflight_reasons[str(rc)] = preflight_reasons.get(str(rc), 0) + 1
+
+            goal_dedup_skipped = sum(1 for g in goal_rows if g.duplicate_of is not None)
+            now_utc = utcnow()
+            goals_in_cooldown = sum(
+                1
+                for g in goal_rows
+                if g.cooldown_until is not None
+                and (
+                    g.cooldown_until.replace(tzinfo=now_utc.tzinfo)
+                    if g.cooldown_until.tzinfo is None
+                    else g.cooldown_until
+                )
+                > now_utc
+            )
+            sum_ig_win = sum(float(m.information_gain or 0.0) for m in mem_rows_win if m.information_gain is not None)
+
             # Aggregate LLM usage by source/operation and top tasks
             breakdown: dict[str, dict[str, Any]] = {}
             tokens_by_task: dict[uuid.UUID, dict[str, Any]] = {}
@@ -1831,6 +1866,18 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 ],
             },
             "risk_advisories": risk_advisories,
+            "kernel_v3_metrics": {
+                "plan_preflight_enabled": rt.settings.kernel_v3.plan_preflight_enabled,
+                "goal_dedup_enabled": rt.settings.kernel_v3.goal_dedup_enabled,
+                "preflight_rejected_count": preflight_rejected,
+                "preflight_reason_breakdown": preflight_reasons,
+                "goal_dedup_skipped_count": goal_dedup_skipped,
+                "goals_in_cooldown": goals_in_cooldown,
+                "sum_verified_ig": round(sum_ig_win, 4),
+                "verified_ig_per_1m_tokens": (
+                    round(sum_ig_win / (total_tokens / 1_000_000.0), 4) if total_tokens > 0 else 0.0
+                ),
+            },
             "budget": budget.model_dump(mode="json"),
             "token_analytics": {
                 "total_tokens": total_tokens,

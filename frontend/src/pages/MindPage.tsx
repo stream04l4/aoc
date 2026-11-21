@@ -113,6 +113,8 @@ export function MindPage({
             <option value="ACTION_FAILED">ACTION_FAILED</option>
             <option value="IDLE">IDLE</option>
             <option value="POLICY_DENIED">POLICY_DENIED</option>
+            <option value="PREFLIGHT_REJECTED">PREFLIGHT_REJECTED</option>
+            <option value="GOAL_DEDUP_SKIPPED">GOAL_DEDUP_SKIPPED</option>
             <option value="REQUIRES_APPROVAL">REQUIRES_APPROVAL</option>
             <option value="BUDGET_DEFERRED">BUDGET_DEFERRED</option>
             <option value="BUDGET_EXHAUSTED">BUDGET_EXHAUSTED</option>

@@ -179,6 +179,24 @@ class TelegramSettings(BaseModel):
         return [str(v).strip()]
 
 
+class KernelV3Settings(BaseModel):
+    """V3.0 Thin Kernel cognitive guards & Feature Flags (zero-bloat, reversible)."""
+
+    # Plan Preflight is a hard execution safety boundary (fail-closed)
+    plan_preflight_enabled: bool = True
+    duplicate_plan_window_minutes: int = 60
+
+    # Goal deduplication, cooldown & deterministic Information Gain v2
+    goal_dedup_enabled: bool = True
+    goal_dedup_window_hours: float = 6.0
+    goal_dedup_lexical_threshold: float = 0.72
+    goal_dedup_semantic_threshold: float = 0.86
+    goal_failed_cooldown_minutes: int = 60
+    goal_low_ig_cooldown_minutes: int = 120
+    goal_low_ig_threshold: float = 0.15
+    ig_v2_enabled: bool = True
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -211,6 +229,7 @@ class Settings(BaseSettings):
     runner: RunnerSettings = Field(default_factory=RunnerSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
+    kernel_v3: KernelV3Settings = Field(default_factory=KernelV3Settings)
 
     @classmethod
     def settings_customise_sources(

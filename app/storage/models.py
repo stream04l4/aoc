@@ -212,6 +212,12 @@ class ActiveGoal(Base):
     expected_outcome: Mapped[dict] = mapped_column(JsonType, default=dict)
     related_key: Mapped[str | None] = mapped_column(String(256), nullable=True)  # e.g. knowledge topic key
     status: Mapped[str] = mapped_column(String(32))
+    # V3.0 M1: goal deduplication, cooldown & deterministic IG tracking
+    goal_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    duplicate_of: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    cooldown_until: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    predicted_ig: Mapped[float | None] = mapped_column(Float, nullable=True)
+    verified_ig: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
     updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
 
@@ -239,6 +245,10 @@ class ActionPlanRow(Base):
     permission_level: Mapped[str] = mapped_column(String(4))
     policy_verdict: Mapped[dict] = mapped_column(JsonType, default=dict)
     status: Mapped[str] = mapped_column(String(32))
+    # V3.0 M1: deterministic ActionPreflight audit
+    preflight_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    preflight_reason_codes: Mapped[list | None] = mapped_column(JsonType, nullable=True)
+    preflight_checked_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
     updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
 
@@ -713,4 +723,7 @@ class AffectHistoryRow(Base):
     boredom: Mapped[float] = mapped_column(Float, default=0.0)
     modulation_applied: Mapped[dict] = mapped_column(JsonType, default=dict)
     trigger_reason: Mapped[str] = mapped_column(Text, default="")
+    # V3.0 M1/M2: idempotent trigger key & decay tracking
+    trigger_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    decay_applied: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)

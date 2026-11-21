@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.base import AgentExecution
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
+from app.cognition.goal_dedup import compute_cooldown_until
 from app.cognition.interfaces import (
     ActionPlan,
     BrainError,
@@ -319,6 +320,12 @@ class TaskFinalizer:
                         )
                         for r in recent_mems
                     ]
+                resolved_key_preview = eval_res.resolved_topic or (
+                    goal_dict.get("related_key") if selected_drive == DriveType.CURIOSITY.value else None
+                )
+                has_workspace_files = bool(
+                    verification_passed and ((exec_row.get("result") or {}).get("workspace_files") or [])
+                )
                 ig_breakdown = self.info_gain_evaluator.evaluate(
                     new_text=candidate_text,
                     new_facts=eval_res.learned_facts,
@@ -329,6 +336,9 @@ class TaskFinalizer:
                     goal_relevance=1.0,
                     verification_confidence=1.0 if verification_passed else 0.0,
                     learning_progress_factor=1.0,
+                    topic_resolved=bool(resolved_key_preview),
+                    new_capability_evidence=bool(self.self_model is not None and verification_passed),
+                    verified_code_artifact=has_workspace_files,
                 )
                 measured_info_gain = ig_breakdown.information_gain
                 info_gain_details = ig_breakdown.model_dump(mode="json")
@@ -570,6 +580,15 @@ class TaskFinalizer:
                     actual_outcome=expected_vs_actual["actual_outcome"],
                     measured_change=measured_change,
                 )
+                # V3.0 M1: persist deterministic verified_ig & cooldown onto active_goals
+                verified_ig_val = round(float(measured_info_gain), 4) if eval_res.goal_achieved else 0.0
+                cooldown_at = compute_cooldown_until(
+                    now=now,
+                    goal_achieved=eval_res.goal_achieved,
+                    verified_ig=verified_ig_val,
+                    failure_streak=1 if not eval_res.goal_achieved else 0,
+                )
+                await self.repo.update_goal(goal_uuid, verified_ig=verified_ig_val, cooldown_until=cooldown_at)
 
             eval_payload = {
                 **eval_res.model_dump(mode="json"),

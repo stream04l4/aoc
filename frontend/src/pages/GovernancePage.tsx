@@ -137,6 +137,60 @@ export function GovernancePage({
         />
       </div>
 
+      {/* V3.0 M1 Kernel Guard & Cognitive Efficiency Strip */}
+      {data.kernel_v3_metrics && (
+        <Card className="p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+              V3.0 内核守门与认知效率（ActionPreflight · GoalDedup · Verified IG）
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-mono text-slate-500">
+              <span>Preflight: {data.kernel_v3_metrics.plan_preflight_enabled ? 'ON' : 'OFF'}</span>
+              <span>·</span>
+              <span>Dedup: {data.kernel_v3_metrics.goal_dedup_enabled ? 'ON' : 'OFF'}</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="rounded-lg bg-slate-100/70 p-2.5 dark:bg-slate-900/70">
+              <div className="text-[11px] text-slate-500">Preflight 前置拦截</div>
+              <div className="mt-1 text-base font-semibold font-mono text-amber-600 dark:text-amber-400">
+                {data.kernel_v3_metrics.preflight_rejected_count}
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-100/70 p-2.5 dark:bg-slate-900/70">
+              <div className="text-[11px] text-slate-500">重复目标拦截</div>
+              <div className="mt-1 text-base font-semibold font-mono text-cyan-600 dark:text-cyan-400">
+                {data.kernel_v3_metrics.goal_dedup_skipped_count}
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-100/70 p-2.5 dark:bg-slate-900/70">
+              <div className="text-[11px] text-slate-500">冷却中目标</div>
+              <div className="mt-1 text-base font-semibold font-mono">
+                {data.kernel_v3_metrics.goals_in_cooldown}
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-100/70 p-2.5 dark:bg-slate-900/70">
+              <div className="text-[11px] text-slate-500">Verified IG / 1M Tok</div>
+              <div className="mt-1 text-base font-semibold font-mono text-emerald-600 dark:text-emerald-400">
+                {Number(data.kernel_v3_metrics.verified_ig_per_1m_tokens || 0).toFixed(3)}
+              </div>
+            </div>
+          </div>
+          {Object.keys(data.kernel_v3_metrics.preflight_reason_breakdown || {}).length > 0 && (
+            <div className="mt-2.5 flex flex-wrap gap-1.5">
+              {Object.entries(data.kernel_v3_metrics.preflight_reason_breakdown).map(([code, cnt]) => (
+                <span
+                  key={code}
+                  className="rounded bg-amber-500/15 px-2 py-0.5 text-[10px] font-mono text-amber-700 dark:text-amber-300"
+                >
+                  {code}: {String(cnt)}
+                </span>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+
       {/* Token Breakdown Chart + Top Token-Heavy Tasks */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>

@@ -27,6 +27,7 @@ from typing import Any
 from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
+from app.cognition.goal_dedup import GoalDedupEngine, compute_cooldown_until, compute_goal_fingerprint
 from app.cognition.interfaces import (
     ActionPlan,
     AssessmentResult,
@@ -36,6 +37,7 @@ from app.cognition.interfaces import (
     GoalProposal,
     VerificationSpec,
 )
+from app.cognition.preflight import ActionPreflight
 from app.core.config import Settings
 from app.core.enums import (
     NO_DRIVE,
@@ -116,6 +118,20 @@ class AutonomousLoop:
         self._last_info_gain_at: datetime | None = None
         # Re-entrancy guard preventing Scheduler and API /control/cycle from overlapping (P1-1a)
         self._cycle_lock = asyncio.Lock()
+
+        # V3.0 M1 thin-kernel deterministic guards
+        kv3 = settings.kernel_v3
+        self.preflight = ActionPreflight(
+            max_task_timeout_seconds=settings.governance.budget.max_task_timeout_seconds,
+        )
+        self.goal_dedup = GoalDedupEngine(
+            dedup_window_hours=kv3.goal_dedup_window_hours,
+            lexical_threshold=kv3.goal_dedup_lexical_threshold,
+            semantic_threshold=kv3.goal_dedup_semantic_threshold,
+            failed_cooldown_minutes=kv3.goal_failed_cooldown_minutes,
+            low_ig_cooldown_minutes=kv3.goal_low_ig_cooldown_minutes,
+            low_ig_threshold=kv3.goal_low_ig_threshold,
+        )
 
         self.finalizer = finalizer or TaskFinalizer(
             organism_id=organism_id,
@@ -456,6 +472,74 @@ class AutonomousLoop:
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
+            # V3.0 M1 P0-2: Deterministic Goal Deduplication & Cooldown Gate
+            goal_fp = compute_goal_fingerprint(
+                drive_type=decision.selected_drive,
+                title=goal_proposal.title,
+                related_key=goal_proposal.related_key,
+                description=goal_proposal.description,
+            )
+            kv3 = self.settings.kernel_v3
+            if kv3.goal_dedup_enabled and not bool(decision.constraints.get("emergency_mode")):
+                lookback_h = max(24.0, float(kv3.goal_dedup_window_hours))
+                recent_goals = await self.repo.list_recent_goals(
+                    since=now - timedelta(hours=lookback_h), limit=80
+                )
+                dedup_res = self.goal_dedup.evaluate(
+                    proposal=goal_proposal,
+                    drive_type=decision.selected_drive,
+                    recent_goals=recent_goals,
+                    now=now,
+                )
+                goal_fp = dedup_res.fingerprint
+                if dedup_res.decision in {"REJECT", "DEFER"}:
+                    dup_uuid = uuid.UUID(dedup_res.duplicate_of) if dedup_res.duplicate_of else None
+                    await self.repo.create_goal(
+                        self.organism_id,
+                        cycle_id,
+                        drive_type=decision.selected_drive,
+                        title=goal_proposal.title[:500],
+                        description=goal_proposal.description,
+                        success_criteria=goal_proposal.success_criteria,
+                        expected_outcome=goal_proposal.expected_outcome,
+                        related_key=goal_proposal.related_key,
+                        status=GoalStatus.REJECTED.value if dedup_res.decision == "REJECT" else GoalStatus.ABANDONED.value,
+                        goal_fingerprint=goal_fp,
+                        duplicate_of=dup_uuid,
+                        cooldown_until=dedup_res.cooldown_until,
+                    )
+                    await self.repo.log_decision(
+                        decision_type="goal_dedup",
+                        selected=dedup_res.decision,
+                        alternatives=[],
+                        reason="; ".join(dedup_res.notes) or str(dedup_res.reason_code or "duplicate_goal"),
+                        payload=dedup_res.model_dump(mode="json"),
+                        cycle_id=cycle_id,
+                    )
+                    await self.repo.update_cycle(
+                        cycle_id,
+                        brain_output={
+                            "assessment": assessment.model_dump(mode="json"),
+                            "goal": goal_proposal.model_dump(mode="json"),
+                            "goal_dedup": dedup_res.model_dump(mode="json"),
+                        },
+                    )
+                    outcome = "GOAL_DEDUP_SKIPPED"
+                    await self.lifecycle.transition(
+                        LifecycleState.IDLE,
+                        reason=f"Goal deduplicated ({dedup_res.reason_code})",
+                        cycle_id=cycle_id,
+                    )
+                    await self._finalize_cycle(
+                        cycle_id,
+                        outcome,
+                        pre_drives,
+                        pre_drives,
+                        {"action": "dedup_skipped", "goal_dedup": dedup_res.model_dump(mode="json")},
+                        t0,
+                    )
+                    return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
+
             goal_id = await self.repo.create_goal(
                 self.organism_id,
                 cycle_id,
@@ -466,12 +550,13 @@ class AutonomousLoop:
                 expected_outcome=goal_proposal.expected_outcome,
                 related_key=goal_proposal.related_key,
                 status=GoalStatus.ACTIVE.value,
+                goal_fingerprint=goal_fp,
             )
 
             # ── 8. COGNITIVE PLANNING ───────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="COGNITIVE_PLANNING")
             plan = await self._plan_safe(
-                cog_ctx.model_copy(update={"goal": goal_proposal}), llm_available_for_brain, cycle_id
+                cog_ctx.model_copy(update={"goal": goal_proposal}), llm_available_for_brain, cycle_id, goal_id=goal_id
             )
             await self.repo.update_cycle(
                 cycle_id,
@@ -489,11 +574,35 @@ class AutonomousLoop:
                 await self._finalize_cycle(cycle_id, outcome, pre_drives, pre_drives, {"action": "abandoned"}, t0)
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
-            # ── 9. POLICY VALIDATION ────────────────────────────────────────
+            # ── 9. POLICY VALIDATION & DETERMINISTIC ACTION PREFLIGHT ───────
             await self.repo.update_cycle(cycle_id, phase="POLICY_VALIDATION")
             verdict = await self.governance.validate_plan(plan, decision.selected_drive)
-            plan_status = "APPROVED" if verdict.allowed else ("REQUIRES_APPROVAL" if verdict.requires_approval else "DENIED")
             plan_hash = compute_plan_hash(plan)
+
+            recent_hashes = (
+                await self.repo.list_recent_plan_hashes(
+                    since=now - timedelta(minutes=max(1, int(kv3.duplicate_plan_window_minutes)))
+                )
+                if kv3.plan_preflight_enabled
+                else []
+            )
+            preflight_res = (
+                self.preflight.validate(
+                    plan=plan,
+                    verdict=verdict,
+                    registry=self.registry,
+                    budget=budget,
+                    recent_plan_hashes=recent_hashes,
+                )
+                if kv3.plan_preflight_enabled
+                else None
+            )
+
+            if preflight_res is not None and preflight_res.decision == "REJECT" and verdict.allowed:
+                plan_status = "PREFLIGHT_REJECTED"
+            else:
+                plan_status = "APPROVED" if verdict.allowed else ("REQUIRES_APPROVAL" if verdict.requires_approval else "DENIED")
+
             plan_id = await self.repo.create_plan(
                 goal_id=goal_id,
                 cycle_id=cycle_id,
@@ -502,6 +611,9 @@ class AutonomousLoop:
                 verdict=verdict,
                 status=plan_status,
                 plan_hash=plan_hash,
+                preflight_status=preflight_res.decision if preflight_res else None,
+                preflight_reason_codes=preflight_res.reason_codes if preflight_res else None,
+                preflight_checked_at=preflight_res.checked_at if preflight_res else None,
             )
             await self.repo.record_policy_evaluation(
                 subject_type="plan",
@@ -520,9 +632,45 @@ class AutonomousLoop:
                 selected=plan_status,
                 alternatives=[],
                 reason=verdict.reason,
-                payload=verdict.model_dump(mode="json"),
+                payload={
+                    **verdict.model_dump(mode="json"),
+                    "preflight": preflight_res.model_dump(mode="json") if preflight_res else None,
+                },
                 cycle_id=cycle_id,
             )
+
+            if preflight_res is not None and preflight_res.decision == "REJECT" and verdict.allowed:
+                cd_until = compute_cooldown_until(
+                    now=now,
+                    goal_achieved=False,
+                    verified_ig=0.0,
+                    failure_streak=1,
+                    failed_cooldown_minutes=kv3.goal_failed_cooldown_minutes,
+                )
+                await self.repo.update_goal(goal_id, cooldown_until=cd_until, verified_ig=0.0)
+                await self.repo.transition_goal(
+                    goal_id,
+                    GoalStatus.REJECTED.value,
+                    note=f"ActionPreflight rejected ({', '.join(preflight_res.reason_codes)}): {'; '.join(preflight_res.notes)}",
+                )
+                await self.repo.log_decision(
+                    decision_type="plan_preflight",
+                    selected="REJECT",
+                    alternatives=[],
+                    reason="; ".join(preflight_res.notes) or ",".join(preflight_res.reason_codes),
+                    payload=preflight_res.model_dump(mode="json"),
+                    cycle_id=cycle_id,
+                )
+                outcome = "PREFLIGHT_REJECTED"
+                await self._finalize_cycle(
+                    cycle_id,
+                    outcome,
+                    pre_drives,
+                    pre_drives,
+                    {"preflight": preflight_res.model_dump(mode="json")},
+                    t0,
+                )
+                return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
             if not verdict.allowed:
                 if verdict.requires_approval:
@@ -805,12 +953,16 @@ class AutonomousLoop:
         return GoalProposal(should_act=False, rationale="LLM unavailable for non-emergency goal generation")
 
     async def _plan_safe(
-        self, cog_ctx: CognitiveContext, llm_available: bool, cycle_id: uuid.UUID
+        self,
+        cog_ctx: CognitiveContext,
+        llm_available: bool,
+        cycle_id: uuid.UUID,
+        goal_id: uuid.UUID | None = None,
     ) -> ActionPlan:
         is_em = bool(cog_ctx.decision.constraints.get("emergency_mode"))
         if llm_available:
             try:
-                with self._gateway_scope(cycle_id=cycle_id, emergency=is_em):
+                with self._gateway_scope(cycle_id=cycle_id, goal_id=goal_id, purpose="plan", emergency=is_em):
                     ap = await self.brain.plan(cog_ctx)
                 await self._record_llm_usage("plan", ap.usage, cycle_id)
                 return ap
@@ -859,9 +1011,16 @@ class AutonomousLoop:
         CYCLE_DURATION.observe(time.perf_counter() - t0)
         logger.info("cycle.finished", cycle_id=str(cycle_id), outcome=outcome, seconds=round(time.perf_counter() - t0, 2))
 
-    def _gateway_scope(self, *, cycle_id: uuid.UUID, emergency: bool = False):
+    def _gateway_scope(
+        self,
+        *,
+        cycle_id: uuid.UUID | None = None,
+        goal_id: uuid.UUID | None = None,
+        purpose: str | None = None,
+        emergency: bool = False,
+    ):
         if isinstance(self.llm_gateway, LLMGateway):
-            return self.llm_gateway.scope(cycle_id=cycle_id, emergency=emergency)
+            return self.llm_gateway.scope(cycle_id=cycle_id, goal_id=goal_id, purpose=purpose, emergency=emergency)
         return nullcontext()
 
     async def _record_llm_usage(self, operation: str, usage: Any, cycle_id: uuid.UUID) -> None:
