@@ -259,3 +259,38 @@ async def test_v2_1_control_center_api_auth_redaction_and_full_trace(tmp_path: P
                 assert logs_r["total"] >= 1
     finally:
         await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v2_1_frontend_static_fault_isolation(tmp_path: Path, monkeypatch):
+    """Frontend dist absence or error must NEVER impact Core health or Control Center API."""
+    import app.api.app as app_module
+
+    # Point frontend dist to a non-existent path
+    monkeypatch.setattr(app_module, "_resolve_frontend_dist", lambda: tmp_path / "missing_dist")
+
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'iso.db'}")
+    await _init_db(db)
+    settings = Settings(
+        api=ApiSettings(host="127.0.0.1", auth_enabled=True, admin_key=SecretStr("adm-iso")),
+        database=DatabaseSettings(url=f"sqlite+aiosqlite:///{tmp_path / 'iso.db'}"),
+        memory=MemorySettings(provider="none", embedding_dim=512),
+        embedding=EmbeddingSettings(provider="hash_fallback", dimensions=512),
+        governance=GovernanceSettings(workspace_root=str(tmp_path / "ws")),
+        runner=RunnerSettings(enabled=False),
+    )
+    rt = OrganismRuntime(settings=settings, db=db, auto_load_agents=False, llm_probe_fn=lambda: None)
+    app = create_app(settings=settings, db=db, runtime=rt, start_scheduler=False)
+
+    try:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                h = await client.get("/health")
+                assert h.status_code == 200
+                ov = await client.get(
+                    "/v2/control-center/overview", headers={"Authorization": "Bearer adm-iso"}
+                )
+                assert ov.status_code == 200
+    finally:
+        await db.dispose()
