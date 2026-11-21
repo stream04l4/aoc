@@ -742,23 +742,37 @@ def create_app(
 
     @app.post("/v1/embeddings")
     async def local_embeddings(
-        req: EmbeddingRequest, _: Principal = Depends(require_scope(SCOPE_INTERNAL))
+        req: EmbeddingRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         from app.memory.local_embeddings import embed_batch
+
+        # Enforce Bearer auth: accept SCOPE_INTERNAL token OR configured LLM API key (sent by Dockerized aoc-letta)
+        if cfg.api.auth_enabled:
+            llm_key = cfg.llm.api_key.get_secret_value() if cfg.llm.api_key else ""
+            raw_tok = (authorization or "").removeprefix("Bearer ").removeprefix("bearer ").strip()
+            if not (llm_key and raw_tok and raw_tok == llm_key):
+                checker = require_scope(SCOPE_INTERNAL)
+                await checker(request)
 
         inputs = [req.input] if isinstance(req.input, str) else list(req.input)
         rt = _rt()
         model_used = req.model
+        target_dim = 1024 if "1024" in (req.model or "") else cfg.memory.embedding_dim
         vecs: list[list[float]] | None = None
         if rt.embedding_service is not None:
             try:
                 res = await rt.embedding_service.provider.embed_texts(inputs, is_query=False)
                 vecs = res.vectors
                 model_used = res.model_key
+                if vecs and target_dim > len(vecs[0]):
+                    pad_len = target_dim - len(vecs[0])
+                    vecs = [v + [0.0] * pad_len for v in vecs]
             except Exception:
                 vecs = None
         if vecs is None:
-            vecs = embed_batch(inputs, dim=cfg.memory.embedding_dim)
+            vecs = embed_batch(inputs, dim=target_dim)
         return {
             "object": "list",
             "model": model_used,

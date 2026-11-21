@@ -472,16 +472,24 @@ class TaskFinalizer:
                 # Update Self Model capability_evidence & capability_profiles atomically (V2.0 P1-7)
                 self_model_evidence: dict[str, Any] | None = None
                 if self.self_model is not None:
+                    raw_skill = (eval_res.acquired_skill or "").strip()
+                    short_skill = raw_skill if (0 < len(raw_skill) <= 64 and " " not in raw_skill) else None
+                    raw_rel = str(goal_dict.get("related_key") or "").strip()
+                    short_rel = (
+                        raw_rel
+                        if (selected_drive == DriveType.REPRODUCTION.value and 0 < len(raw_rel) <= 64 and " " not in raw_rel)
+                        else None
+                    )
                     cap_key = (
-                        eval_res.acquired_skill
-                        or (goal_dict.get("related_key") if selected_drive == DriveType.REPRODUCTION.value else None)
+                        short_skill
                         or plan_dict.get("required_capability")
                         or task_row.get("required_capability")
+                        or short_rel
                         or "general_task"
                     )
                     wall_sec = (exec_row.get("resource_usage") or {}).get("wall_seconds")
                     self_model_evidence = await self.self_model.record_execution_evidence(
-                        capability_key=str(cap_key),
+                        capability_key=str(cap_key)[:120],
                         execution_id=exec_uuid,
                         task_id=task_uuid,
                         verified_success=bool(verification_passed and eval_res.goal_achieved),

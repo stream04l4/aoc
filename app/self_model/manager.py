@@ -244,7 +244,7 @@ class SelfModelManager(SelfModelInterface):
         Strictly idempotent on (profile_id, execution_id): duplicate calls do not double-count.
         Can run inside an existing `TaskFinalizer` transaction via `session`.
         """
-        cap_key = str(capability_key or "general_task").strip() or "general_task"
+        cap_key = (str(capability_key or "general_task").strip() or "general_task")[:120]
         exec_uuid = uuid.UUID(str(execution_id))
         task_uuid = uuid.UUID(str(task_id))
 

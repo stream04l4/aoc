@@ -28,7 +28,7 @@ llm:
   base_url: "http://127.0.0.1:8000/v1"
   model: "Qwen/Qwen3.8-27B-FP8"
   temperature: 0.3
-  max_tokens: 4096
+  max_tokens: 9999
   timeout_seconds: 180
   max_schema_retries: 2
   # api_key: from AOC_LLM__API_KEY
@@ -49,16 +49,16 @@ governance:
   auto_approve_max_level: "L1"
   workspace_root: "/home/ubuntu/aoc-workspaces"
   budget:
-    max_agent_tasks_per_day: 20
+    max_agent_tasks_per_day: 9999
     max_task_timeout_seconds: 600
     max_concurrent_tasks: 1
-    max_llm_calls_per_cycle: 8
-    max_tokens_per_cycle: 100000
-    max_concurrent_llm_calls: 2
-    max_llm_tokens_per_day: 2000000
-    emergency_llm_calls_per_day: 10
-    emergency_llm_tokens_per_day: 100000
-    hard_daily_llm_tokens_cap: 2200000
+    max_llm_calls_per_cycle: 9999
+    max_tokens_per_cycle: 99990000
+    max_concurrent_llm_calls: 16
+    max_llm_tokens_per_day: 999900000
+    emergency_llm_calls_per_day: 9999
+    emergency_llm_tokens_per_day: 99990000
+    hard_daily_llm_tokens_cap: 999990000
     max_task_retries: 2
     circuit_breaker_threshold: 5
     circuit_breaker_cooldown_seconds: 30.0

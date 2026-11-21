@@ -45,7 +45,25 @@ class VectorType(TypeDecorator):
             try:
                 from pgvector.sqlalchemy import Vector
 
-                return dialect.type_descriptor(Vector())
+                class _SafePgVector(Vector):
+                    cache_ok = True
+
+                    def result_processor(self, dialect_, coltype):
+                        base_proc = super().result_processor(dialect_, coltype)
+
+                        def process(value):
+                            if value is None:
+                                return None
+                            if isinstance(value, (list, tuple)):
+                                return [float(x) for x in value]
+                            if hasattr(value, "tolist"):
+                                return [float(x) for x in value.tolist()]
+                            res = base_proc(value) if base_proc else value
+                            return [float(x) for x in res] if res is not None else None
+
+                        return process
+
+                return dialect.type_descriptor(_SafePgVector())
             except ImportError:
                 return dialect.type_descriptor(JSONB())
         return dialect.type_descriptor(JSON())
