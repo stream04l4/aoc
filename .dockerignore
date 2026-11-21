@@ -6,3 +6,7 @@ __pycache__
 .env
 *.sqlite
 *.db
+frontend/node_modules
+backups
+.cache
+logs

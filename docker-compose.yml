@@ -12,7 +12,7 @@ services:
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
-      - aoc_pg_data:/var/lib/postgresql/data
+      - aoc_pg_data_pgvector:/var/lib/postgresql/data
     mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aoc} -d ${POSTGRES_DB:-aoc}"]
@@ -41,16 +41,17 @@ services:
       AOC_MEMORY__EMBEDDING_DIM: "512"
       AOC_RUNNER__ENABLED: ${AOC_RUNNER__ENABLED:-true}
       AOC_RUNNER__SOCKET_PATH: /run/aoc-runner/runner.sock
-      AOC_RUNNER__AUTH_TOKEN: ${AOC_RUNNER__AUTH_TOKEN:-}
     ports:
       - "127.0.0.1:9200:9200"
     volumes:
       - ./config:/app/config:ro
+      - ./frontend/dist:/app/frontend/dist:ro
+      - ./.cache/embeddings:/app/.cache/embeddings
       - /run/aoc-runner:/run/aoc-runner
       - ${AOC_WORKSPACE_ROOT:-/home/ubuntu/aoc-workspaces}:/home/ubuntu/aoc-workspaces
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    mem_limit: 768m
+    mem_limit: 1024m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9200/health || exit 1"]
       interval: 10s
@@ -77,5 +78,5 @@ services:
       start_period: 30s
 
 volumes:
-  aoc_pg_data:
+  aoc_pg_data_pgvector:
   aoc_letta_pg_data:
