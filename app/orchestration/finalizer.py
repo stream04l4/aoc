@@ -501,8 +501,11 @@ class TaskFinalizer:
                         session=s,
                     )
 
-                # Mark execution & task finalized inside the same atomic transaction
+                # Mark execution, any superseded earlier attempts, & task finalized inside the same atomic transaction
                 await self.repo.update_execution(exec_uuid, finalized_at=now, session=s)
+                await self.repo.finalize_superseded_executions(
+                    task_uuid, now, exclude_execution_id=exec_uuid, session=s
+                )
                 updated_outcome = dict(task_row.get("outcome") or {})
                 updated_outcome["goal_achieved"] = eval_res.goal_achieved
                 updated_outcome["finalized_at"] = now.isoformat()

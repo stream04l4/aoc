@@ -757,6 +757,16 @@ class AgentOrchestrator:
                     log_decision=True,
                 )
             if next_adapter is not None:
+                # V2.1 P0-1: explicitly finalize superseded retry attempt at execution level
+                superseded_ver = dict(verification.model_dump(mode="json"))
+                superseded_ver["superseded_by_retry"] = True
+                superseded_ver["superseded_at"] = utcnow().isoformat()
+                superseded_ver["next_attempt"] = attempt + 1
+                await self.repo.update_execution(
+                    exec_uuid,
+                    finalized_at=utcnow(),
+                    verification=superseded_ver,
+                )
                 await self.state_machine.transition(
                     task_uuid,
                     TaskStatus.RETRY_WAIT,

@@ -78,6 +78,29 @@ async def collect_gate_snapshot(
             metrics["unfinalized_terminal_execs"] = await _scalar(
                 "SELECT count(*) FROM agent_executions WHERE status IN ('SUCCEEDED','FAILED','TIMEOUT','CANCELLED') AND finalized_at IS NULL"
             )
+            metrics["unfinalized_terminal_tasks"] = await _scalar(
+                "SELECT count(*) FROM agent_tasks WHERE status IN ('SUCCEEDED','FAILED','CANCELLED','ABANDONED') AND finalized_at IS NULL"
+            )
+            metrics["unfinalized_execs_parent_open"] = await _scalar(
+                """
+                SELECT count(*)
+                FROM agent_executions e
+                JOIN agent_tasks t ON t.id = e.task_id
+                WHERE e.status IN ('SUCCEEDED','FAILED','TIMEOUT','CANCELLED')
+                  AND e.finalized_at IS NULL
+                  AND t.finalized_at IS NULL
+                """
+            )
+            metrics["unfinalized_execs_parent_finalized"] = await _scalar(
+                """
+                SELECT count(*)
+                FROM agent_executions e
+                JOIN agent_tasks t ON t.id = e.task_id
+                WHERE e.status IN ('SUCCEEDED','FAILED','TIMEOUT','CANCELLED')
+                  AND e.finalized_at IS NULL
+                  AND t.finalized_at IS NOT NULL
+                """
+            )
             metrics["outbox_dead_letter"] = await _scalar("SELECT count(*) FROM outbox_events WHERE status = 'dead_letter'")
             metrics["outbox_pending"] = await _scalar("SELECT count(*) FROM outbox_events WHERE status = 'pending'")
             metrics["validated_skills"] = await _scalar("SELECT count(*) FROM skill_registry WHERE status = 'VALIDATED'")
@@ -111,6 +134,7 @@ async def collect_gate_snapshot(
         "idle_cycles_ge_10": metrics["cycles_idle"] >= 10,
         "budget_throttles_ge_3": metrics["cycles_throttled"] >= 3,
         "zero_cycle_errors": metrics["cycles_error"] == 0,
+        "zero_unfinalized_terminal_tasks": metrics["unfinalized_terminal_tasks"] == 0,
         "zero_unfinalized_terminal": metrics["unfinalized_terminal_execs"] == 0,
         "zero_outbox_dead_letter": metrics["outbox_dead_letter"] == 0,
         "core_rss_le_512mb": (core_rss is None) or (core_rss <= 512.0),

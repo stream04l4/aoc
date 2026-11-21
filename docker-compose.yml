@@ -34,9 +34,14 @@ services:
         required: false
     environment:
       AOC_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-aoc}:${POSTGRES_PASSWORD:-aoc_local_dev}@aoc-postgres:5432/${POSTGRES_DB:-aoc}
+      AOC_API__HOST: 0.0.0.0
       AOC_MEMORY__LETTA_BASE_URL: http://aoc-letta:8283
+      AOC_MEMORY__EMBEDDING_ENDPOINT: http://aoc-core:9200/v1
+      AOC_MEMORY__EMBEDDING_MODEL: aoc-local-embed-512
+      AOC_MEMORY__EMBEDDING_DIM: "512"
       AOC_RUNNER__ENABLED: ${AOC_RUNNER__ENABLED:-true}
       AOC_RUNNER__SOCKET_PATH: /run/aoc-runner/runner.sock
+      AOC_RUNNER__AUTH_TOKEN: ${AOC_RUNNER__AUTH_TOKEN:-}
     ports:
       - "127.0.0.1:9200:9200"
     volumes:

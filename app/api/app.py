@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
@@ -20,7 +23,8 @@ from app.api.auth import (
     require_scope,
     validate_api_security_config,
 )
-from app.core.config import Settings, get_settings
+from app.api.control_center import create_control_center_router
+from app.core.config import PROJECT_ROOT, Settings, get_settings
 from app.core.loop import CycleInProgressError
 from app.core.runtime import OrganismRuntime
 from app.notifications.telegram import TelegramAuthError
@@ -50,7 +54,7 @@ class ControlNote(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     input: str | list[str]
-    model: str = "aoc-local-embed-1024"
+    model: str = "aoc-local-embed-512"
 
 
 class MemorySearchRequest(BaseModel):
@@ -759,16 +763,13 @@ def create_app(
         inputs = [req.input] if isinstance(req.input, str) else list(req.input)
         rt = _rt()
         model_used = req.model
-        target_dim = 1024 if "1024" in (req.model or "") else cfg.memory.embedding_dim
+        target_dim = int(cfg.memory.embedding_dim or 512)
         vecs: list[list[float]] | None = None
         if rt.embedding_service is not None:
             try:
                 res = await rt.embedding_service.provider.embed_texts(inputs, is_query=False)
                 vecs = res.vectors
                 model_used = res.model_key
-                if vecs and target_dim > len(vecs[0]):
-                    pad_len = target_dim - len(vecs[0])
-                    vecs = [v + [0.0] * pad_len for v in vecs]
             except Exception:
                 vecs = None
         if vecs is None:
@@ -786,5 +787,33 @@ def create_app(
     @app.get("/metrics")
     async def metrics(_: Principal = Depends(require_scope(SCOPE_INTERNAL))) -> Response:
         return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+
+    # V2.1 AOC Control Center read-only API router (enforces Bearer Token + SCOPE_READ)
+    app.include_router(create_control_center_router(_rt))
+
+    # Optional isolated static serving for built AOC Control Center SPA (`frontend/dist`).
+    # Strictly wrapped so missing/broken frontend assets NEVER affect API or AutonomousLoop.
+    dist_dir = Path(os.environ.get("AOC_FRONTEND_DIST", str(PROJECT_ROOT / "frontend" / "dist")))
+    if dist_dir.is_dir() and (dist_dir / "index.html").is_file():
+        assets_dir = dist_dir / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="control-center-assets")
+
+        @app.get("/", include_in_schema=False)
+        async def serve_control_center_root() -> Response:
+            try:
+                return FileResponse(str(dist_dir / "index.html"))
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail=f"Control Center UI unavailable: {exc}") from exc
+
+        @app.get("/ui/{full_path:path}", include_in_schema=False)
+        async def serve_control_center_spa(full_path: str) -> Response:
+            try:
+                candidate = (dist_dir / full_path).resolve()
+                if dist_dir.resolve() in candidate.parents and candidate.is_file():
+                    return FileResponse(str(candidate))
+                return FileResponse(str(dist_dir / "index.html"))
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail=f"Control Center UI unavailable: {exc}") from exc
 
     return app

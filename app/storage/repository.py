@@ -734,6 +734,36 @@ class StateRepository:
         async with self._use_session(session) as s:
             await s.execute(update(AgentExecutionRow).where(AgentExecutionRow.id == execution_id).values(**clean))
 
+    async def finalize_superseded_executions(
+        self,
+        task_id: uuid.UUID,
+        finalized_at: datetime,
+        *,
+        exclude_execution_id: uuid.UUID | None = None,
+        session: AsyncSession | None = None,
+    ) -> int:
+        """Mark earlier terminal attempts of a task as finalized (V2.1 P0-1).
+
+        Guarantees that when a retry supersedes an earlier attempt or when the task
+        itself reaches finalization, no terminal execution of that task remains with
+        `finalized_at IS NULL`.
+        """
+        terminal_exec_statuses = ["SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED"]
+        stmt = (
+            update(AgentExecutionRow)
+            .where(
+                AgentExecutionRow.task_id == task_id,
+                AgentExecutionRow.finalized_at.is_(None),
+                AgentExecutionRow.status.in_(terminal_exec_statuses),
+            )
+            .values(finalized_at=finalized_at, updated_at=finalized_at)
+        )
+        if exclude_execution_id is not None:
+            stmt = stmt.where(AgentExecutionRow.id != exclude_execution_id)
+        async with self._use_session(session) as s:
+            res = await s.execute(stmt)
+            return int(res.rowcount or 0)
+
     async def list_unfinalized_terminal_executions(self, limit: int = 50) -> list[dict]:
         """Return executions that reached a terminal execution status on a terminal task but are not finalized."""
         terminal_task_statuses = ["SUCCEEDED", "FAILED", "CANCELLED", "ABANDONED"]

@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -620,9 +621,37 @@ class RunnerManager:
         )
 
 
+def bind_uds_socket_0660(socket_path: str | Path) -> socket.socket:
+    """Create and bind a Unix Domain Socket with strict 0o660 permissions (never 0o666)."""
+    sock_p = Path(socket_path)
+    sock_p.parent.mkdir(parents=True, exist_ok=True)
+    if sock_p.exists():
+        try:
+            sock_p.unlink()
+        except OSError:
+            pass
+    prev_umask = os.umask(0o117)
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(sock_p))
+        os.chmod(sock_p, 0o660)
+        sock.listen(128)
+        sock.setblocking(False)
+        return sock
+    finally:
+        os.umask(prev_umask)
+
+
 def create_runner_app(manager: RunnerManager) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Defense-in-depth: ensure least-privilege 0o660 on the UDS socket if already present
+        sock_p = Path(manager.socket_path)
+        if sock_p.exists():
+            try:
+                os.chmod(sock_p, 0o660)
+            except OSError as exc:
+                logger.warning("runner.socket_chmod_failed", socket_path=manager.socket_path, error=str(exc))
         await manager.recover_from_disk()
         try:
             yield
@@ -725,7 +754,21 @@ def main() -> None:
         auth_token=auth_token,
     )
     app = create_runner_app(manager)
-    uvicorn.run(app, uds=socket_path, log_level=settings.logging.level.lower())
+    bound_sock = bind_uds_socket_0660(socket_path)
+    config = uvicorn.Config(app, log_level=settings.logging.level.lower())
+    server = uvicorn.Server(config)
+    try:
+        asyncio.run(server.serve(sockets=[bound_sock]))
+    finally:
+        try:
+            bound_sock.close()
+        except OSError:
+            pass
+        if sock_p.exists():
+            try:
+                sock_p.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
