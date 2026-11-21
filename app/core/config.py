@@ -201,6 +201,8 @@ class KernelV3Settings(BaseModel):
     mcp_in_loop_enabled: bool = True
     max_mcp_calls_per_cycle: int = 3
     world_poll_on_perceive: bool | None = None
+    # V3.0 M4: safe RSI foundation — auto-crystallize & L0/L1 auto-validate workspace skills
+    skill_auto_crystallize_enabled: bool = True
 
 
 class _YamlSource(PydanticBaseSettingsSource):

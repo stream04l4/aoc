@@ -14,8 +14,10 @@ Hard invariants (Task Book Section 5.8 & Section 7 P1-7):
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -46,7 +48,58 @@ def compute_file_sha256(path: Path) -> str:
 
 
 class SkillGovernanceError(PermissionError):
-    """Raised when a skill violates L3 governance or path isolation rules."""
+    """Raised when a skill violates L3 governance, static safety scan, or path isolation rules."""
+
+
+_FORBIDDEN_SKILL_IMPORTS = frozenset(
+    {
+        "sqlalchemy",
+        "asyncpg",
+        "psycopg",
+        "psycopg2",
+        "ctypes",
+        "socket",
+        "paramiko",
+        "fabric",
+        "docker",
+    }
+)
+
+_FORBIDDEN_SKILL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("core_source_access", re.compile(r"(/home/ubuntu/aoc/app\b|app/governance|app/core/loop)", re.IGNORECASE)),
+    ("dangerous_shell_cmd", re.compile(r"\b(sudo\s+|rm\s+-rf|chmod\s+777|systemctl\b|mkfs\b|dd\s+if=)", re.IGNORECASE)),
+    ("destructive_sql", re.compile(r"\b(DROP\s+TABLE|TRUNCATE\s+TABLE|ALTER\s+TABLE|DELETE\s+FROM\s+organism)", re.IGNORECASE)),
+    ("dynamic_exec", re.compile(r"\b(os\.system|os\.popen|eval|exec|__import__)\s*\(")),
+    ("subprocess_shell_true", re.compile(r"shell\s*=\s*True")),
+)
+
+
+def scan_skill_code_safety(code: str) -> list[str]:
+    """Deterministic AST + regex static safety scanner for candidate Skill artifacts (V3.0 M4)."""
+    violations: list[str] = []
+    text = code or ""
+    for tag, pat in _FORBIDDEN_SKILL_PATTERNS:
+        if pat.search(text):
+            violations.append(f"forbidden_pattern:{tag}")
+
+    # AST inspection for forbidden module imports & dangerous calls (when valid Python)
+    try:
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    if root in _FORBIDDEN_SKILL_IMPORTS:
+                        violations.append(f"forbidden_import:{root}")
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    root = node.module.split(".")[0]
+                    if root in _FORBIDDEN_SKILL_IMPORTS:
+                        violations.append(f"forbidden_import:{root}")
+    except SyntaxError:
+        violations.append("syntax_error:invalid_python")
+
+    return list(dict.fromkeys(violations))
 
 
 class SkillRegistryManager(SkillRegistryInterface):
@@ -99,6 +152,14 @@ class SkillRegistryManager(SkillRegistryInterface):
         ckey = str(capability_key).strip()
         if not skey or not ver or not ckey:
             raise ValueError("skill_key, version, and capability_key are required")
+
+        # V3.0 M4: Deterministic static safety scan on Python skill code before persisting
+        if artifact_code is not None and str(artifact_filename).endswith(".py"):
+            code_violations = scan_skill_code_safety(artifact_code)
+            if code_violations:
+                raise SkillGovernanceError(
+                    f"Skill '{skey}@{ver}' rejected by static safety scanner: {', '.join(code_violations)}"
+                )
 
         # Governance check (L0-L3): skills can NEVER bypass policy
         if self.governance is not None:
@@ -190,6 +251,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         skill_id: uuid.UUID | str,
         *,
         timeout_seconds: float | None = None,
+        approved_l2_promotion: bool = False,
     ) -> dict[str, Any]:
         """Execute skill's assertion test_spec in an isolated temp workspace.
 
@@ -275,7 +337,10 @@ class SkillRegistryManager(SkillRegistryInterface):
                     if not test_code:
                         raise ValueError("test_spec.code is empty")
                     runner_file = tmp_path / "_test_skill.py"
-                    runner_file.write_text(test_code, encoding="utf-8")
+                    # Allow importing sibling artifact in the isolated tmpdir while keeping `python -I`
+                    # completely isolated from user site-packages, PYTHONPATH, and AOC Core source.
+                    preamble = f"import sys as _aoc_sys; _aoc_sys.path.insert(0, {str(tmp_path)!r})\n"
+                    runner_file.write_text(preamble + test_code, encoding="utf-8")
                     argv = [sys.executable, "-I", str(runner_file)]
                 else:
                     raw_argv = test_spec.get("argv")
@@ -356,11 +421,25 @@ class SkillRegistryManager(SkillRegistryInterface):
             skill_id=sid, passed=passed, checks=checks, stdout_excerpt=excerpt
         )
 
-        new_status = SkillStatus.VALIDATED.value if passed else SkillStatus.DRAFT.value
+        # V3.0 M4 Policy (Joel Decision #1):
+        #   - L0 / L1 skills passing static scan + isolated sandbox assertions + SHA-256 auto-promote to VALIDATED
+        #   - L2 / L3 skills stay DRAFT until explicitly approved (approved_l2_promotion=True for L2; L3 never)
+        perm_lvl = str(skill.get("permission_level") or PermissionLevel.L1.value).upper()
+        awaiting_approval = False
+        if passed:
+            if perm_lvl in {PermissionLevel.L0.value, PermissionLevel.L1.value}:
+                new_status = SkillStatus.VALIDATED.value
+            elif perm_lvl == PermissionLevel.L2.value and approved_l2_promotion:
+                new_status = SkillStatus.VALIDATED.value
+            else:
+                new_status = SkillStatus.DRAFT.value
+                awaiting_approval = True
+        else:
+            new_status = SkillStatus.DRAFT.value
         await self.repo.update_skill_status(sid, new_status)
 
         self_model_update: dict[str, Any] | None = None
-        if passed and self.self_model is not None:
+        if new_status == SkillStatus.VALIDATED.value and self.self_model is not None:
             try:
                 self_model_update = await self.self_model.on_skill_validated(
                     capability_key=skill["capability_key"],
@@ -377,9 +456,127 @@ class SkillRegistryManager(SkillRegistryInterface):
             "capability_key": skill["capability_key"],
             "status": new_status,
             "passed": passed,
+            "awaiting_human_approval": awaiting_approval,
             "validation": val_row,
             "self_model_version": (self_model_update or {}).get("version"),
         }
+
+    async def revoke_skill(self, skill_id: uuid.UUID | str, reason: str = "revoked") -> dict[str, Any]:
+        """Deprecate/revoke a skill cleanly so it is immediately excluded from reuse."""
+        sid = uuid.UUID(str(skill_id))
+        sk = await self.repo.get_skill(sid)
+        if sk is None:
+            raise ValueError(f"Skill {skill_id} not found")
+        await self.repo.update_skill_status(sid, SkillStatus.DEPRECATED.value)
+        await self.repo.log_event(
+            "skill.revoked",
+            message=f"Revoked skill {sk['skill_key']}@{sk['version']}: {reason}",
+            payload={"skill_id": str(sid), "skill_key": sk["skill_key"], "version": sk["version"], "reason": reason},
+        )
+        return {"skill_id": str(sid), "skill_key": sk["skill_key"], "status": SkillStatus.DEPRECATED.value, "reason": reason}
+
+    async def list_reusable_skills_for_context(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Return integrity-verified VALIDATED skills for injection into CognitiveContext."""
+        rows = await self.list_skills_with_integrity(status=SkillStatus.VALIDATED.value, limit=max(limit * 2, 16))
+        reusable: list[dict[str, Any]] = []
+        for sk in rows:
+            if not sk.get("integrity_ok"):
+                continue
+            reusable.append(
+                {
+                    "skill_key": sk["skill_key"],
+                    "version": sk["version"],
+                    "capability_key": sk["capability_key"],
+                    "description": str(sk.get("description") or "")[:240],
+                    "artifact_path": sk.get("artifact_path"),
+                    "steps": list(sk.get("steps") or [])[:5],
+                    "permission_level": sk.get("permission_level", "L1"),
+                }
+            )
+            if len(reusable) >= limit:
+                break
+        return reusable
+
+    async def crystallize_from_workspace(
+        self,
+        *,
+        workspace: str,
+        skill_key: str,
+        capability_key: str,
+        description: str,
+        permission_level: str = PermissionLevel.L1.value,
+        source_task_id: uuid.UUID | str | None = None,
+        source_execution_id: uuid.UUID | str | None = None,
+    ) -> dict[str, Any] | None:
+        """Auto-extract a candidate Skill + isolated assertion test from a verified task workspace (V3.0 M4).
+
+        Convention: external Agent writes `skill.py` (or a single non-test `*.py` file) AND
+        `test_skill.py` (or `test_*.py`) inside its isolated task workspace.
+        Runs static safety scan -> registers DRAFT -> executes isolated sandbox validation ->
+        L0/L1 auto-promotes to VALIDATED without human approval.
+        """
+        ws = Path(workspace)
+        if not ws.exists() or not ws.is_dir():
+            return None
+
+        # Locate artifact script and matching assertion test inside workspace
+        art_file = ws / "skill.py"
+        if not art_file.is_file():
+            py_candidates = [
+                p for p in sorted(ws.glob("*.py"))
+                if not p.name.startswith("test_") and not p.name.startswith("_") and not p.name.startswith(".aoc_")
+            ]
+            art_file = py_candidates[0] if len(py_candidates) == 1 else None  # type: ignore[assignment]
+
+        test_file = ws / "test_skill.py"
+        if not test_file.is_file():
+            test_candidates = sorted(ws.glob("test_*.py"))
+            test_file = test_candidates[0] if test_candidates else None  # type: ignore[assignment]
+
+        if art_file is None or test_file is None:
+            return None
+
+        art_code = art_file.read_text(encoding="utf-8", errors="replace")
+        test_code = test_file.read_text(encoding="utf-8", errors="replace")
+        if not art_code.strip() or not test_code.strip():
+            return None
+
+        # Static safety scan on BOTH artifact and test code
+        test_violations = scan_skill_code_safety(test_code)
+        if test_violations:
+            logger.warning("skill.crystallize_test_unsafe", skill_key=skill_key, violations=test_violations)
+            return {
+                "crystallized": False,
+                "rejected_unsafe": True,
+                "violations": test_violations,
+            }
+
+        slug = re.sub(r"[^a-z0-9_]+", "_", skill_key.strip().lower()).strip("_")[:64] or "skill_artifact"
+        try:
+            reg_row = await self.register_skill(
+                skill_key=slug,
+                version="1.0.0",
+                capability_key=capability_key[:120] or "coding",
+                description=description[:500],
+                artifact_code=art_code,
+                artifact_filename=art_file.name,
+                test_spec={"kind": "python_assertions", "code": test_code, "expected_exit_code": 0},
+                permission_level=permission_level,
+                source_task_id=source_task_id,
+                source_execution_id=source_execution_id,
+            )
+            val_res = await self.validate_skill(reg_row["id"])
+            return {
+                "crystallized": True,
+                "skill_id": reg_row["id"],
+                "skill_key": slug,
+                "status": val_res["status"],
+                "passed": val_res["passed"],
+                "awaiting_human_approval": val_res.get("awaiting_human_approval", False),
+            }
+        except SkillGovernanceError as exc:
+            logger.warning("skill.crystallize_governance_blocked", skill_key=slug, error=str(exc))
+            return {"crystallized": False, "rejected_unsafe": True, "error": str(exc)}
 
     async def count_validated_skills(
         self,

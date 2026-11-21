@@ -84,6 +84,7 @@ class TaskFinalizer:
         info_gain_evaluator: InformationGainEvaluator | None = None,
         self_model: Any = None,
         skill_registry: Any = None,
+        skill_auto_crystallize: bool = True,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -99,6 +100,7 @@ class TaskFinalizer:
         self.info_gain_evaluator = info_gain_evaluator or InformationGainEvaluator()
         self.self_model = self_model
         self.skill_registry = skill_registry
+        self.skill_auto_crystallize = bool(skill_auto_crystallize)
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -347,6 +349,8 @@ class TaskFinalizer:
             now = utcnow()
             memory_ids: list[str] = []
             memory_writes: list[dict[str, Any]] = []
+            effective_cap_key: str = "general_task"
+            updated_outcome: dict[str, Any] = dict(task_row.get("outcome") or {})
 
             async with self.repo.transaction() as s:
                 # Double-check inbox inside transaction for strict concurrent idempotency
@@ -490,16 +494,21 @@ class TaskFinalizer:
                         if (selected_drive == DriveType.REPRODUCTION.value and 0 < len(raw_rel) <= 64 and " " not in raw_rel)
                         else None
                     )
+                    req_cap = str(
+                        plan_dict.get("required_capability") or task_row.get("required_capability") or ""
+                    ).strip()
+                    explicit_cap = req_cap if (req_cap and req_cap != "general_task") else None
                     cap_key = (
-                        short_skill
-                        or plan_dict.get("required_capability")
-                        or task_row.get("required_capability")
+                        explicit_cap
+                        or short_skill
                         or short_rel
+                        or req_cap
                         or "general_task"
                     )
+                    effective_cap_key = str(cap_key)[:120]
                     wall_sec = (exec_row.get("resource_usage") or {}).get("wall_seconds")
                     self_model_evidence = await self.self_model.record_execution_evidence(
-                        capability_key=str(cap_key)[:120],
+                        capability_key=effective_cap_key,
                         execution_id=exec_uuid,
                         task_id=task_uuid,
                         verified_success=bool(verification_passed and eval_res.goal_achieved),
@@ -516,7 +525,6 @@ class TaskFinalizer:
                 await self.repo.finalize_superseded_executions(
                     task_uuid, now, exclude_execution_id=exec_uuid, session=s
                 )
-                updated_outcome = dict(task_row.get("outcome") or {})
                 updated_outcome["goal_achieved"] = eval_res.goal_achieved
                 updated_outcome["finalized_at"] = now.isoformat()
                 if info_gain_details:
@@ -529,6 +537,44 @@ class TaskFinalizer:
                         "maturity_status": (self_model_evidence.get("profile") or {}).get("maturity_status"),
                     }
                 await self.repo.update_task(task_uuid, finalized_at=now, outcome=updated_outcome, session=s)
+
+            # V3.0 M4: Fault-isolated Skill Auto-Crystallization outside DB transaction
+            # Runs before post-drive recalculation so newly auto-promoted L0/L1 VALIDATED skills
+            # immediately reflect in ReproductionDriveEvaluator's validated_skill_count.
+            skill_crystallized: dict[str, Any] | None = None
+            if (
+                eval_res.goal_achieved
+                and verification_passed
+                and self.skill_registry is not None
+                and self.skill_auto_crystallize
+                and task_row.get("workspace")
+            ):
+                try:
+                    raw_skey = (
+                        eval_res.acquired_skill
+                        or goal_dict.get("related_key")
+                        or goal_dict.get("title")
+                        or "skill_artifact"
+                    )
+                    cryst_cap = (
+                        effective_cap_key
+                        if effective_cap_key and effective_cap_key != "general_task"
+                        else (task_row.get("required_capability") or "coding")
+                    )
+                    skill_crystallized = await self.skill_registry.crystallize_from_workspace(
+                        workspace=str(task_row["workspace"]),
+                        skill_key=str(raw_skey),
+                        capability_key=str(cryst_cap),
+                        description=str(eval_res.summary or goal_dict.get("description") or task_row["objective"]),
+                        permission_level=str(task_row.get("permission_level") or "L1"),
+                        source_task_id=task_uuid,
+                        source_execution_id=exec_uuid,
+                    )
+                    if skill_crystallized is not None:
+                        updated_outcome["skill_crystallized"] = skill_crystallized
+                        await self.repo.update_task(task_uuid, outcome=updated_outcome)
+                except Exception as exc:
+                    logger.warning("finalizer.skill_crystallize_degraded", execution_id=exec_key, error=str(exc))
 
             # Notify in-memory learning tracker (used by CuriosityDriveEvaluator)
             info_gain = 0.0
@@ -594,6 +640,7 @@ class TaskFinalizer:
                 **eval_res.model_dump(mode="json"),
                 **expected_vs_actual,
                 "memory_writes": memory_writes,
+                "skill_crystallized": skill_crystallized,
                 "finalized_at": now.isoformat(),
             }
             if cycle_uuid is not None:

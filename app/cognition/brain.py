@@ -114,8 +114,10 @@ class CognitionBrain(BrainInterface):
             "available agents, and remaining budget, propose ONE concrete, bounded, achievable goal "
             "that addresses the selected drive. "
             "If nothing worthwhile or safe can be done, set should_act=false. "
-            "For reproduction drive in V1.0, ONLY propose virtual capability-building or skill research "
-            "goals — NEVER creating servers, cloning instances, or elevating permissions. "
+            "For reproduction drive, ONLY propose virtual capability-building, skill research, "
+            "or low-risk L1 isolated-workspace Python coding/utility tasks (e.g. creating a reusable "
+            "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
+            "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
             "Set related_key to the relevant topic/capability key if applicable. "
             + _UNTRUSTED_DATA_RULE
         )
@@ -149,8 +151,12 @@ class CognitionBrain(BrainInterface):
             "verifiable task for an available external AI agent. "
             "Rules:\n"
             "- Pick assigned_agent strictly from available_agents (prefer enabled & healthy agents).\n"
-            "- Use the minimum permission_level needed: L0 (read-only) or L1 (write inside isolated workspace). "
-            "NEVER request L3.\n"
+            "- Use the minimum permission_level needed: L0 (STRICTLY read-only: NEVER ask to write/create/save "
+            "files or use file_exists verification under L0!) or L1 (workspace-write: use L1 whenever the task "
+            "writes result.md, skill.py, tests, or any file inside the isolated workspace). NEVER request L3.\n"
+            "- Reuse relevant validated_skills when applicable instead of rebuilding from scratch.\n"
+            "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
+            "from available_tools.\n"
             "- Include concrete success_criteria and at least one deterministic verification check "
             "(e.g. kind='non_empty_output' or kind='file_exists' with target='result.md' or kind='min_output_chars').\n"
             "- Keep timeout_seconds realistic (60-300s) and within budget.\n"
@@ -163,6 +169,7 @@ class CognitionBrain(BrainInterface):
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
             "available_tools": context.available_tools,
+            "validated_skills": context.validated_skills[:8],
             "budget_remaining": context.budget_remaining,
             "memories": context.memories[:8],
         }

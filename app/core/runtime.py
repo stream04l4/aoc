@@ -361,6 +361,7 @@ class OrganismRuntime:
             info_gain_evaluator=self.info_gain_evaluator,
             self_model=self.self_model,
             skill_registry=self.skill_registry,
+            skill_auto_crystallize=self.settings.kernel_v3.skill_auto_crystallize_enabled,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:

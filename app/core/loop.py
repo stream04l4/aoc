@@ -153,6 +153,7 @@ class AutonomousLoop:
             on_learning=self._record_learning_signal,
             self_model=self_model,
             skill_registry=skill_registry,
+            skill_auto_crystallize=kv3.skill_auto_crystallize_enabled,
         )
 
     def _record_learning_signal(self, when: datetime, gain: float) -> None:
@@ -464,6 +465,12 @@ class AutonomousLoop:
 
             # ── 7. GOAL GENERATION ──────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="GOAL_GENERATION")
+            reusable_skills: list[dict[str, Any]] = []
+            if self.skill_registry is not None:
+                try:
+                    reusable_skills = await self.skill_registry.list_reusable_skills_for_context(limit=8)
+                except Exception as exc:
+                    logger.warning("cycle.skill_context_degraded", cycle_id=str(cycle_id), error=str(exc))
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -476,6 +483,7 @@ class AutonomousLoop:
                     if (self.mcp_manager is not None and self.settings.kernel_v3.mcp_in_loop_enabled)
                     else []
                 ),
+                validated_skills=reusable_skills,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
