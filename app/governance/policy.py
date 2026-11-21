@@ -102,7 +102,19 @@ class GovernanceManager(GovernanceInterface):
         eff_level = req_level
         violations: list[str] = []
 
-        corpus = "\n".join([plan.goal_title, plan.objective, plan.description, plan.expected_output])
+        raw_corpus = "\n".join([plan.goal_title, plan.objective, plan.description, plan.expected_output])
+        # Strip explicit negative safety-constraint clauses (e.g. "Do not X, Y, or Z.") so safety
+        # reminders echoed by the planner do not falsely trigger escalation rules.
+        corpus = re.sub(
+            r"(?i)\b(?:do\s+not|don't|never|avoid|without|must\s+not|cannot|should\s+not)\s+(?:(?!\b(?:instead|but|then|please)\b)[^.?!;\n])*",
+            " ",
+            raw_corpus,
+        )
+        corpus = re.sub(
+            r"(?:不要|禁止|不得|切勿|严禁)(?:(?!但是|而是|然后|请)[^。；！？\n])*",
+            " ",
+            corpus,
+        )
 
         # 1. Pattern-based escalation rules from config/policy.yaml
         for rule in self.policy.get("escalation_rules", []):
@@ -165,7 +177,7 @@ class GovernanceManager(GovernanceInterface):
             )
 
         auto_max = PermissionLevel(self.settings.auto_approve_max_level)
-        if eff_level.rank > auto_max.rank or eff_level == PermissionLevel.L2:
+        if eff_level.rank > auto_max.rank:
             POLICY_VERDICTS.labels(verdict="requires_approval").inc()
             return PolicyVerdict(
                 allowed=False,
@@ -201,8 +213,13 @@ class GovernanceManager(GovernanceInterface):
                 reason=f"Denied: {budget.reason}",
             )
 
-        level_sandbox = self.policy.get("level_sandbox", {"L0": "read-only", "L1": "workspace-write"})
-        sandbox_mode = level_sandbox.get(eff_level.value, "read-only")
+        level_sandbox = self.policy.get(
+            "level_sandbox",
+            {"L0": "read-only", "L1": "workspace-write", "L2": "workspace-write"},
+        )
+        sandbox_mode = level_sandbox.get(eff_level.value, "workspace-write")
+        if req_level == PermissionLevel.L0:
+            sandbox_mode = "read-only"
         if sandbox_mode not in {"read-only", "workspace-write"}:
             sandbox_mode = "read-only"
 

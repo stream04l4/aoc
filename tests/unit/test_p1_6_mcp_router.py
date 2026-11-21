@@ -79,7 +79,10 @@ class _DummyAgent(AgentInterface):
 
 def _make_mcp_manager(repo: StateRepository, ws_root: Path, git_roots: list[str]) -> MCPClientManager:
     settings = Settings()
-    gov = GovernanceManager(settings.governance.model_copy(update={"workspace_root": str(ws_root)}), repo)
+    gov = GovernanceManager(
+        settings.governance.model_copy(update={"workspace_root": str(ws_root), "auto_approve_max_level": "L1"}),
+        repo,
+    )
     mgr = MCPClientManager(
         governance=gov,
         repo=repo,

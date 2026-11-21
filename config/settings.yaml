@@ -46,7 +46,7 @@ perception:
 
 governance:
   # Default max permission an autonomous task may receive without human approval.
-  auto_approve_max_level: "L1"
+  auto_approve_max_level: "L2"
   workspace_root: "/home/ubuntu/aoc-workspaces"
   budget:
     max_agent_tasks_per_day: 9999

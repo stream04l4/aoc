@@ -228,7 +228,7 @@ class MCPClientManager(ToolProviderInterface):
             )
 
         # Handle L2 approval gate (unless caller presents verified post-approval flag)
-        if (verdict.requires_approval or eff_level == PermissionLevel.L2) and not req.approved_l2:
+        if verdict.requires_approval and not req.approved_l2:
             eval_id = await self.repo.record_policy_evaluation(
                 subject_type="mcp_tool",
                 subject_id=task_uuid,

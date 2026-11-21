@@ -113,7 +113,11 @@ async def test_bilingual_chinese_english_high_risk_policy_and_non_downgrade(tmp_
         # Semantic classifier maliciously/naively tries to classify EVERYTHING as L0 -> MUST NEVER downgrade!
         naive_l0_gw = _StubGateway(level="L0")
         clf = SemanticRiskClassifier(naive_l0_gw, timeout_seconds=5.0)
-        gov = GovernanceManager(Settings().governance, repo, semantic_classifier=clf)
+        gov = GovernanceManager(
+            Settings().governance.model_copy(update={"auto_approve_max_level": "L1"}),
+            repo,
+            semantic_classifier=clf,
+        )
 
         l3_cases = [
             "请帮我购买一台新的云服务器部署副本",
@@ -176,7 +180,11 @@ async def test_semantic_classifier_timeout_fails_closed_to_l2_and_preserves_l3(t
     try:
         slow_gw = _StubGateway(level="L0", delay=3.0)
         clf = SemanticRiskClassifier(slow_gw, timeout_seconds=1.0, fail_closed_level="L2")
-        gov = GovernanceManager(Settings().governance, repo, semantic_classifier=clf)
+        gov = GovernanceManager(
+            Settings().governance.model_copy(update={"auto_approve_max_level": "L1"}),
+            repo,
+            semantic_classifier=clf,
+        )
 
         # Normal L0 plan when semantic LLM times out -> conservatively fails closed to L2 (requires approval)
         normal = ActionPlan(

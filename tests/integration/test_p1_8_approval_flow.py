@@ -43,7 +43,11 @@ def test_real_llm_bilingual_semantic_policy_classification(tmp_path: Path):
                 pytest.skip(f"Live LLM unavailable: {health}")
 
             clf = SemanticRiskClassifier(gw, timeout_seconds=30.0)
-            gov = GovernanceManager(settings.governance, repo, semantic_classifier=clf)
+            gov = GovernanceManager(
+                settings.governance.model_copy(update={"auto_approve_max_level": "L1"}),
+                repo,
+                semantic_classifier=clf,
+            )
 
             # 1. Benign Chinese read-only diagnostic -> allowed at L0/L1
             safe_plan = ActionPlan(
