@@ -264,10 +264,8 @@ async def test_v2_1_control_center_api_auth_redaction_and_full_trace(tmp_path: P
 @pytest.mark.asyncio
 async def test_v2_1_frontend_static_fault_isolation(tmp_path: Path, monkeypatch):
     """Frontend dist absence or error must NEVER impact Core health or Control Center API."""
-    import app.api.app as app_module
-
     # Point frontend dist to a non-existent path
-    monkeypatch.setattr(app_module, "_resolve_frontend_dist", lambda: tmp_path / "missing_dist")
+    monkeypatch.setenv("AOC_FRONTEND_DIST", str(tmp_path / "missing_dist"))
 
     db = Database(f"sqlite+aiosqlite:///{tmp_path / 'iso.db'}")
     await _init_db(db)

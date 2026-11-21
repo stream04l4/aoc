@@ -362,7 +362,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "drive_type": d.drive_type,
                     "phase": d.phase,
                     "satisfaction": round(float(d.satisfaction), 4),
-                    "priority": round(float(d.priority), 4),
+                    "priority": round(float(d.deficit) * (0.5 + 0.5 * float(d.urgency)), 4),
                 }
                 for d in dh_rows
             ],
@@ -464,8 +464,8 @@ def create_control_center_router(get_runtime) -> APIRouter:
                         "agent_id": a.agent_id,
                         "name": a.name,
                         "enabled": a.enabled,
-                        "healthy": a.healthy,
-                        "version": a.version,
+                        "healthy": bool((a.probe or {}).get("available", False)),
+                        "version": (a.probe or {}).get("version"),
                     }
                     for a in agents
                 ],
@@ -968,7 +968,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "drive_type": d.drive_type,
                     "phase": d.phase,
                     "satisfaction": round(float(d.satisfaction), 4),
-                    "priority": round(float(d.priority), 4),
+                    "priority": round(float(d.deficit) * (0.5 + 0.5 * float(d.urgency)), 4),
                     "dimensions": d.dimensions,
                 }
                 for d in history_rows
@@ -1097,13 +1097,13 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "name": a.name,
                     "agent_type": a.agent_type,
                     "enabled": a.enabled,
-                    "healthy": a.healthy,
+                    "healthy": bool((a.probe or {}).get("available", False)),
                     "experimental": a.experimental,
-                    "version": a.version,
+                    "version": (a.probe or {}).get("version"),
                     "capabilities": a.capabilities,
                     "supported_modes": a.supported_modes,
                     "stats": a.stats,
-                    "last_probe_at": _iso(a.last_probe_at),
+                    "last_probe_at": _iso(a.updated_at),
                 }
                 for a in agents
             ],
@@ -1669,7 +1669,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "agent_id": a.agent_id,
                     "name": a.name,
                     "enabled": a.enabled,
-                    "healthy": a.healthy,
+                    "healthy": bool((a.probe or {}).get("available", False)),
                     "stats": a.stats,
                 }
                 for a in agents
