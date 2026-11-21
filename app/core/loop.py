@@ -61,8 +61,10 @@ from app.orchestration.finalizer import TaskFinalizer
 from app.orchestration.orchestrator import AgentOrchestrator, compute_params_digest, compute_plan_hash
 from app.perception.interfaces import Observation, utcnow
 from app.perception.manager import SensorManager
+from app.perception.world.security import detect_prompt_injection, sanitize_external_text, wrap_untrusted_world_event
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository, day_start
+from app.tools.interfaces import ToolCallRequest
 
 logger = get_logger("aoc.loop")
 
@@ -92,6 +94,8 @@ class AutonomousLoop:
         self_model: Any = None,
         skill_registry: Any = None,
         affect: Any = None,
+        mcp_manager: Any = None,
+        world_pipeline: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -110,6 +114,8 @@ class AutonomousLoop:
         self.self_model = self_model
         self.skill_registry = skill_registry
         self.affect = affect
+        self.mcp_manager = mcp_manager
+        self.world_pipeline = world_pipeline
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
 
@@ -465,6 +471,11 @@ class AutonomousLoop:
                 assessment=assessment,
                 memories=mem_dicts,
                 available_agents=self.registry.summary_for_brain(),
+                available_tools=(
+                    self.mcp_manager.summary_for_brain()
+                    if (self.mcp_manager is not None and self.settings.kernel_v3.mcp_in_loop_enabled)
+                    else []
+                ),
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -749,7 +760,18 @@ class AutonomousLoop:
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
-            # ── 10. AGENT DISPATCH ──────────────────────────────────────────
+            # ── 10. BOUNDED L0 MCP PREFETCH + AGENT DISPATCH ────────────────
+            if (
+                self.mcp_manager is not None
+                and self.settings.kernel_v3.mcp_in_loop_enabled
+                and plan.mcp_prefetch_calls
+            ):
+                mcp_summary, enriched_desc = await self._run_mcp_prefetch(cycle_id=cycle_id, plan=plan)
+                if mcp_summary:
+                    state_changes["mcp_prefetch"] = mcp_summary
+                if enriched_desc:
+                    plan = plan.model_copy(update={"description": enriched_desc})
+
             await self.repo.update_cycle(cycle_id, phase="AGENT_DISPATCH")
             dispatch_info = await self.orchestrator.submit_plan(
                 plan=plan, verdict=verdict, goal_id=goal_id, plan_id=plan_id, cycle_id=cycle_id
@@ -997,6 +1019,123 @@ class AutonomousLoop:
                 rationale="Deterministic emergency fallback plan",
             )
         return ActionPlan(should_execute=False, rationale="LLM unavailable for planning")
+
+    async def _run_mcp_prefetch(
+        self,
+        *,
+        cycle_id: uuid.UUID,
+        plan: ActionPlan,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Execute strictly bounded L0 read-only MCP prefetch calls inside AutonomousLoop (V3.0 M3).
+
+        Hard guarantees:
+          - Never bypasses MCPClientManager Governance / policy_evaluations / resource_usage.
+          - Strictly refuses any L1+ / mutating tool call during autonomous prefetch.
+          - Quarantines Prompt Injection payloads; wraps clean results as untrusted external data.
+          - Fault-isolated: timeouts or server crashes NEVER block or fail the cycle.
+        """
+        if self.mcp_manager is None or not plan.mcp_prefetch_calls:
+            return [], None
+
+        max_calls = max(1, int(self.settings.kernel_v3.max_mcp_calls_per_cycle))
+        audit_records: list[dict[str, Any]] = []
+        clean_excerpts: list[str] = []
+
+        for raw_call in list(plan.mcp_prefetch_calls)[:max_calls]:
+            if not isinstance(raw_call, dict):
+                continue
+            tool_name = str(raw_call.get("tool_name") or "").strip()
+            args = dict(raw_call.get("arguments") or {}) if isinstance(raw_call.get("arguments"), dict) else {}
+            if not tool_name:
+                continue
+
+            # Hard L0 read-only gate for autonomous prefetch
+            spec = self.mcp_manager.get_tool(tool_name)
+            if spec is not None:
+                action_val = str(args.get("action") or "").strip().lower()
+                eff_req_level = spec.action_levels.get(action_val, spec.permission_level)
+                if str(eff_req_level).upper() != PermissionLevel.L0.value:
+                    audit_records.append(
+                        {
+                            "tool_name": tool_name,
+                            "ok": False,
+                            "blocked": True,
+                            "reason": f"Autonomous MCP prefetch allows L0 read-only only (got {eff_req_level})",
+                        }
+                    )
+                    await self.repo.log_event(
+                        "loop.mcp_prefetch_blocked",
+                        message=f"Blocked non-L0 MCP prefetch call {tool_name} ({eff_req_level})",
+                        payload={"tool_name": tool_name, "requested_level": eff_req_level},
+                        cycle_id=cycle_id,
+                    )
+                    continue
+
+            try:
+                res = await self.mcp_manager.invoke(
+                    ToolCallRequest(
+                        tool_name=tool_name,
+                        arguments=args,
+                        cycle_id=str(cycle_id),
+                        workspace=self.settings.governance.workspace_root,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("loop.mcp_prefetch_degraded", cycle_id=str(cycle_id), tool=tool_name, error=str(exc))
+                audit_records.append({"tool_name": tool_name, "ok": False, "error": str(exc)[:300]})
+                continue
+
+            if not res.ok:
+                audit_records.append(
+                    {
+                        "tool_name": tool_name,
+                        "ok": False,
+                        "denied": res.denied,
+                        "requires_approval": res.requires_approval,
+                        "error": res.error,
+                    }
+                )
+                continue
+
+            # Sanitize & guard against Prompt Injection before surfacing to external Agent
+            raw_text = str(res.output) if not isinstance(res.output, str) else res.output
+            clean_text = sanitize_external_text(raw_text, max_chars=2400)
+            inj_flags = detect_prompt_injection(clean_text)
+            if inj_flags:
+                audit_records.append(
+                    {
+                        "tool_name": tool_name,
+                        "ok": False,
+                        "quarantined_injection": True,
+                        "injection_flags": inj_flags,
+                    }
+                )
+                await self.repo.log_event(
+                    "loop.mcp_injection_quarantined",
+                    message=f"Quarantined prompt injection in MCP output from {tool_name}",
+                    payload={"tool_name": tool_name, "flags": inj_flags},
+                    cycle_id=cycle_id,
+                )
+                continue
+
+            wrapped = wrap_untrusted_world_event(f"mcp:{tool_name}", f"MCP prefetch ({tool_name})", clean_text)
+            clean_excerpts.append(wrapped)
+            audit_records.append(
+                {
+                    "tool_name": tool_name,
+                    "ok": True,
+                    "latency_ms": res.latency_ms,
+                    "truncated": res.truncated,
+                    "policy_evaluation_id": res.policy_evaluation_id,
+                }
+            )
+
+        enriched_desc: str | None = None
+        if clean_excerpts:
+            base_desc = (plan.description or "").strip()
+            block = "\n\n".join(clean_excerpts)
+            enriched_desc = f"{base_desc}\n\n[Read-Only MCP Prefetched Context]\n{block}".strip()
+        return audit_records, enriched_desc
 
     async def _finalize_cycle(
         self,

@@ -61,6 +61,69 @@ class WorldEventPipeline:
     def register_sensor(self, sensor: DigitalWorldSensor) -> None:
         self._sensors[sensor.sensor_type] = sensor
 
+    async def register_dynamic_source(
+        self,
+        *,
+        source_id: str,
+        sensor_type: str,
+        name: str,
+        config: dict[str, Any],
+        reliability_score: float = 0.75,
+        poll_interval_seconds: int = 3600,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Guarded extension port for dynamically adding external perception sources (V3.0 M3+).
+
+        Enforces strict allowlist validation for RSS/Web domains and Git roots so future
+        curiosity-driven topic discovery can never bypass SSRF or filesystem containment.
+        """
+        from urllib.parse import urlparse
+        from pathlib import Path
+
+        stype = str(sensor_type or "").strip().lower()
+        if stype not in {"rss", "web", "git"}:
+            raise ValueError(f"Unsupported dynamic sensor_type '{stype}'")
+
+        if stype in {"rss", "web"}:
+            url = str(config.get("url") or "").strip()
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not host:
+                raise PermissionError(f"Dynamic {stype} source requires https URL with valid host")
+            allowed_low = {d.lower() for d in self.allowed_domains}
+            if allowed_low and host not in allowed_low:
+                raise PermissionError(f"Domain '{host}' is not in allowed_domains allowlist")
+        elif stype == "git":
+            repo_raw = str(config.get("repo_path") or "").strip()
+            if not repo_raw:
+                raise ValueError("Dynamic git source requires repo_path")
+            resolved = Path(repo_raw).resolve()
+            if self.allowed_git_roots and not any(
+                resolved == Path(r).resolve() or Path(r).resolve() in resolved.parents
+                for r in self.allowed_git_roots
+            ):
+                raise PermissionError(f"Git root '{resolved}' is outside allowed_git_roots")
+
+        src = WorldSourceConfig(
+            source_id=source_id.strip()[:120],
+            sensor_type=stype,
+            name=name.strip()[:240],
+            config=dict(config),
+            reliability_score=clamp01(reliability_score),
+            poll_interval_seconds=max(300, int(poll_interval_seconds)),
+            enabled=bool(enabled),
+        )
+        await self.repo.upsert_world_source(
+            source_id=src.source_id,
+            sensor_type=src.sensor_type,
+            name=src.name,
+            config=src.config,
+            reliability_score=src.reliability_score,
+            poll_interval_seconds=src.poll_interval_seconds,
+            enabled=src.enabled,
+        )
+        return src.model_dump(mode="json")
+
     async def sync_configured_sources(self, sources_cfg: Sequence[dict[str, Any]]) -> int:
         """Seed/update world_event_sources from config/sensors.yaml without overwriting operator enable/disable."""
         count = 0

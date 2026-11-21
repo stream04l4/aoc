@@ -81,6 +81,8 @@ class ActionPlan(BaseModel):
     permission_level: str = PermissionLevel.L0.value
     success_criteria: list[str] = Field(default_factory=list)
     verification: list[VerificationSpec] = Field(default_factory=list)
+    # V3.0 M3: optional bounded L0 read-only MCP prefetch tool calls before external Agent dispatch
+    mcp_prefetch_calls: list[dict[str, Any]] = Field(default_factory=list)
     # Advisory prediction ONLY — never directly updates drive satisfaction (task book 9.1)
     expected_improvement: float = 0.0
     rationale: str = ""

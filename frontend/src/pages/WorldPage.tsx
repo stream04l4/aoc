@@ -68,6 +68,45 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
         </div>
       </Card>
 
+      {/* V3.0 M3 External MCP ToolProvider Card (fused into World page, 0 new menus) */}
+      {data.mcp_tools && (
+        <Card>
+          <CardHeader
+            title="外接 MCP 只读工具口与调用审计（ToolProvider）"
+            subtitle={`主循环接入：${data.mcp_tools.in_loop_enabled ? '已启用' : '已关闭'} · 单周期上限 ${data.mcp_tools.max_calls_per_cycle} 次 · 累计治理审计 ${data.mcp_tools.policy_evals_count} 次`}
+            action={<StatusBadge value={data.mcp_tools.in_loop_enabled ? 'ENABLED' : 'DISABLED'} />}
+          />
+          <div className="p-4 space-y-3">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              {(data.mcp_tools.registered || []).map((t: any) => (
+                <div key={t.tool_name} className="rounded-xl border border-slate-200/80 p-3 space-y-1.5 dark:border-slate-800">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold font-mono truncate">{t.tool_name}</span>
+                    <StatusBadge value={t.permission_level || 'L0'} />
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-400">{t.server_name}</div>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-300 line-clamp-2">{t.description}</p>
+                </div>
+              ))}
+            </div>
+            {(data.mcp_tools.recent_invocations || []).length > 0 && (
+              <div className="divide-y divide-slate-200/70 rounded-lg border border-slate-200/70 dark:divide-slate-800 dark:border-slate-800">
+                {data.mcp_tools.recent_invocations.slice(0, 8).map((inv: any) => (
+                  <div key={inv.id} className="flex items-center justify-between gap-2 px-3 py-2 text-[11px] font-mono">
+                    <span className="truncate">{inv.tool_name} ({inv.server_name})</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-slate-400">{inv.seconds}s</span>
+                      <StatusBadge value={inv.ok ? 'SUCCEEDED' : 'FAILED'} />
+                      <span className="text-slate-400">{formatTime(inv.created_at)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+
       {/* Prompt Injection Quarantine Alert Box */}
       <Card>
         <CardHeader

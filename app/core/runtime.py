@@ -280,7 +280,10 @@ class OrganismRuntime:
             allowed_git_roots=allowed_git_roots,
         )
         self.env_sensor.world_pipeline = self.world_pipeline
-        self.env_sensor.poll_on_observe = bool(scfg.get("poll_on_perceive", False))
+        if self.settings.kernel_v3.world_poll_on_perceive is not None:
+            self.env_sensor.poll_on_observe = bool(self.settings.kernel_v3.world_poll_on_perceive)
+        else:
+            self.env_sensor.poll_on_observe = bool(scfg.get("poll_on_perceive", False))
         self.system_sensor._runner_health_fn = self.orchestrator.sync_runner_heartbeat
 
         # Guarded MCP ToolProvider (V2.0 P1-6: second controlled tool path, strictly distinct from AgentProvider)
@@ -418,6 +421,8 @@ class OrganismRuntime:
             self_model=self.self_model,
             skill_registry=self.skill_registry,
             affect=self.affect,
+            mcp_manager=self.mcp_manager,
+            world_pipeline=self.world_pipeline,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         if self.world_pipeline is not None and (self._sensors_cfg or {}).get("sources"):

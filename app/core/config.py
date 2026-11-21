@@ -197,6 +197,10 @@ class KernelV3Settings(BaseModel):
     ig_v2_enabled: bool = True
     # V3.0 M2: optional runtime override for AffectModulator (None = inherit config/affect.yaml)
     affect_enabled: bool | None = None
+    # V3.0 M3: external MCP read-only ToolProvider in AutonomousLoop & dynamic world polling
+    mcp_in_loop_enabled: bool = True
+    max_mcp_calls_per_cycle: int = 3
+    world_poll_on_perceive: bool | None = None
 
 
 class _YamlSource(PydanticBaseSettingsSource):

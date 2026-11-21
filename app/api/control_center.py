@@ -1528,6 +1528,22 @@ def create_control_center_router(get_runtime) -> APIRouter:
             latest_obs = (
                 await s.execute(select(ObservationRecord).order_by(desc(ObservationRecord.created_at)).limit(1))
             ).scalar_one_or_none()
+            mcp_usage_rows = (
+                await s.execute(
+                    select(ResourceUsage)
+                    .where(ResourceUsage.category == "mcp_tool")
+                    .order_by(desc(ResourceUsage.created_at))
+                    .limit(30)
+                )
+            ).scalars().all()
+            mcp_policy_cnt = int(
+                (
+                    await s.execute(
+                        select(func.count(PolicyEvaluation.id)).where(PolicyEvaluation.subject_type == "mcp_tool")
+                    )
+                ).scalar_one()
+                or 0
+            )
 
         quarantined = [
             {
@@ -1543,9 +1559,33 @@ def create_control_center_router(get_runtime) -> APIRouter:
         ]
 
         sensors_cfg = get_sensors_config()
+        mcp_registered = rt.mcp_manager.summary_for_brain() if rt.mcp_manager is not None else []
+        eff_poll_on_perceive = (
+            bool(rt.settings.kernel_v3.world_poll_on_perceive)
+            if rt.settings.kernel_v3.world_poll_on_perceive is not None
+            else bool(sensors_cfg.get("poll_on_perceive", False))
+        )
         return {
-            "poll_on_perceive": bool(sensors_cfg.get("poll_on_perceive", False)),
+            "poll_on_perceive": eff_poll_on_perceive,
             "importance_threshold": float(sensors_cfg.get("importance_threshold", 0.45)),
+            "mcp_tools": {
+                "in_loop_enabled": bool(rt.settings.kernel_v3.mcp_in_loop_enabled),
+                "max_calls_per_cycle": int(rt.settings.kernel_v3.max_mcp_calls_per_cycle),
+                "registered": mcp_registered,
+                "policy_evals_count": mcp_policy_cnt,
+                "recent_invocations": [
+                    {
+                        "id": str(u.id),
+                        "cycle_id": str(u.cycle_id) if u.cycle_id else None,
+                        "tool_name": (u.details or {}).get("tool_name", "unknown"),
+                        "server_name": (u.details or {}).get("server_name", ""),
+                        "ok": (u.details or {}).get("ok", True),
+                        "seconds": round(float(u.seconds or 0.0), 3),
+                        "created_at": _iso(u.created_at),
+                    }
+                    for u in mcp_usage_rows
+                ],
+            },
             "sources": [
                 {
                     "source_id": src.source_id,

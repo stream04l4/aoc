@@ -70,3 +70,31 @@ sources:
     poll_interval_seconds: 3600
     config:
       url: "https://docs.python.org/3.12/whatsnew/3.12.html"
+  # V3.0 M3: AI/Agent engineering & core dependency external feeds (curiosity fuel)
+  - source_id: "rss-arxiv-cs-ai"
+    sensor_type: "rss"
+    name: "arXiv cs.AI Research Feed"
+    enabled: true
+    reliability_score: 0.85
+    poll_interval_seconds: 3600
+    config:
+      url: "https://export.arxiv.org/rss/cs.AI"
+      max_items: 10
+  - source_id: "rss-github-pgvector-releases"
+    sensor_type: "rss"
+    name: "GitHub pgvector Releases"
+    enabled: true
+    reliability_score: 0.92
+    poll_interval_seconds: 7200
+    config:
+      url: "https://github.com/pgvector/pgvector/releases.atom"
+      max_items: 5
+  - source_id: "rss-github-letta-releases"
+    sensor_type: "rss"
+    name: "GitHub Letta Releases"
+    enabled: true
+    reliability_score: 0.90
+    poll_interval_seconds: 7200
+    config:
+      url: "https://github.com/letta-ai/letta/releases.atom"
+      max_items: 5
