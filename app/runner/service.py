@@ -670,6 +670,30 @@ def create_runner_app(manager: RunnerManager) -> FastAPI:
     async def health() -> RunnerHealthResponse:
         return manager.health()
 
+    @app.get("/v1/probe", dependencies=[Depends(_require_token)])
+    async def probe_binary(binary: str) -> dict[str, Any]:
+        """Probe an agent CLI binary on the host where Runner executes it (supports containerized Core)."""
+        b = (binary or "").strip()
+        if not b or any(ch in b for ch in (";", "&", "|", "$", "`", "\n", "\r", " ")):
+            raise HTTPException(status_code=400, detail="Invalid binary name")
+        resolved = shutil.which(b)
+        if not resolved:
+            return {"ok": False, "binary": b, "version": "", "error": f"binary '{b}' not found on host runner"}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                resolved,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+            lines = (out.decode(errors="replace") or err.decode(errors="replace")).strip().splitlines()
+            if proc.returncode == 0:
+                return {"ok": True, "binary": resolved, "version": lines[0] if lines else "unknown", "error": None}
+            return {"ok": False, "binary": resolved, "version": "", "error": f"exit {proc.returncode}: {lines[:1]}"}
+        except Exception as exc:
+            return {"ok": False, "binary": resolved, "version": "", "error": str(exc)}
+
     @app.post("/v1/executions", response_model=LaunchExecutionResponse, dependencies=[Depends(_require_token)])
     async def launch_execution(req: LaunchExecutionRequest) -> LaunchExecutionResponse:
         return await manager.launch(req)

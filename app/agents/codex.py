@@ -342,7 +342,7 @@ class CodexAdapter(AgentInterface):
         sandbox = task.sandbox_mode or str(self.options.get("sandbox", "read-only"))
         if sandbox not in ALLOWED_SANDBOXES:
             raise ValueError(f"Refused disallowed sandbox mode '{sandbox}' (allowed: {sorted(ALLOWED_SANDBOXES)})")
-        resolved = shutil.which(self.binary)
+        resolved = shutil.which(self.binary) or getattr(self, "_runner_binary_path", None)
         if not resolved:
             raise FileNotFoundError(f"Codex binary '{self.binary}' not found")
 
@@ -424,7 +424,7 @@ class CodexAdapter(AgentInterface):
             )
         if not thread_id or not thread_id.strip():
             raise ValueError("thread_id is required for codex exec resume")
-        resolved = shutil.which(self.binary)
+        resolved = shutil.which(self.binary) or getattr(self, "_runner_binary_path", None)
         if not resolved:
             raise FileNotFoundError(f"Codex binary '{self.binary}' not found")
 

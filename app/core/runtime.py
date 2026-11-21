@@ -174,6 +174,7 @@ class OrganismRuntime:
                 timeout_seconds=self.settings.runner.request_timeout_seconds,
             )
             self.execution_backend = UnixSocketRunnerBackend(rc, runner_id=self.settings.runner.runner_id)
+            self.registry.runner_client = rc
         else:
             self.execution_backend = LocalSubprocessBackend()
         self.orchestrator = AgentOrchestrator(

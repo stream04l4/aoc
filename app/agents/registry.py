@@ -16,8 +16,9 @@ logger = get_logger("aoc.agents.registry")
 
 
 class AgentRegistry:
-    def __init__(self, repo: StateRepository | None = None) -> None:
+    def __init__(self, repo: StateRepository | None = None, runner_client: Any = None) -> None:
         self.repo = repo
+        self.runner_client = runner_client
         self._adapters: dict[str, AgentInterface] = {}
         self._probes: dict[str, AgentProbeResult] = {}
 
@@ -77,6 +78,24 @@ class AgentRegistry:
                 probe = AgentProbeResult(ok=False, error="disabled in config")
             else:
                 probe = await adapter.probe()
+                if not probe.ok and self.runner_client is not None and hasattr(adapter, "binary"):
+                    try:
+                        remote = await self.runner_client.probe_binary(getattr(adapter, "binary"))
+                        if remote.get("ok"):
+                            setattr(adapter, "_runner_binary_path", remote.get("binary"))
+                            probe = AgentProbeResult(
+                                ok=True,
+                                binary=str(remote.get("binary") or getattr(adapter, "binary")),
+                                version=str(remote.get("version") or "unknown"),
+                            )
+                        elif remote.get("error"):
+                            probe = AgentProbeResult(
+                                ok=False,
+                                binary=str(remote.get("binary") or getattr(adapter, "binary")),
+                                error=str(remote.get("error")),
+                            )
+                    except Exception as exc:
+                        logger.warning("agent.runner_probe_failed", agent_id=aid, error=str(exc))
             self._probes[aid] = probe
             results[aid] = probe
             logger.info(

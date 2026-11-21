@@ -71,6 +71,15 @@ class RunnerClient:
         except Exception as exc:
             raise RunnerUnavailableError(f"Runner health check failed on {self.socket_path}: {exc}") from exc
 
+    async def probe_binary(self, binary: str) -> dict[str, Any]:
+        try:
+            async with self._make_client() as client:
+                r = await client.get("/v1/probe", params={"binary": binary})
+                r.raise_for_status()
+                return dict(r.json())
+        except Exception as exc:
+            raise RunnerUnavailableError(f"Runner probe failed on {self.socket_path}: {exc}") from exc
+
     async def launch(self, req: LaunchExecutionRequest) -> LaunchExecutionResponse:
         try:
             async with self._make_client() as client:

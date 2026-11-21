@@ -39,6 +39,7 @@ services:
       AOC_MEMORY__EMBEDDING_ENDPOINT: http://aoc-core:9200/v1
       AOC_MEMORY__EMBEDDING_MODEL: aoc-local-embed-512
       AOC_MEMORY__EMBEDDING_DIM: "512"
+      AOC_EMBEDDING__PROVIDER: ${AOC_EMBEDDING__PROVIDER:-local_onnx}
       AOC_RUNNER__ENABLED: ${AOC_RUNNER__ENABLED:-true}
       AOC_RUNNER__SOCKET_PATH: /run/aoc-runner/runner.sock
     ports:
