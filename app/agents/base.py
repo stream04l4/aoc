@@ -74,6 +74,7 @@ class AgentExecution(BaseModel):
     error: str | None = None
     resource_usage: dict[str, Any] = Field(default_factory=dict)
     pid: int | None = None
+    thread_id: str | None = None
 
 
 class AgentInterface(ABC):

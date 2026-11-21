@@ -123,11 +123,14 @@ class CodexAdapter(AgentInterface):
             "-C",
             task.workspace,
             "--skip-git-repo-check",
-            "--ephemeral",
             "--json",
             "-o",
             last_msg_path,
         ]
+        if not bool(self.options.get("persist_session", False)):
+            cmd.append("--ephemeral")
+        if bool(self.options.get("worktree", False)):
+            cmd.append("--worktree")
         extra_env: dict[str, str] = {}
         if self.options.get("use_aoc_llm"):
             llm_cfg = self._llm_settings
@@ -224,7 +227,7 @@ class CodexAdapter(AgentInterface):
 
         elapsed = round(time.perf_counter() - t0, 3)
         completed = utcnow()
-        parsed_result, usage = self._parse_output(stdout_str, last_msg_path, task.workspace)
+        parsed_result, usage, thread_id = self._parse_output(stdout_str, last_msg_path, task.workspace)
         usage["wall_seconds"] = elapsed
 
         self._finished[exec_id] = AgentStatus(
@@ -250,14 +253,17 @@ class CodexAdapter(AgentInterface):
             error=err_msg,
             resource_usage=usage,
             pid=proc.pid,
+            thread_id=thread_id,
         )
 
     def _parse_output(
         self, stdout: str, last_msg_path: str, workspace: str
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
         events = 0
         usage: dict[str, Any] = {}
         last_agent_text = ""
+        thread_id: str | None = None
+        tool_calls: list[dict[str, Any]] = []
 
         for line in (stdout or "").splitlines():
             line = line.strip()
@@ -267,13 +273,26 @@ class CodexAdapter(AgentInterface):
                 ev = json.loads(line)
                 events += 1
                 if isinstance(ev, dict):
+                    if ev.get("type") == "thread.started" and ev.get("thread_id"):
+                        thread_id = str(ev["thread_id"])
                     if ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
                         usage.update(ev["usage"])
                     item = ev.get("item")
-                    if isinstance(item, dict) and item.get("type") == "agent_message":
-                        txt = item.get("text") or ""
-                        if txt:
-                            last_agent_text = txt
+                    if isinstance(item, dict):
+                        itype = str(item.get("type") or "")
+                        if itype == "agent_message":
+                            txt = item.get("text") or ""
+                            if txt:
+                                last_agent_text = txt
+                        elif itype in {"command_execution", "mcp_tool_call", "file_change"}:
+                            tool_calls.append(
+                                {
+                                    "id": item.get("id"),
+                                    "type": itype,
+                                    "command": item.get("command") or item.get("tool") or item.get("name"),
+                                    "status": item.get("status"),
+                                }
+                            )
             except json.JSONDecodeError:
                 continue
 
@@ -290,9 +309,12 @@ class CodexAdapter(AgentInterface):
             {
                 "summary": last_agent_text,
                 "events_count": events,
+                "thread_id": thread_id,
+                "tool_calls": tool_calls[:50],
                 "workspace_files": list_workspace_files(workspace),
             },
             usage,
+            thread_id,
         )
 
     async def get_status(self, execution_id: str) -> AgentStatus:
@@ -340,11 +362,14 @@ class CodexAdapter(AgentInterface):
             "-C",
             task.workspace,
             "--skip-git-repo-check",
-            "--ephemeral",
             "--json",
             "-o",
             last_msg_path,
         ]
+        if not bool(self.options.get("persist_session", False)):
+            cmd.append("--ephemeral")
+        if bool(self.options.get("worktree", False)):
+            cmd.append("--worktree")
         extra_env: dict[str, str] = {}
         if self.options.get("use_aoc_llm"):
             llm_cfg = self._llm_settings
@@ -381,6 +406,65 @@ class CodexAdapter(AgentInterface):
             "extra_env": extra_env,
         }
 
+    def build_resume_spec(
+        self,
+        task: AgentTask,
+        thread_id: str,
+        *,
+        idempotent_or_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        """Controlled `codex exec resume <thread_id>` spec (Task Book 5.7.2).
+
+        Hard guard: refuses automatic resume unless the caller explicitly certifies
+        the task is idempotent or operator-confirmed.
+        """
+        if not idempotent_or_confirmed:
+            raise PermissionError(
+                "Refused codex exec resume: only idempotent or operator-confirmed tasks may be resumed"
+            )
+        if not thread_id or not thread_id.strip():
+            raise ValueError("thread_id is required for codex exec resume")
+        resolved = shutil.which(self.binary)
+        if not resolved:
+            raise FileNotFoundError(f"Codex binary '{self.binary}' not found")
+
+        last_msg_path = os.path.join(task.workspace, ".aoc_last_message.txt")
+        cmd = [
+            resolved,
+            "exec",
+            "resume",
+            "--skip-git-repo-check",
+            "--json",
+            "-o",
+            last_msg_path,
+        ]
+        extra_env: dict[str, str] = {}
+        if self.options.get("use_aoc_llm"):
+            llm_cfg = self._llm_settings
+            base_url = str(self.options.get("base_url") or (llm_cfg.base_url if llm_cfg else ""))
+            model_name = str(self.options.get("model") or (llm_cfg.model if llm_cfg else ""))
+            if base_url and model_name:
+                cmd.extend(
+                    [
+                        "-c",
+                        'model_provider="aoc_llm"',
+                        "-c",
+                        'model_providers.aoc_llm.name="AOC_LLM"',
+                        "-c",
+                        f'model_providers.aoc_llm.base_url="{base_url}"',
+                        "-c",
+                        'model_providers.aoc_llm.env_key="CODEX_CUSTOM_API_KEY"',
+                        "-c",
+                        'model_providers.aoc_llm.wire_api="responses"',
+                        "-m",
+                        model_name,
+                    ]
+                )
+                if llm_cfg and llm_cfg.api_key:
+                    extra_env["CODEX_CUSTOM_API_KEY"] = llm_cfg.api_key.get_secret_value()
+        cmd.extend([thread_id.strip(), "-"])
+        return {"command": cmd, "stdin_text": build_agent_prompt(task), "extra_env": extra_env}
+
     def parse_runner_result(
         self,
         *,
@@ -395,7 +479,7 @@ class CodexAdapter(AgentInterface):
         pid: int | None,
     ) -> AgentExecution:
         last_msg_path = os.path.join(task.workspace, ".aoc_last_message.txt")
-        parsed_result, usage = self._parse_output(stdout or "", last_msg_path, task.workspace)
+        parsed_result, usage, thread_id = self._parse_output(stdout or "", last_msg_path, task.workspace)
         done_at = completed_at or utcnow()
         try:
             usage["wall_seconds"] = round(max(0.0, (done_at - started_at).total_seconds()), 3)
@@ -414,6 +498,7 @@ class CodexAdapter(AgentInterface):
             error=error,
             resource_usage=usage,
             pid=pid,
+            thread_id=thread_id,
         )
 
     async def cancel(self, execution_id: str) -> bool:

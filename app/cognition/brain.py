@@ -162,6 +162,7 @@ class CognitionBrain(BrainInterface):
             "goal": context.goal.model_dump(mode="json") if context.goal else None,
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
+            "available_tools": context.available_tools,
             "budget_remaining": context.budget_remaining,
             "memories": context.memories[:8],
         }

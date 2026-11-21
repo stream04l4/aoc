@@ -55,6 +55,7 @@ from app.perception.world.web_sensor import WebChangeWorldSensor
 from app.storage.database import Database
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository
+from app.tools.mcp_manager import MCPClientManager
 
 logger = get_logger("aoc.runtime")
 
@@ -275,6 +276,16 @@ class OrganismRuntime:
         self.env_sensor.world_pipeline = self.world_pipeline
         self.env_sensor.poll_on_observe = bool(scfg.get("poll_on_perceive", False))
         self.system_sensor._runner_health_fn = self.orchestrator.sync_runner_heartbeat
+
+        # Guarded MCP ToolProvider (V2.0 P1-6: second controlled tool path, strictly distinct from AgentProvider)
+        self.mcp_manager = MCPClientManager(
+            governance=self.governance,
+            repo=self.repo,
+            workspace_root=self.settings.governance.workspace_root,
+            allowed_domains=allowed_domains,
+            allowed_git_roots=allowed_git_roots,
+        )
+        self.mcp_manager.load_from_config(get_agent_config())
 
         self.loop: AutonomousLoop | None = None
         self.scheduler: OrganismScheduler | None = None

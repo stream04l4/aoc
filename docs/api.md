@@ -64,3 +64,5 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `POST` | `/v2/approvals/{approval_id}/approve` | Approve a bound single-use L2 request by `approval_id` (Bearer `approve`) |
 | `POST` | `/v2/approvals/{approval_id}/reject` | Reject a bound L2 request by `approval_id` (Bearer `approve`) |
 | `POST` | `/v2/webhooks/telegram` | Telegram Bot approval callback webhook (`X-Telegram-Bot-Api-Secret-Token` + chat allowlist + nonce TTL) |
+| `GET` | `/v2/tools` | List registered MCP `ToolProvider` tools (explicitly distinct from `GET /agents` `AgentProvider`; Bearer `read`) |
+| `POST` | `/v2/tools/{tool_name}/invoke` | Invoke a guarded MCP tool via `MCPClientManager` with schema, Governance, Budget, and audit checks (Bearer `control`) |

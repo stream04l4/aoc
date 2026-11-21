@@ -113,6 +113,7 @@ class CognitiveContext(BaseModel):
     goal: GoalProposal | None = None
     memories: list[dict[str, Any]] = Field(default_factory=list)
     available_agents: list[dict[str, Any]] = Field(default_factory=list)
+    available_tools: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 

@@ -24,6 +24,7 @@ from typing import Any
 
 from app.agents.base import AgentExecution, AgentTask
 from app.agents.registry import AgentRegistry
+from app.agents.router import AgentRouter
 from app.cognition.gateway import LLMGatewayInterface
 from app.cognition.interfaces import ActionPlan, VerificationSpec
 from app.core.enums import ExecutionStatus, GoalStatus, PermissionLevel, TaskStatus
@@ -106,6 +107,7 @@ class AgentOrchestrator:
         llm_gateway: LLMGatewayInterface | None = None,
         backend: ExecutionBackendInterface | None = None,
         state_machine: TaskStateMachine | None = None,
+        router: AgentRouter | None = None,
     ) -> None:
         self.registry = registry
         self.governance = governance
@@ -115,6 +117,7 @@ class AgentOrchestrator:
         self.llm_gateway = llm_gateway
         self.backend: ExecutionBackendInterface = backend or LocalSubprocessBackend()
         self.state_machine = state_machine or TaskStateMachine(repo)
+        self.router = router or AgentRouter(registry, repo)
         self._approval_locks: dict[str, asyncio.Lock] = {}
 
     def _approval_lock(self, task_id: str) -> asyncio.Lock:
@@ -365,9 +368,12 @@ class AgentOrchestrator:
         task_id = str(task_uuid)
         workspace = self.governance.prepare_workspace(task_id)
 
-        adapter = self.registry.select_agent(
+        adapter, _routing_dec = await self.router.select(
             preferred_agent=plan.assigned_agent,
             required_capability=plan.required_capability,
+            sandbox_mode=verdict.sandbox_mode,
+            cycle_id=cycle_id,
+            log_decision=True,
         )
         if adapter is None:
             await self.repo.create_task(
@@ -611,6 +617,7 @@ class AgentOrchestrator:
             exec_uuid,
             status=execution.status,
             pid=execution.pid,
+            thread_id=execution.thread_id,
             completed_at=execution.completed_at or utcnow(),
             result=execution.result,
             stdout=execution.stdout,
@@ -730,17 +737,26 @@ class AgentOrchestrator:
         )
 
         if attempt < max_attempts:
-            # Prefer switching to an untried healthy agent first; otherwise retry same healthy agent
-            alt = self.registry.select_agent(
+            # Prefer switching to an untried healthy agent via explainable AgentRouter; otherwise retry same healthy agent
+            cycle_uuid = uuid.UUID(task_row["cycle_id"]) if task_row.get("cycle_id") else None
+            alt, _ = await self.router.select(
                 required_capability=task_row.get("required_capability"),
+                sandbox_mode=sandbox_mode,
                 exclude=tried,
+                cycle_id=cycle_uuid,
+                log_decision=True,
             )
-            next_adapter = alt or self.registry.select_agent(
-                preferred_agent=execution.agent_id,
-                required_capability=task_row.get("required_capability"),
-            )
+            if alt is not None:
+                next_adapter = alt
+            else:
+                next_adapter, _ = await self.router.select(
+                    preferred_agent=execution.agent_id,
+                    required_capability=task_row.get("required_capability"),
+                    sandbox_mode=sandbox_mode,
+                    cycle_id=cycle_uuid,
+                    log_decision=True,
+                )
             if next_adapter is not None:
-                cycle_uuid = uuid.UUID(task_row["cycle_id"]) if task_row.get("cycle_id") else None
                 await self.state_machine.transition(
                     task_uuid,
                     TaskStatus.RETRY_WAIT,

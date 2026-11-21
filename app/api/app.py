@@ -75,6 +75,13 @@ class WorldSourceUpsertRequest(BaseModel):
     enabled: bool = True
 
 
+class ToolInvokeRequest(BaseModel):
+    arguments: dict[str, Any] = {}
+    workspace: str | None = None
+    task_id: str | None = None
+    approved_l2: bool = False
+
+
 def create_app(
     settings: Settings | None = None,
     db: Database | None = None,
@@ -252,6 +259,40 @@ def create_app(
     @app.get("/agents")
     async def list_agents(_: Principal = Depends(require_scope(SCOPE_READ))) -> list[dict[str, Any]]:
         return await _rt().repo.list_agents()
+
+    @app.get("/v2/tools")
+    async def list_tools_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
+        rt = _rt()
+        return {
+            "provider_kind": "tool_provider_mcp",
+            "note": "MCP ToolProvider establishes a second controlled execution path (atomic tools), not a second autonomous AgentProvider.",
+            "tools": [t.model_dump(mode="json") for t in rt.mcp_manager.list_tools()],
+        }
+
+    @app.post("/v2/tools/{tool_name}/invoke")
+    async def invoke_tool_v2(
+        tool_name: str,
+        req: ToolInvokeRequest = ToolInvokeRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        from app.tools.interfaces import ToolCallRequest
+
+        rt = _rt()
+        res = await rt.mcp_manager.invoke(
+            ToolCallRequest(
+                tool_name=tool_name,
+                arguments=req.arguments,
+                workspace=req.workspace,
+                task_id=req.task_id,
+                requested_by=principal.name,
+                approved_l2=req.approved_l2,
+            )
+        )
+        if res.denied:
+            raise HTTPException(status_code=403, detail=res.error or "Tool invocation denied")
+        if res.requires_approval:
+            raise HTTPException(status_code=202, detail=res.error or "Tool invocation requires L2 approval")
+        return res.model_dump(mode="json")
 
     @app.get("/memories")
     async def list_memories(
