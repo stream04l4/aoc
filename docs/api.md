@@ -58,3 +58,9 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `POST` | `/v2/world/sources/{source_id}/enable` | Enable a world sensor source (Bearer `control`) |
 | `POST` | `/v2/world/sources/{source_id}/disable` | Circuit-break / disable a world sensor source (Bearer `control`) |
 | `POST` | `/v2/world/poll` | Trigger a fault-isolated poll of due/selected world sensors (Bearer `control`) |
+| `GET` | `/v2/governance/policies` | Inspect active read-only governance policy rules and semantic classifier status (Bearer `read`) |
+| `GET` | `/v2/governance/audit` | Query `policy_evaluations` audit records across plan, approval_recheck, and mcp_tool (Bearer `read`) |
+| `GET` | `/v2/approvals` | List bound L2 `approval_records` (optional `status` filter; Bearer `read`) |
+| `POST` | `/v2/approvals/{approval_id}/approve` | Approve a bound single-use L2 request by `approval_id` (Bearer `approve`) |
+| `POST` | `/v2/approvals/{approval_id}/reject` | Reject a bound L2 request by `approval_id` (Bearer `approve`) |
+| `POST` | `/v2/webhooks/telegram` | Telegram Bot approval callback webhook (`X-Telegram-Bot-Api-Secret-Token` + chat allowlist + nonce TTL) |

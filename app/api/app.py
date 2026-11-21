@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from app.api.auth import (
 from app.core.config import Settings, get_settings
 from app.core.loop import CycleInProgressError
 from app.core.runtime import OrganismRuntime
+from app.notifications.telegram import TelegramAuthError
 from app.observability.metrics import REGISTRY
 from app.orchestration.orchestrator import (
     ApprovalConflictError,
@@ -30,6 +31,7 @@ from app.orchestration.orchestrator import (
     ApprovalNotFoundError,
 )
 from app.storage.database import Database
+from app.storage.outbox import OutboxEventType
 
 
 class WorldInputRequest(BaseModel):
@@ -434,6 +436,11 @@ def create_app(
         rt = _rt()
         assert rt.lifecycle is not None
         st = await rt.lifecycle.pause(body.reason)
+        await rt.repo.enqueue_outbox_event(
+            event_type=OutboxEventType.NOTIFICATION_DISPATCH,
+            idempotency_key=f"notify:paused:{uuid.uuid4()}",
+            payload={"kind": "lifecycle_paused", "reason": body.reason},
+        )
         return {"lifecycle_state": st.value}
 
     @app.post("/control/resume")
@@ -511,6 +518,110 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ApprovalConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # ── V2 Governance, Bound Approvals & Telegram Webhook (P1-8) ────────────
+    @app.get("/v2/governance/policies")
+    async def get_governance_policies_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
+        rt = _rt()
+        return {
+            "auto_approve_max_level": rt.settings.governance.auto_approve_max_level,
+            "semantic_classifier_enabled": rt.semantic_classifier is not None,
+            "policy": getattr(rt.governance, "policy", {}),
+        }
+
+    @app.get("/v2/governance/audit")
+    async def get_governance_audit_v2(
+        subject_type: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().repo.list_policy_evaluations(
+            subject_type=subject_type, limit=min(max(limit, 1), 200)
+        )
+
+    @app.get("/v2/approvals")
+    async def list_approvals_v2(
+        status: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().approval_service.list_approvals(status=status, limit=min(max(limit, 1), 200))
+
+    @app.post("/v2/approvals/{approval_id}/approve")
+    async def approve_by_id_v2(
+        approval_id: str,
+        body: ControlNote = ControlNote(reason="operator approved"),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        try:
+            a_uuid = uuid.UUID(approval_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid approval_id UUID") from exc
+        try:
+            return await rt.approval_service.approve_by_id(
+                a_uuid,
+                approver=principal.name,
+                reason=body.reason,
+                channel="api",
+            )
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ApprovalDeniedError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/v2/approvals/{approval_id}/reject")
+    async def reject_by_id_v2(
+        approval_id: str,
+        body: ControlNote = ControlNote(reason="operator rejected"),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        try:
+            a_uuid = uuid.UUID(approval_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid approval_id UUID") from exc
+        try:
+            return await rt.approval_service.reject_by_id(
+                a_uuid,
+                approver=principal.name,
+                reason=body.reason,
+                channel="api",
+            )
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ApprovalDeniedError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/v2/webhooks/telegram")
+    async def telegram_webhook_v2(
+        request: Request,
+        x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        try:
+            update_payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+        if not isinstance(update_payload, dict):
+            raise HTTPException(status_code=400, detail="Telegram update must be a JSON object")
+        try:
+            return await rt.telegram_webhook.handle_update(
+                update_payload,
+                secret_header=x_telegram_bot_api_secret_token,
+            )
+        except TelegramAuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ApprovalDeniedError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     @app.post("/v1/embeddings")
     async def local_embeddings(

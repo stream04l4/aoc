@@ -59,7 +59,7 @@ from app.orchestration.finalizer import TaskFinalizer
 from app.orchestration.orchestrator import AgentOrchestrator, compute_params_digest, compute_plan_hash
 from app.perception.interfaces import Observation, utcnow
 from app.perception.manager import SensorManager
-from app.storage.outbox import OutboxDispatcher
+from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository, day_start
 
 logger = get_logger("aoc.loop")
@@ -86,6 +86,7 @@ class AutonomousLoop:
         llm_gateway: LLMGatewayInterface | None = None,
         finalizer: TaskFinalizer | None = None,
         outbox: OutboxDispatcher | None = None,
+        approval_service: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -100,6 +101,7 @@ class AutonomousLoop:
         self.memory = memory
         self.llm_gateway = llm_gateway
         self.outbox = outbox
+        self.approval_service = approval_service
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -274,6 +276,11 @@ class AutonomousLoop:
                     await self.lifecycle.transition(
                         LifecycleState.ACTIVE, reason="quota refreshed", cycle_id=cycle_id
                     )
+                    await self.repo.enqueue_outbox_event(
+                        event_type=OutboxEventType.NOTIFICATION_DISPATCH,
+                        idempotency_key=f"notify:quota_recovered:{cycle_id}",
+                        payload={"kind": "quota_recovered", "cycle_id": str(cycle_id), "message": "Daily quota refreshed; organism resumed ACTIVE."},
+                    )
 
             # ── 4. SELF ASSESSMENT ──────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="SELF_ASSESSMENT")
@@ -338,6 +345,11 @@ class AutonomousLoop:
 
             if decision.constraints.get("emergency_mode"):
                 await self.lifecycle.transition(LifecycleState.CRITICAL, reason=decision.reason, cycle_id=cycle_id)
+                await self.repo.enqueue_outbox_event(
+                    event_type=OutboxEventType.NOTIFICATION_DISPATCH,
+                    idempotency_key=f"notify:critical:{cycle_id}",
+                    payload={"kind": "critical_alert", "cycle_id": str(cycle_id), "reason": decision.reason, "message": "Organism entered CRITICAL emergency mode"},
+                )
 
             # IDLE check (Scenario D: never force a task when all drives are satisfied)
             if decision.selected_drive == NO_DRIVE:
@@ -450,8 +462,8 @@ class AutonomousLoop:
                 subject_id=plan_id,
                 cycle_id=cycle_id,
                 requested_level=verdict.requested_level,
-                deterministic_level=verdict.effective_level,
-                semantic_level=None,
+                deterministic_level=verdict.deterministic_level or verdict.effective_level,
+                semantic_level=verdict.semantic_level,
                 effective_level=verdict.effective_level,
                 verdict=plan_status.lower(),
                 violations=verdict.violations,
@@ -496,15 +508,27 @@ class AutonomousLoop:
                             "workspace": ws,
                         }
                     )
-                    await self.repo.create_approval_record(
-                        task_id=pending_task_id,
-                        plan_id=plan_id,
-                        plan_hash=plan_hash,
-                        params_digest=params_digest,
-                        permission_level=verdict.effective_level,
-                        nonce=secrets.token_hex(16),
-                        expires_at=utcnow() + timedelta(hours=24),
-                    )
+                    if self.approval_service is not None:
+                        await self.approval_service.create_approval_request(
+                            task_id=pending_task_id,
+                            plan_id=plan_id,
+                            plan_hash=plan_hash,
+                            params_digest=params_digest,
+                            permission_level=verdict.effective_level,
+                            objective=plan.objective,
+                            assigned_agent=plan.assigned_agent,
+                            cycle_id=cycle_id,
+                        )
+                    else:
+                        await self.repo.create_approval_record(
+                            task_id=pending_task_id,
+                            plan_id=plan_id,
+                            plan_hash=plan_hash,
+                            params_digest=params_digest,
+                            permission_level=verdict.effective_level,
+                            nonce=secrets.token_hex(16),
+                            expires_at=utcnow() + timedelta(hours=24),
+                        )
                     outcome = "REQUIRES_APPROVAL"
                 else:
                     await self.repo.transition_goal(goal_id, GoalStatus.REJECTED.value, note=verdict.reason)

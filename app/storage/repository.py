@@ -1421,6 +1421,13 @@ class StateRepository:
             row = await s.get(ApprovalRecord, approval_id)
             return self._approval_dict(row) if row else None
 
+    async def get_approval_by_nonce(self, nonce: str) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(ApprovalRecord).where(ApprovalRecord.nonce == nonce))
+            ).scalar_one_or_none()
+            return self._approval_dict(row) if row else None
+
     async def update_approval_record(self, approval_id: uuid.UUID, **values: Any) -> None:
         clean = {}
         for k, v in values.items():

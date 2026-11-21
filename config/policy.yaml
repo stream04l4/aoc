@@ -10,33 +10,97 @@ level_sandbox:
   L0: "read-only"
   L1: "workspace-write"
 
-# Keyword/pattern rules applied to plan objective+description (case-insensitive).
-# A match escalates the plan to at least the given level.
+# Semantic policy classifier settings (V2.0 P1-8)
+semantic_policy:
+  enabled: false  # Enabled explicitly in OrganismRuntime when LLMGateway is wired; unit tests opt in cleanly
+  timeout_seconds: 12.0
+  fail_closed_level: "L2"
+
+# Approval TTL defaults (V2.0 P1-8)
+approval:
+  default_ttl_hours: 24
+
+# Keyword/pattern rules applied to plan objective+description (case-insensitive, English + Chinese bilingual).
+# A match escalates the plan to at least the given level (LLM semantic layer can NEVER downgrade these).
 escalation_rules:
   - level: L3
     reason: "infrastructure / cloud resource creation"
-    patterns: ["(?<!not )(?<!never )(?<!avoid )create (a )?(cloud )?(server|vm|instance|vps)", "(?<!not )(?<!never )provision (a )?(cloud |new )?(server|vm|instance|host|cluster|node|resource|vps)", "(?<!not )(?<!never )launch (a )?(cloud |ec2 )?instance", "\\bec2\\b", "terraform apply", "(?<!not )(?<!never )\\b(buy|purchase) (a )?(server|domain|gpu|instance|cloud|credits?)"]
+    patterns:
+      - "(?<!not )(?<!never )(?<!avoid )create (a )?(cloud )?(server|vm|instance|vps)"
+      - "(?<!not )(?<!never )(?<!avoid )provision (a )?(cloud |new )?(server|vm|instance|host|cluster|node|resource|vps)"
+      - "(?<!not )(?<!never )(?<!avoid )launch (a )?(cloud |ec2 )?instance"
+      - "\\bec2\\b"
+      - "terraform apply"
+      - "(?<!not )(?<!never )\\b(buy|purchase) (a )?(server|domain|gpu|instance|cloud|credits?)"
+      - "(?<!不要)(?<!禁止)(?<!不)(创建|开通|购买|部署|新建|申请).{0,8}(云服务器|虚拟机|云主机|云资源|GPU\\s*实例|EC2|VPS|新节点|集群)"
   - level: L3
     reason: "privilege / security policy modification"
-    patterns: ["sudo ", "chmod 777", "chown root", "visudo", "/etc/sudoers", "disable (the )?(firewall|ufw)", "modify (the )?(security|safety) polic", "policy.yaml", "governance"]
+    patterns:
+      - "sudo "
+      - "chmod 777"
+      - "chown root"
+      - "visudo"
+      - "/etc/sudoers"
+      - "disable (the )?(firewall|ufw)"
+      - "modify (the )?(security|safety) polic"
+      - "policy\\.yaml"
+      - "governance"
+      - "(提升权限|提权|获取\\s*root|授予\\s*root|修改.{0,6}(安全策略|风控策略|权限策略)|篡改.{0,4}策略|绕过.{0,6}(审批|风控|治理|安全检查)|关闭防火墙|禁用防火墙)"
   - level: L3
     reason: "credential exfiltration"
-    patterns: ["(export|exfiltrat|steal|dump|print|read|cat|copy|send|upload|extract).{0,40}(api[_ -]?keys?|secrets?|passwords?|private keys?|credentials?|access tokens?)", "\\.env\\b", "\\.ssh/", "id_rsa", "\\.pem\\b", "auth\\.json", "\\.git-credentials"]
+    patterns:
+      - "(export|exfiltrat|steal|dump|print|read|cat|copy|send|upload|extract).{0,40}(api[_ -]?keys?|secrets?|passwords?|private keys?|credentials?|access tokens?)"
+      - "\\.env\\b"
+      - "\\.ssh/"
+      - "id_rsa"
+      - "\\.pem\\b"
+      - "auth\\.json"
+      - "\\.git-credentials"
+      - "(读取|导出|打印|泄露|窃取|上传|发送|获取).{0,12}(密钥|私钥|密码|凭证|环境变量|API\\s*Key|Token|Bot\\s*Token)"
   - level: L3
     reason: "self-replication / instance cloning"
-    patterns: ["replicate (yourself|itself|the organism)", "clone (yourself|itself|the organism)", "spawn (a )?new (instance|organism)", "copy (your|its) identity"]
+    patterns:
+      - "replicate (yourself|itself|the organism)"
+      - "clone (yourself|itself|the organism)"
+      - "spawn (a )?new (instance|organism)"
+      - "copy (your|its) identity"
+      - "(自我复制|克隆(自身|自己|实例|身份)|派生新(实例|生命体))"
   - level: L3
     reason: "core memory / database destruction"
-    patterns: ["drop (table|database)", "truncate table", "delete .{0,30}(core )?memor(y|ies)", "rm -rf /(\\s|$)", "aoc (database|db)", "letta (database|db)"]
+    patterns:
+      - "drop (table|database)"
+      - "truncate table"
+      - "delete .{0,30}(core )?memor(y|ies)"
+      - "rm -rf /(\\s|$)"
+      - "aoc (database|db)"
+      - "letta (database|db)"
+      - "(删库|删除(数据库|数据表|核心记忆|生产库)|清空(数据库|核心记忆|生产表)|销毁核心记忆)"
   - level: L3
     reason: "disable shutdown / pause / resource limits"
-    patterns: ["disable (shutdown|pause|budget|limit)", "remove (the )?budget", "ignore (the )?limit"]
+    patterns:
+      - "disable (shutdown|pause|budget|limit)"
+      - "remove (the )?budget"
+      - "ignore (the )?limit"
+      - "(禁用|关闭|取消|移除|绕过).{0,6}(关机|停机|暂停|预算限制|配额限制|安全限额)"
   - level: L2
     reason: "system service or package changes"
-    patterns: ["systemctl", "apt(-get)? install", "pip install", "npm install -g", "restart (the )?service", "kill ", "crontab", "docker "]
+    patterns:
+      - "systemctl"
+      - "apt(-get)? install"
+      - "pip install"
+      - "npm install -g"
+      - "restart (the )?service"
+      - "kill "
+      - "crontab"
+      - "docker "
+      - "(重启服务|停止服务|关闭服务|安装系统软件包|修改定时任务|杀死进程|重启容器)"
   - level: L2
     reason: "deleting files outside workspace"
-    patterns: ["rm -rf", "delete files", "/home/ubuntu/(?!aoc-workspaces)"]
+    patterns:
+      - "rm -rf"
+      - "delete files"
+      - "/home/ubuntu/(?!aoc-workspaces)"
+      - "(删除工作区外文件|清空宿主机目录|修改宿主机系统配置)"
 
 # Hard-forbidden capability requests from the reproduction drive (task book 4.2 / 11)
 reproduction_forbidden:
@@ -44,3 +108,9 @@ reproduction_forbidden:
   - "replicate"
   - "clone identity"
   - "increase permission"
+  - "创建服务器"
+  - "购买主机"
+  - "自我复制"
+  - "克隆身份"
+  - "提升权限"
+  - "提权"

@@ -29,13 +29,16 @@ from app.core.lifecycle import LifecycleManager
 from app.core.loop import AutonomousLoop
 from app.core.scheduler import OrganismScheduler
 from app.drives.engine import DriveEngine
+from app.governance.approval import ApprovalService
 from app.governance.policy import GovernanceManager
+from app.governance.semantic_policy import SemanticRiskClassifier
 from app.memory.embedding import EmbeddingInterface, EmbeddingService, build_embedding_provider
 from app.memory.experience_manager import ExperienceManager
 from app.memory.info_gain import InformationGainEvaluator
 from app.memory.interfaces import MemoryInterface
 from app.memory.letta_adapter import LettaAdapter
 from app.memory.retrieval import HybridRetrievalEngine
+from app.notifications.telegram import TelegramNotifier, TelegramWebhookHandler
 from app.observability.logging import configure_logging, get_logger
 from app.orchestration.backend import ExecutionBackendInterface, LocalSubprocessBackend
 from app.orchestration.finalizer import TaskFinalizer
@@ -128,11 +131,23 @@ class OrganismRuntime:
         # Brain
         self.brain: BrainInterface = brain or CognitionBrain(self.llm_gateway)
 
-        # Governance
+        # Governance (with optional bilingual SemanticRiskClassifier via LLMGateway, P1-8)
+        eff_policy_cfg = policy_config if policy_config is not None else get_policy_config()
+        sem_cfg = (eff_policy_cfg or {}).get("semantic_policy") or {}
+        self.semantic_classifier: SemanticRiskClassifier | None = (
+            SemanticRiskClassifier(
+                self.llm_gateway,
+                timeout_seconds=float(sem_cfg.get("timeout_seconds", 12.0)),
+                fail_closed_level=str(sem_cfg.get("fail_closed_level", "L2")),
+            )
+            if bool(sem_cfg.get("enabled", False))
+            else None
+        )
         self.governance = GovernanceManager(
             self.settings.governance,
             self.repo,
-            policy_cfg=policy_config if policy_config is not None else get_policy_config(),
+            policy_cfg=eff_policy_cfg,
+            semantic_classifier=self.semantic_classifier,
         )
 
         # Agents & Orchestration (inject llm_settings explicitly — no hidden global get_settings())
@@ -163,6 +178,15 @@ class OrganismRuntime:
             llm_gateway=self.llm_gateway,
             backend=self.execution_backend,
             state_machine=self.state_machine,
+        )
+        app_ttl = float(((eff_policy_cfg or {}).get("approval") or {}).get("default_ttl_hours", 24.0))
+        self.approval_service = ApprovalService(self.repo, self.orchestrator, default_ttl_hours=app_ttl)
+        self.telegram_notifier = TelegramNotifier(self.settings.telegram)
+        self.telegram_webhook = TelegramWebhookHandler(
+            self.settings.telegram,
+            self.approval_service,
+            self.repo,
+            notifier=self.telegram_notifier,
         )
         self.outbox = OutboxDispatcher(
             self.repo,
@@ -303,6 +327,11 @@ class OrganismRuntime:
         self.outbox.register_handler(OutboxEventType.EXECUTION_FINALIZE, "outbox_finalizer", _handle_finalize_event)
         self.outbox.register_handler(OutboxEventType.MEMORY_EMBED, "outbox_memory_embed", _handle_memory_embed)
         self.outbox.register_handler(OutboxEventType.MEMORY_SYNC_LETTA, "outbox_memory_letta", _handle_memory_sync_letta)
+        self.outbox.register_handler(
+            OutboxEventType.NOTIFICATION_DISPATCH,
+            "outbox_telegram_notifier",
+            self.telegram_notifier.dispatch_notification,
+        )
 
         self.loop = AutonomousLoop(
             organism_id=self.organism_id,
@@ -319,6 +348,7 @@ class OrganismRuntime:
             llm_gateway=self.llm_gateway,
             finalizer=self.finalizer,
             outbox=self.outbox,
+            approval_service=self.approval_service,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         if self.world_pipeline is not None and (self._sensors_cfg or {}).get("sources"):

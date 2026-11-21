@@ -23,11 +23,13 @@ class GovernanceManager(GovernanceInterface):
         settings: GovernanceSettings,
         repo: StateRepository,
         policy_cfg: dict[str, Any] | None = None,
+        semantic_classifier: Any = None,
     ) -> None:
         self.settings = settings
         self.repo = repo
         self.policy = policy_cfg if policy_cfg is not None else get_policy_config()
         self.workspace_root = Path(settings.workspace_root).resolve()
+        self.semantic_classifier = semantic_classifier
 
     async def check_budget(self, now: datetime | None = None) -> BudgetStatus:
         ref_now = now or utcnow()
@@ -118,6 +120,27 @@ class GovernanceManager(GovernanceInterface):
                     eff_level = PermissionLevel.L3
                     violations.append(f"[L3] reproduction drive forbidden action: {forbidden}")
 
+        det_level = eff_level
+
+        # 2b. Semantic bilingual risk layer (V2.0 P1-8):
+        #     Hard invariant: eff_level = max(requested, deterministic, semantic)
+        #     LLM can ONLY raise caution; it can NEVER downgrade deterministic L2 or L3!
+        sem_level_str: str | None = None
+        sem_rationale = ""
+        sem_degraded = False
+        if self.semantic_classifier is not None and det_level != PermissionLevel.L3:
+            sem_res = await self.semantic_classifier.classify(plan, drive_type, det_level.value)
+            sem_level = PermissionLevel(sem_res.risk_level)
+            sem_level_str = sem_level.value
+            sem_rationale = sem_res.rationale
+            sem_degraded = bool(sem_res.degraded)
+            if sem_level.rank > det_level.rank:
+                eff_level = PermissionLevel.max(req_level, det_level, sem_level)
+                violations.append(f"[{sem_level.value}] semantic risk classifier: {sem_res.rationale or sem_res.risk_categories}")
+            else:
+                # Guarantee non-downgrade even if semantic_level < det_level
+                eff_level = PermissionLevel.max(req_level, det_level)
+
         # 3. Budget check
         budget = await self.check_budget()
         eff_timeout = min(plan.timeout_seconds, self.settings.budget.max_task_timeout_seconds)
@@ -131,6 +154,10 @@ class GovernanceManager(GovernanceInterface):
                 denied=True,
                 requested_level=req_level.value,
                 effective_level=eff_level.value,
+                deterministic_level=det_level.value,
+                semantic_level=sem_level_str,
+                semantic_rationale=sem_rationale,
+                semantic_degraded=sem_degraded,
                 sandbox_mode="read-only",
                 effective_timeout_seconds=eff_timeout,
                 violations=violations or ["L3 operations are forbidden for autonomous execution"],
@@ -146,6 +173,10 @@ class GovernanceManager(GovernanceInterface):
                 denied=False,
                 requested_level=req_level.value,
                 effective_level=eff_level.value,
+                deterministic_level=det_level.value,
+                semantic_level=sem_level_str,
+                semantic_rationale=sem_rationale,
+                semantic_degraded=sem_degraded,
                 sandbox_mode="read-only",
                 effective_timeout_seconds=eff_timeout,
                 violations=violations or [f"{eff_level.value} exceeds auto-approve level {auto_max.value}"],
@@ -160,6 +191,10 @@ class GovernanceManager(GovernanceInterface):
                 denied=True,
                 requested_level=req_level.value,
                 effective_level=eff_level.value,
+                deterministic_level=det_level.value,
+                semantic_level=sem_level_str,
+                semantic_rationale=sem_rationale,
+                semantic_degraded=sem_degraded,
                 sandbox_mode="read-only",
                 effective_timeout_seconds=eff_timeout,
                 violations=[budget.reason],
@@ -178,6 +213,10 @@ class GovernanceManager(GovernanceInterface):
             denied=False,
             requested_level=req_level.value,
             effective_level=eff_level.value,
+            deterministic_level=det_level.value,
+            semantic_level=sem_level_str,
+            semantic_rationale=sem_rationale,
+            semantic_degraded=sem_degraded,
             sandbox_mode=sandbox_mode,
             effective_timeout_seconds=eff_timeout,
             violations=violations,

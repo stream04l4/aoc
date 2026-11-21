@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -158,6 +158,27 @@ class EmbeddingSettings(BaseModel):
     fallback_on_error: bool = True
 
 
+class TelegramSettings(BaseModel):
+    enabled: bool = False
+    bot_token: SecretStr | None = None
+    webhook_secret: SecretStr | None = None
+    allowed_chat_ids: list[str] = Field(default_factory=list)
+    allowed_user_ids: list[str] = Field(default_factory=list)
+    api_base_url: str = "https://api.telegram.org"
+    timeout_seconds: float = 10.0
+
+    @field_validator("allowed_chat_ids", "allowed_user_ids", mode="before")
+    @classmethod
+    def _parse_id_list(cls, v: Any) -> list[str]:
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [part.strip() for part in v.split(",") if part.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return [str(v).strip()]
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -189,6 +210,7 @@ class Settings(BaseSettings):
     lifecycle: LifecycleSettings = Field(default_factory=LifecycleSettings)
     runner: RunnerSettings = Field(default_factory=RunnerSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
     @classmethod
     def settings_customise_sources(

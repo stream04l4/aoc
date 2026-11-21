@@ -48,6 +48,10 @@ class PolicyVerdict(BaseModel):
     denied: bool = False
     requested_level: str
     effective_level: str
+    deterministic_level: str = ""
+    semantic_level: str | None = None
+    semantic_rationale: str = ""
+    semantic_degraded: bool = False
     sandbox_mode: str = "read-only"
     effective_timeout_seconds: int = 300
     violations: list[str] = Field(default_factory=list)
