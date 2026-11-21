@@ -552,3 +552,54 @@ class ExecutionRecoveryRecord(Base):
     action_taken: Mapped[str] = mapped_column(String(64))
     notes: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+# ── digital world perception sensors (P1-5) ─────────────────────────────────
+class WorldEventSource(Base):
+    __tablename__ = "world_event_sources"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_id: Mapped[str] = mapped_column(String(128), unique=True)
+    sensor_type: Mapped[str] = mapped_column(String(32))  # rss | git | web | system
+    name: Mapped[str] = mapped_column(String(256), default="")
+    config: Mapped[dict] = mapped_column(JsonType, default=dict)
+    reliability_score: Mapped[float] = mapped_column(Float, default=0.7)
+    poll_interval_seconds: Mapped[int] = mapped_column(Integer, default=900)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    health_status: Mapped[str] = mapped_column(String(24), default="unknown")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class SensorCheckpoint(Base):
+    __tablename__ = "sensor_checkpoints"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("world_event_sources.source_id", ondelete="CASCADE"), unique=True
+    )
+    cursor: Mapped[dict] = mapped_column(JsonType, default=dict)
+    last_polled_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class WorldEventRow(Base):
+    __tablename__ = "world_events"
+    __table_args__ = (
+        UniqueConstraint("source_id", "content_hash", name="uq_world_events_dedup"),
+        Index("ix_world_events_status_time", "status", "observed_at"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("world_event_sources.source_id", ondelete="CASCADE")
+    )
+    event_type: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(512), default="")
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    source_reliability: Mapped[float] = mapped_column(Float, default=0.7)
+    importance_score: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(24), default="new")  # new | queued_topic | ignored | duplicate
+    meta: Mapped[dict] = mapped_column("metadata", JsonType, default=dict)
+    observed_at: Mapped[datetime] = mapped_column(TS, default=_now)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)

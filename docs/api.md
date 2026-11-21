@@ -52,3 +52,9 @@ Default bind: `http://127.0.0.1:9200` (configured via `config/settings.yaml`; no
 | `GET` | `/v2/memories/embeddings/status` | Active embedding provider, registered models, and embedding coverage stats (Bearer `read`) |
 | `GET` | `/v2/memories/sync/status` | PostgreSQL memory_index vs Letta Outbox synchronization stats (Bearer `read`) |
 | `POST` | `/v2/memories/sync/replay` | Replay dead-letter/pending memory embedding or Letta sync outbox events (Bearer `control`) |
+| `GET` | `/v2/world/events` | List deduplicated, scored, and provenance-tracked external world events (Bearer `read`) |
+| `GET` | `/v2/world/sources` | List configured digital world sensors with checkpoint and health status (Bearer `read`) |
+| `POST` | `/v2/world/sources` | Register or update an allowlisted RSS/Git/Web/System world source (Bearer `control`) |
+| `POST` | `/v2/world/sources/{source_id}/enable` | Enable a world sensor source (Bearer `control`) |
+| `POST` | `/v2/world/sources/{source_id}/disable` | Circuit-break / disable a world sensor source (Bearer `control`) |
+| `POST` | `/v2/world/poll` | Trigger a fault-isolated poll of due/selected world sensors (Bearer `control`) |

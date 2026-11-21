@@ -22,9 +22,13 @@ class EnvironmentSensor(SensorInterface):
         self,
         repo: StateRepository,
         providers: dict[str, EnvProvider] | None = None,
+        world_pipeline: Any = None,
+        poll_on_observe: bool = False,
     ) -> None:
         self.repo = repo
         self._providers: dict[str, EnvProvider] = dict(providers or {})
+        self.world_pipeline = world_pipeline
+        self.poll_on_observe = poll_on_observe
 
     def add_provider(self, name: str, provider: EnvProvider) -> None:
         self._providers[name] = provider
@@ -34,6 +38,12 @@ class EnvironmentSensor(SensorInterface):
 
     async def observe(self) -> Observation:
         now = utcnow()
+        poll_summary: list[dict[str, Any]] = []
+        if self.world_pipeline is not None and self.poll_on_observe:
+            try:
+                poll_summary = await self.world_pipeline.poll_all(force=False)
+            except Exception:
+                poll_summary = []
         try:
             items = await self.repo.list_world_items()
         except Exception as exc:
@@ -105,6 +115,27 @@ class EnvironmentSensor(SensorInterface):
         }
         if provider_data:
             env_state["providers"] = provider_data
+        if poll_summary:
+            env_state["world_sensor_poll"] = poll_summary
+        try:
+            recent_we = await self.repo.list_world_events(status="queued_topic", limit=10)
+            if recent_we:
+                for we in recent_we:
+                    external_events.append(
+                        {
+                            "event_id": we["id"],
+                            "source": we["source_id"],
+                            "event_type": we["event_type"],
+                            "title": we["title"],
+                            "importance_score": we["importance_score"],
+                            "untrusted_payload": (we.get("metadata") or {}).get("untrusted_wrapped") or we["content"][:800],
+                            "observed_at": we["observed_at"].isoformat()
+                            if hasattr(we["observed_at"], "isoformat")
+                            else str(we["observed_at"]),
+                        }
+                    )
+        except Exception:
+            pass
 
         total_sources = 1 + len(self._providers)
         confidence = (total_sources - provider_failures) / total_sources

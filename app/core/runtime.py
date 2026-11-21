@@ -22,6 +22,7 @@ from app.core.config import (
     get_memory_config,
     get_policy_config,
     get_runner_config,
+    get_sensors_config,
     get_settings,
 )
 from app.core.lifecycle import LifecycleManager
@@ -44,6 +45,10 @@ from app.perception.agent_sensor import AgentSensor
 from app.perception.environment_sensor import EnvironmentSensor
 from app.perception.manager import SensorManager
 from app.perception.system_sensor import SystemSensor
+from app.perception.world.git_sensor import GitWorldSensor
+from app.perception.world.pipeline import WorldEventPipeline
+from app.perception.world.rss_sensor import RSSWorldSensor
+from app.perception.world.web_sensor import WebChangeWorldSensor
 from app.storage.database import Database
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository
@@ -107,12 +112,15 @@ class OrganismRuntime:
             self.settings.llm,
             repo=self.repo,
             llm_probe_fn=effective_llm_probe,
+            db_ping_fn=self.db.ping,
         )
         self.agent_sensor = AgentSensor(self.repo)
         self.env_sensor = EnvironmentSensor(self.repo)
         self.perception.register(self.system_sensor)
         self.perception.register(self.agent_sensor)
         self.perception.register(self.env_sensor)
+        self._sensors_cfg: dict[str, Any] = get_sensors_config()
+        self.world_pipeline: WorldEventPipeline | None = None
 
         # Drives
         self.drives = DriveEngine(config=drive_config if drive_config is not None else get_drive_config())
@@ -210,6 +218,40 @@ class OrganismRuntime:
             embed_on_write=embed_on_write,
         )
 
+        # Digital World Perception Pipeline (V2.0 P1-5: RSS, Git, Web + SSRF/PI guards)
+        scfg = self._sensors_cfg or {}
+        allowed_domains = list(scfg.get("allowed_domains") or [])
+        allowed_git_roots = list(scfg.get("allowed_git_roots") or [])
+        max_bytes = int(scfg.get("max_response_bytes", 2 * 1024 * 1024))
+        s_timeout = float(scfg.get("timeout_seconds", 15.0))
+        max_redir = int(scfg.get("max_redirects", 3))
+        self.world_pipeline = WorldEventPipeline(
+            self.repo,
+            sensors=[
+                RSSWorldSensor(
+                    allowed_domains=allowed_domains,
+                    max_response_bytes=max_bytes,
+                    timeout_seconds=s_timeout,
+                    max_redirects=max_redir,
+                ),
+                GitWorldSensor(allowed_git_roots=allowed_git_roots),
+                WebChangeWorldSensor(
+                    allowed_domains=allowed_domains,
+                    max_response_bytes=max_bytes,
+                    timeout_seconds=s_timeout,
+                    max_redirects=max_redir,
+                ),
+            ],
+            interest_keywords=list(scfg.get("interest_keywords") or []),
+            importance_threshold=float(scfg.get("importance_threshold", 0.45)),
+            embedding_service=self.embedding_service,
+            allowed_domains=allowed_domains,
+            allowed_git_roots=allowed_git_roots,
+        )
+        self.env_sensor.world_pipeline = self.world_pipeline
+        self.env_sensor.poll_on_observe = bool(scfg.get("poll_on_perceive", False))
+        self.system_sensor._runner_health_fn = self.orchestrator.sync_runner_heartbeat
+
         self.loop: AutonomousLoop | None = None
         self.scheduler: OrganismScheduler | None = None
 
@@ -279,6 +321,8 @@ class OrganismRuntime:
             outbox=self.outbox,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
+        if self.world_pipeline is not None and (self._sensors_cfg or {}).get("sources"):
+            await self.world_pipeline.sync_configured_sources(self._sensors_cfg["sources"])
         recovery = await self.loop.recover()
         self.scheduler = OrganismScheduler(self.loop, self.lifecycle, self.settings.runtime)
         if start_scheduler:

@@ -1,0 +1,72 @@
+# Digital World Perception Sensors Configuration (V2.0 P1-5)
+enabled: true
+poll_on_perceive: false
+max_response_bytes: 2097152  # 2 MB hard cap
+timeout_seconds: 15.0
+max_redirects: 3
+importance_threshold: 0.45
+dedup_window_hours: 168
+
+# Strict domain allowlist for RSS & Web Change sensors (SSRF + DNS Rebinding protected)
+allowed_domains:
+  - "www.postgresql.org"
+  - "blog.python.org"
+  - "docs.python.org"
+  - "github.com"
+  - "raw.githubusercontent.com"
+  - "arxiv.org"
+  - "export.arxiv.org"
+
+# Strict read-only local filesystem roots for Git Repository sensor
+allowed_git_roots:
+  - "/home/ubuntu/aoc"
+
+# Relevance keywords boosting importance scoring
+interest_keywords:
+  - "postgresql"
+  - "pgvector"
+  - "python"
+  - "asyncio"
+  - "systemd"
+  - "cgroup"
+  - "onnx"
+  - "embedding"
+  - "agent"
+  - "mcp"
+  - "security"
+  - "vulnerability"
+  - "release"
+  - "performance"
+  - "linux"
+  - "database"
+  - "llm"
+
+# Default configured sources (can be toggled via POST /v2/world/sources/{id}/enable|disable)
+sources:
+  - source_id: "git-aoc-repo"
+    sensor_type: "git"
+    name: "AOC Local Repository (Read-Only)"
+    enabled: true
+    reliability_score: 0.95
+    poll_interval_seconds: 600
+    config:
+      repo_path: "/home/ubuntu/aoc"
+      branch: "HEAD"
+      max_commits: 5
+  - source_id: "rss-postgresql-news"
+    sensor_type: "rss"
+    name: "PostgreSQL Official News Feed"
+    enabled: false
+    reliability_score: 0.90
+    poll_interval_seconds: 3600
+    config:
+      url: "https://www.postgresql.org/news.rss"
+      max_items: 10
+  - source_id: "web-python-whatsnew"
+    sensor_type: "web"
+    name: "Python 3.12 Documentation Release Notes"
+    enabled: false
+    reliability_score: 0.90
+    poll_interval_seconds: 3600
+    config:
+      url: "https://docs.python.org/3.12/whatsnew/3.12.html"

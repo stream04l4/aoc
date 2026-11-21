@@ -24,12 +24,16 @@ class SystemSensor(SensorInterface):
         repo: StateRepository | None = None,
         http_client: httpx.AsyncClient | None = None,
         llm_probe_fn: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        runner_health_fn: Callable[[], Awaitable[dict[str, Any] | None]] | None = None,
+        db_ping_fn: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.cfg = perception_cfg
         self.llm_cfg = llm_cfg
         self.repo = repo
         self._http_client = http_client
         self._llm_probe_fn = llm_probe_fn
+        self._runner_health_fn = runner_health_fn
+        self._db_ping_fn = db_ping_fn
 
     async def observe(self) -> Observation:
         now = utcnow()
@@ -107,9 +111,31 @@ class SystemSensor(SensorInterface):
         else:
             sys_state["llm"] = unavailable("llm_probe disabled")
 
-        # 5. Monitored external services
+        # 5. Monitored external services + V2.0 P1-5 Runner / DB / Error-rate telemetry
         if self.cfg.monitored_services:
             sys_state["services"] = await self._probe_services()
+
+        if self._db_ping_fn is not None:
+            try:
+                db_ok = await self._db_ping_fn()
+                sys_state["database"] = {"ok": bool(db_ok)}
+            except Exception as exc:
+                sys_state["database"] = {"ok": False, "error": str(exc)}
+
+        if self._runner_health_fn is not None:
+            try:
+                r_health = await self._runner_health_fn()
+                if r_health is not None:
+                    sys_state["runner"] = r_health
+            except Exception as exc:
+                sys_state["runner"] = {"status": "offline", "error": str(exc)}
+
+        if self.repo is not None:
+            try:
+                err_15m = await self.repo.count_recent_error_events(minutes=15)
+                sys_state["error_rate_15m"] = err_15m
+            except Exception:
+                pass
 
         # 6. Apply explicit simulation overrides from world_states (never modifies real host)
         sim_notes: list[str] = []

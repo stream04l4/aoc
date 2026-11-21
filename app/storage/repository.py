@@ -42,8 +42,11 @@ from app.storage.models import (
     PolicyEvaluation,
     ResourceUsage,
     RunnerRegistryRow,
+    SensorCheckpoint,
     SystemConfig,
     TaskLifecycleEvent,
+    WorldEventRow,
+    WorldEventSource,
     WorldState,
 )
 
@@ -1795,6 +1798,259 @@ class StateRepository:
                 )
             ).scalar_one_or_none()
             return self._exec_dict(row) if row else None
+
+    async def count_recent_error_events(self, minutes: int = 15) -> int:
+        since = utcnow() - timedelta(minutes=max(1, int(minutes)))
+        async with self.db.session() as s:
+            return int(
+                (
+                    await s.execute(
+                        select(func.count(EventLog.id)).where(
+                            EventLog.level.in_(["error", "critical"]),
+                            EventLog.created_at >= since,
+                        )
+                    )
+                ).scalar_one()
+            )
+
+    # ── digital world perception sensors & events (P1-5) ────────────────────
+    async def upsert_world_source(
+        self,
+        *,
+        source_id: str,
+        sensor_type: str,
+        name: str = "",
+        config: dict[str, Any] | None = None,
+        reliability_score: float = 0.7,
+        poll_interval_seconds: int = 900,
+        enabled: bool = True,
+    ) -> dict:
+        now = utcnow()
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(WorldEventSource).where(WorldEventSource.source_id == source_id))
+            ).scalar_one_or_none()
+            if row is None:
+                row = WorldEventSource(
+                    source_id=source_id,
+                    sensor_type=sensor_type,
+                    name=name,
+                    config=_jsonable(config or {}),
+                    reliability_score=float(reliability_score),
+                    poll_interval_seconds=int(poll_interval_seconds),
+                    enabled=bool(enabled),
+                    updated_at=now,
+                )
+                s.add(row)
+            else:
+                row.sensor_type = sensor_type
+                row.name = name or row.name
+                if config is not None:
+                    row.config = _jsonable(config)
+                row.reliability_score = float(reliability_score)
+                row.poll_interval_seconds = int(poll_interval_seconds)
+                row.enabled = bool(enabled)
+                row.updated_at = now
+            await s.flush()
+            return self._world_source_dict(row)
+
+    async def get_world_source(self, source_id: str) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(WorldEventSource).where(WorldEventSource.source_id == source_id))
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            cp = (
+                await s.execute(select(SensorCheckpoint).where(SensorCheckpoint.source_id == source_id))
+            ).scalar_one_or_none()
+            return self._world_source_dict(row, cp)
+
+    async def list_world_sources(self, enabled_only: bool = False) -> list[dict]:
+        async with self.db.session() as s:
+            q = select(WorldEventSource)
+            if enabled_only:
+                q = q.where(WorldEventSource.enabled.is_(True))
+            rows = (await s.execute(q.order_by(WorldEventSource.source_id.asc()))).scalars().all()
+            cps = (await s.execute(select(SensorCheckpoint))).scalars().all()
+            cp_map = {c.source_id: c for c in cps}
+            return [self._world_source_dict(r, cp_map.get(r.source_id)) for r in rows]
+
+    async def set_world_source_enabled(self, source_id: str, enabled: bool) -> dict | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(select(WorldEventSource).where(WorldEventSource.source_id == source_id))
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            row.enabled = bool(enabled)
+            row.updated_at = utcnow()
+            await s.flush()
+            return self._world_source_dict(row)
+
+    async def update_world_source_health(
+        self, source_id: str, *, health_status: str, last_error: str | None = None
+    ) -> None:
+        async with self.db.session() as s:
+            await s.execute(
+                update(WorldEventSource)
+                .where(WorldEventSource.source_id == source_id)
+                .values(health_status=health_status, last_error=last_error, updated_at=utcnow())
+            )
+
+    @staticmethod
+    def _world_source_dict(r: WorldEventSource, cp: SensorCheckpoint | None = None) -> dict:
+        d = {
+            "id": str(r.id),
+            "source_id": r.source_id,
+            "sensor_type": r.sensor_type,
+            "name": r.name,
+            "config": r.config,
+            "reliability_score": float(r.reliability_score),
+            "poll_interval_seconds": int(r.poll_interval_seconds),
+            "enabled": bool(r.enabled),
+            "health_status": r.health_status,
+            "last_error": r.last_error,
+            "updated_at": r.updated_at,
+        }
+        if cp is not None:
+            d["checkpoint"] = {
+                "last_polled_at": cp.last_polled_at,
+                "last_success_at": cp.last_success_at,
+                "consecutive_failures": cp.consecutive_failures,
+            }
+        return d
+
+    async def get_sensor_checkpoint(self, source_id: str) -> dict | None:
+        async with self.db.session() as s:
+            cp = (
+                await s.execute(select(SensorCheckpoint).where(SensorCheckpoint.source_id == source_id))
+            ).scalar_one_or_none()
+            if cp is None:
+                return None
+            return {
+                "source_id": cp.source_id,
+                "cursor": cp.cursor,
+                "last_polled_at": cp.last_polled_at,
+                "last_success_at": cp.last_success_at,
+                "consecutive_failures": cp.consecutive_failures,
+                "updated_at": cp.updated_at,
+            }
+
+    async def upsert_sensor_checkpoint(
+        self,
+        *,
+        source_id: str,
+        cursor: dict[str, Any],
+        last_polled_at: datetime | None = None,
+        last_success_at: datetime | None = None,
+        consecutive_failures: int = 0,
+    ) -> None:
+        now = utcnow()
+        async with self.db.session() as s:
+            cp = (
+                await s.execute(select(SensorCheckpoint).where(SensorCheckpoint.source_id == source_id))
+            ).scalar_one_or_none()
+            if cp is None:
+                s.add(
+                    SensorCheckpoint(
+                        source_id=source_id,
+                        cursor=_jsonable(cursor),
+                        last_polled_at=last_polled_at or now,
+                        last_success_at=last_success_at,
+                        consecutive_failures=int(consecutive_failures),
+                        updated_at=now,
+                    )
+                )
+            else:
+                cp.cursor = _jsonable(cursor)
+                if last_polled_at is not None:
+                    cp.last_polled_at = last_polled_at
+                if last_success_at is not None:
+                    cp.last_success_at = last_success_at
+                cp.consecutive_failures = int(consecutive_failures)
+                cp.updated_at = now
+
+    async def world_event_exists(self, source_id: str, content_hash: str) -> bool:
+        async with self.db.session() as s:
+            found = (
+                await s.execute(
+                    select(WorldEventRow.id).where(
+                        WorldEventRow.source_id == source_id,
+                        WorldEventRow.content_hash == content_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            return found is not None
+
+    async def create_world_event(
+        self,
+        *,
+        source_id: str,
+        event_type: str,
+        title: str,
+        content: str,
+        content_hash: str,
+        source_reliability: float,
+        importance_score: float,
+        status: str,
+        metadata: dict[str, Any],
+        observed_at: datetime,
+    ) -> uuid.UUID | None:
+        async with self.db.session() as s:
+            row = WorldEventRow(
+                source_id=source_id,
+                event_type=event_type,
+                title=title[:512],
+                content=content,
+                content_hash=content_hash,
+                source_reliability=float(source_reliability),
+                importance_score=float(importance_score),
+                status=status,
+                meta=_jsonable(metadata),
+                observed_at=observed_at,
+            )
+            s.add(row)
+            try:
+                await s.flush()
+                return row.id
+            except IntegrityError:
+                await s.rollback()
+                return None
+
+    async def list_world_events(
+        self,
+        *,
+        source_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        async with self.db.session() as s:
+            q = select(WorldEventRow)
+            if source_id:
+                q = q.where(WorldEventRow.source_id == source_id)
+            if status:
+                q = q.where(WorldEventRow.status == status)
+            rows = (
+                await s.execute(q.order_by(WorldEventRow.observed_at.desc()).limit(limit))
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "source_id": r.source_id,
+                    "event_type": r.event_type,
+                    "title": r.title,
+                    "content": r.content,
+                    "content_hash": r.content_hash,
+                    "source_reliability": float(r.source_reliability),
+                    "importance_score": float(r.importance_score),
+                    "status": r.status,
+                    "metadata": r.meta,
+                    "observed_at": r.observed_at,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
 
 
 def day_start(now: datetime | None = None) -> datetime:

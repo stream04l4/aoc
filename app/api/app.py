@@ -63,6 +63,16 @@ class MemorySyncReplayRequest(BaseModel):
     dispatch_now: bool = True
 
 
+class WorldSourceUpsertRequest(BaseModel):
+    source_id: str
+    sensor_type: str  # rss | git | web | system
+    name: str = ""
+    config: dict[str, Any] = {}
+    reliability_score: float = 0.7
+    poll_interval_seconds: int = 900
+    enabled: bool = True
+
+
 def create_app(
     settings: Settings | None = None,
     db: Database | None = None,
@@ -338,6 +348,83 @@ def create_app(
         if not deleted:
             raise HTTPException(status_code=404, detail="world item not found")
         return {"deleted": True, "kind": kind, "key": key}
+
+    # ── Digital World Perception Sensors (V2.0 P1-5) ────────────────────────
+    @app.get("/v2/world/events")
+    async def list_world_events_v2(
+        source_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().repo.list_world_events(
+            source_id=source_id, status=status, limit=min(max(limit, 1), 200)
+        )
+
+    @app.get("/v2/world/sources")
+    async def list_world_sources_v2(
+        enabled_only: bool = False, _: Principal = Depends(require_scope(SCOPE_READ))
+    ) -> list[dict[str, Any]]:
+        return await _rt().repo.list_world_sources(enabled_only=enabled_only)
+
+    @app.post("/v2/world/sources")
+    async def upsert_world_source_v2(
+        req: WorldSourceUpsertRequest, _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
+        rt = _rt()
+        if req.sensor_type not in {"rss", "git", "web", "system"}:
+            raise HTTPException(status_code=400, detail=f"Unsupported sensor_type '{req.sensor_type}'")
+        if req.sensor_type in {"rss", "web"} and rt.world_pipeline is not None:
+            from app.perception.world.security import SSRFBlockedError, is_domain_allowed
+            from urllib.parse import urlparse
+
+            raw_url = str(req.config.get("url") or "").strip()
+            parsed = urlparse(raw_url)
+            if not raw_url or not is_domain_allowed(parsed.hostname or "", rt.world_pipeline.allowed_domains):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Source URL domain '{parsed.hostname}' is not in sensors allowed_domains allowlist",
+                )
+        return await rt.repo.upsert_world_source(
+            source_id=req.source_id,
+            sensor_type=req.sensor_type,
+            name=req.name,
+            config=req.config,
+            reliability_score=req.reliability_score,
+            poll_interval_seconds=req.poll_interval_seconds,
+            enabled=req.enabled,
+        )
+
+    @app.post("/v2/world/sources/{source_id}/enable")
+    async def enable_world_source_v2(
+        source_id: str, _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
+        updated = await _rt().repo.set_world_source_enabled(source_id, True)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="World source not found")
+        return updated
+
+    @app.post("/v2/world/sources/{source_id}/disable")
+    async def disable_world_source_v2(
+        source_id: str, _: Principal = Depends(require_scope(SCOPE_CONTROL))
+    ) -> dict[str, Any]:
+        updated = await _rt().repo.set_world_source_enabled(source_id, False)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="World source not found")
+        return updated
+
+    @app.post("/v2/world/poll")
+    async def poll_world_sources_v2(
+        source_id: str | None = None,
+        force: bool = True,
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        if rt.world_pipeline is None:
+            raise HTTPException(status_code=503, detail="WorldEventPipeline not initialized")
+        if source_id:
+            return {"results": [await rt.world_pipeline.poll_source(source_id, force=force)]}
+        return {"results": await rt.world_pipeline.poll_all(force=force)}
 
     # ── Lifecycle control ───────────────────────────────────────────────────
     @app.post("/control/pause")
