@@ -40,6 +40,7 @@ class AffectModulator(AffectModulatorInterface):
         else:
             self.cfg = AffectConfig()
         self._state = AffectState()
+        self._seen_trigger_ids: set[str] = set()
 
     @property
     def enabled(self) -> bool:
@@ -64,6 +65,8 @@ class AffectModulator(AffectModulatorInterface):
         recent_successes: int = 0,
         last_information_gain: float | None = None,
         idle_cycles: int = 0,
+        low_ig_streak: int = 0,
+        world_event_novelty: float = 0.0,
     ) -> tuple[AffectState, str]:
         """Pure deterministic event-driven state transition (strictly bounded)."""
         d = self.cfg.decay_rate
@@ -95,6 +98,17 @@ class AffectModulator(AffectModulatorInterface):
             arousal -= 0.05 * min(idle_cycles, 4)
             reasons.append(f"idle_cycles={idle_cycles}")
 
+        if low_ig_streak > 0:
+            boredom += self.cfg.low_ig_boredom_step * min(low_ig_streak, 4)
+            reasons.append(f"low_ig_streak={low_ig_streak}")
+
+        novelty = max(0.0, min(1.0, float(world_event_novelty or 0.0)))
+        if novelty > 0.0:
+            arousal += self.cfg.world_novelty_arousal_step * novelty
+            valence += 0.08 * novelty
+            boredom *= max(0.5, 1.0 - 0.4 * novelty)
+            reasons.append(f"world_novelty={novelty:.2f}")
+
         new_state = AffectState(
             valence=valence,
             arousal=arousal,
@@ -103,6 +117,29 @@ class AffectModulator(AffectModulatorInterface):
             boredom=boredom,
         )
         return new_state, ("; ".join(reasons) or "neutral_decay")
+
+    def replay_events(
+        self, events: list[dict[str, Any]], initial: AffectState | None = None
+    ) -> AffectState:
+        """Deterministically replay a sequence of historical affect events (strictly reproducible)."""
+        cur = initial or AffectState()
+        seen: set[str] = set()
+        for ev in events:
+            tid = ev.get("trigger_event_id")
+            if tid:
+                if str(tid) in seen:
+                    continue
+                seen.add(str(tid))
+            cur, _ = self.step_state(
+                cur,
+                consecutive_failures=int(ev.get("consecutive_failures", 0)),
+                recent_successes=int(ev.get("recent_successes", 0)),
+                last_information_gain=ev.get("last_information_gain"),
+                idle_cycles=int(ev.get("idle_cycles", 0)),
+                low_ig_streak=int(ev.get("low_ig_streak", 0)),
+                world_event_novelty=float(ev.get("world_event_novelty", 0.0)),
+            )
+        return cur
 
     def compute_modulation(self, state: AffectState | None = None) -> AffectModulation:
         """Map bounded AffectState to bounded behavioral modulation within ±maximum_influence."""
@@ -150,11 +187,22 @@ class AffectModulator(AffectModulatorInterface):
         idle_cycles: int = 0,
         cycle_id: uuid.UUID | None = None,
         trigger_reason: str = "cycle",
+        trigger_event_id: str | None = None,
+        low_ig_streak: int = 0,
+        world_event_novelty: float = 0.0,
     ) -> tuple[AffectState, AffectModulation]:
         if not self.enabled:
             return self._state, AffectModulation(
                 enabled=False, maximum_influence=self.cfg.maximum_influence, reason="affect disabled"
             )
+
+        # V3.0 M2: strict event idempotency (in-memory + DB check prevents double-stepping on replay)
+        if trigger_event_id:
+            if trigger_event_id in self._seen_trigger_ids:
+                return self._state, self.compute_modulation(self._state)
+            if self.repo is not None and await self.repo.has_affect_trigger_event(trigger_event_id):
+                self._seen_trigger_ids.add(trigger_event_id)
+                return self._state, self.compute_modulation(self._state)
 
         # Count trailing consecutive failures from most recent executions
         consec_fail = 0
@@ -171,9 +219,13 @@ class AffectModulator(AffectModulatorInterface):
             recent_successes=recent_ok,
             last_information_gain=last_information_gain,
             idle_cycles=idle_cycles,
+            low_ig_streak=low_ig_streak,
+            world_event_novelty=world_event_novelty,
         )
         self._state = new_state
         mod = self.compute_modulation(new_state)
+        if trigger_event_id:
+            self._seen_trigger_ids.add(trigger_event_id)
 
         if self.repo is not None and self.organism_id is not None:
             await self.repo.update_organism_state(
@@ -190,6 +242,8 @@ class AffectModulator(AffectModulatorInterface):
                 boredom=new_state.boredom,
                 modulation_applied=mod.model_dump(mode="json"),
                 trigger_reason=f"{trigger_reason}: {calc_reason}",
+                trigger_event_id=trigger_event_id,
+                decay_applied=self.cfg.decay_rate,
             )
 
         return new_state, mod
@@ -202,6 +256,9 @@ class AffectModulator(AffectModulatorInterface):
         idle_cycles: int = 0,
         cycle_id: uuid.UUID | None = None,
         trigger_reason: str = "cycle",
+        trigger_event_id: str | None = None,
+        low_ig_streak: int = 0,
+        world_event_novelty: float = 0.0,
     ) -> AffectModulation:
         """Fault-isolated entrypoint for AutonomousLoop: NEVER raises; falls back to neutral V1.0 policy."""
         if not self.enabled:
@@ -213,6 +270,9 @@ class AffectModulator(AffectModulatorInterface):
                 idle_cycles=idle_cycles,
                 cycle_id=cycle_id,
                 trigger_reason=trigger_reason,
+                trigger_event_id=trigger_event_id,
+                low_ig_streak=low_ig_streak,
+                world_event_novelty=world_event_novelty,
             )
             return mod
         except Exception as exc:

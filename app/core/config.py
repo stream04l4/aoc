@@ -195,6 +195,8 @@ class KernelV3Settings(BaseModel):
     goal_low_ig_cooldown_minutes: int = 120
     goal_low_ig_threshold: float = 0.15
     ig_v2_enabled: bool = True
+    # V3.0 M2: optional runtime override for AffectModulator (None = inherit config/affect.yaml)
+    affect_enabled: bool | None = None
 
 
 class _YamlSource(PydanticBaseSettingsSource):

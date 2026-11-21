@@ -111,6 +111,7 @@ class AutonomousLoop:
         self.skill_registry = skill_registry
         self.affect = affect
         self._consecutive_idle_cycles: int = 0
+        self._low_ig_streak: int = 0
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -152,6 +153,11 @@ class AutonomousLoop:
         self._last_learning_at = when
         self._last_info_gain = gain
         self._last_info_gain_at = when
+        low_thresh = float(self.settings.kernel_v3.goal_low_ig_threshold)
+        if gain >= low_thresh:
+            self._low_ig_streak = 0
+        else:
+            self._low_ig_streak += 1
 
     async def recover(self) -> dict[str, Any]:
         """Startup recovery (Scenario E): restore identity, memory, probes, and orphan tasks."""
@@ -377,12 +383,17 @@ class AutonomousLoop:
             affect_mod_payload: dict[str, Any] | None = None
             if self.affect is not None and getattr(self.affect, "enabled", False):
                 try:
+                    ext_events = pre_obs.external_events or []
+                    world_novelty = min(1.0, len(ext_events) * 0.25) if ext_events else 0.0
                     mod = await self.affect.evaluate_safe(
                         recent_execution_statuses=drive_ctx.recent_execution_statuses,
                         last_information_gain=self._last_info_gain,
                         idle_cycles=self._consecutive_idle_cycles,
                         cycle_id=cycle_id,
                         trigger_reason="drive_arbitration",
+                        trigger_event_id=f"cycle:{cycle_id}:drive_arbitration",
+                        low_ig_streak=self._low_ig_streak,
+                        world_event_novelty=world_novelty,
                     )
                     if mod.enabled:
                         affect_mod_payload = mod.model_dump(mode="json")
@@ -525,6 +536,7 @@ class AutonomousLoop:
                         },
                     )
                     outcome = "GOAL_DEDUP_SKIPPED"
+                    self._low_ig_streak += 1
                     await self.lifecycle.transition(
                         LifecycleState.IDLE,
                         reason=f"Goal deduplicated ({dedup_res.reason_code})",

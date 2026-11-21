@@ -334,11 +334,14 @@ class OrganismRuntime:
         )
         self.skill_registry.self_model = self.self_model
 
-        # Optional bounded Affect modulation layer (V2.0 P1-9, disabled by default)
+        # Optional bounded Affect modulation layer (V2.0 P1-9 / V3.0 M2)
+        eff_affect_cfg = dict(self._affect_cfg or {})
+        if self.settings.kernel_v3.affect_enabled is not None:
+            eff_affect_cfg["enabled"] = bool(self.settings.kernel_v3.affect_enabled)
         self.affect = AffectModulator(
             organism_id=self.organism_id,
             repo=self.repo,
-            config=self._affect_cfg,
+            config=eff_affect_cfg,
         )
 
         self.finalizer = TaskFinalizer(

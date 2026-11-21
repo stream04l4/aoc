@@ -2604,7 +2604,20 @@ class StateRepository:
                 for r in rows
             ]
 
-    # ── optional affect history (P1-9, disabled by default) ─────────────────
+    # ── optional affect history (P1-9 / V3.0 M2) ────────────────────────────
+    async def has_affect_trigger_event(self, trigger_event_id: str) -> bool:
+        if not trigger_event_id:
+            return False
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(AffectHistoryRow.id)
+                    .where(AffectHistoryRow.trigger_event_id == trigger_event_id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return row is not None
+
     async def record_affect_history(
         self,
         *,
@@ -2617,6 +2630,8 @@ class StateRepository:
         modulation_applied: dict[str, Any] | None = None,
         trigger_reason: str = "",
         cycle_id: uuid.UUID | None = None,
+        trigger_event_id: str | None = None,
+        decay_applied: float | None = None,
     ) -> uuid.UUID:
         async with self.db.session() as s:
             row = AffectHistoryRow(
@@ -2629,6 +2644,8 @@ class StateRepository:
                 boredom=float(boredom),
                 modulation_applied=_jsonable(modulation_applied or {}),
                 trigger_reason=trigger_reason[:1000],
+                trigger_event_id=trigger_event_id[:128] if trigger_event_id else None,
+                decay_applied=float(decay_applied) if decay_applied is not None else None,
                 created_at=utcnow(),
             )
             s.add(row)
@@ -2659,6 +2676,8 @@ class StateRepository:
                     "boredom": float(r.boredom),
                     "modulation_applied": r.modulation_applied or {},
                     "trigger_reason": r.trigger_reason,
+                    "trigger_event_id": r.trigger_event_id,
+                    "decay_applied": float(r.decay_applied) if r.decay_applied is not None else None,
                     "created_at": r.created_at,
                 }
                 for r in rows

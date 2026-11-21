@@ -29,6 +29,9 @@ class AffectConfig(BaseModel):
     success_valence_step: float = 0.18
     info_gain_valence_weight: float = 0.35
     idle_boredom_step: float = 0.14
+    low_ig_boredom_step: float = 0.12
+    low_ig_threshold: float = 0.15
+    world_novelty_arousal_step: float = 0.10
 
     @field_validator("maximum_influence")
     @classmethod
@@ -101,4 +104,7 @@ class AffectModulatorInterface(ABC):
         idle_cycles: int = 0,
         cycle_id: Any = None,
         trigger_reason: str = "cycle",
+        trigger_event_id: str | None = None,
+        low_ig_streak: int = 0,
+        world_event_novelty: float = 0.0,
     ) -> tuple[AffectState, AffectModulation]: ...

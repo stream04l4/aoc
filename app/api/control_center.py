@@ -937,6 +937,23 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 c_q = c_q.where(CycleRecord.started_at >= since)
             c_rows = (await s.execute(c_q)).scalars().all()
 
+        affect_hist = (await rt.repo.list_affect_history(org_id, limit=80)) if org_id else []
+        affect_hist_asc = list(reversed(affect_hist))
+        if since is not None:
+            affect_hist_asc = [
+                h
+                for h in affect_hist_asc
+                if h.get("created_at") is None
+                or (
+                    h["created_at"].replace(tzinfo=since.tzinfo)
+                    if h["created_at"].tzinfo is None
+                    else h["created_at"]
+                )
+                >= since
+            ]
+        affect_mod = rt.affect.compute_modulation().model_dump(mode="json") if rt.affect else {"enabled": False}
+        affect_state = rt.affect.state.model_dump(mode="json") if (rt.affect and rt.affect.enabled) else None
+
         predicted_vs_measured = []
         for c in c_rows:
             sc = c.state_changes or {}
@@ -986,6 +1003,29 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 for a in arb_rows
             ],
             "predicted_vs_measured": predicted_vs_measured,
+            "affect": {
+                "enabled": bool(rt.affect and rt.affect.enabled),
+                "maximum_influence": float(rt.affect.cfg.maximum_influence) if rt.affect else 0.15,
+                "current_state": affect_state,
+                "current_modulation": affect_mod,
+                "history": [
+                    {
+                        "id": h["id"],
+                        "cycle_id": h["cycle_id"],
+                        "timestamp": _iso(h["created_at"]),
+                        "valence": round(float(h["valence"]), 4),
+                        "arousal": round(float(h["arousal"]), 4),
+                        "confidence": round(float(h["confidence"]), 4),
+                        "frustration": round(float(h["frustration"]), 4),
+                        "boredom": round(float(h["boredom"]), 4),
+                        "decay_applied": h.get("decay_applied"),
+                        "trigger_event_id": h.get("trigger_event_id"),
+                        "trigger_reason": h.get("trigger_reason", ""),
+                        "modulation_applied": h.get("modulation_applied", {}),
+                    }
+                    for h in affect_hist_asc
+                ],
+            },
             "goal_transitions": [
                 {
                     "id": str(g.id),

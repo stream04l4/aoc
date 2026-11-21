@@ -63,6 +63,18 @@ export function DrivesPage({
     return Object.values(byTime).slice(-80);
   }, [data]);
 
+  const affectSeries = useMemo(() => {
+    const hist = data?.affect?.history || [];
+    return hist.slice(-60).map((h: any) => ({
+      label: formatTime(h.timestamp).slice(6),
+      valence: Number((Number(h.valence || 0) * 100).toFixed(1)),
+      arousal: Number((Number(h.arousal || 0) * 100).toFixed(1)),
+      confidence: Number((Number(h.confidence || 0) * 100).toFixed(1)),
+      frustration: Number((Number(h.frustration || 0) * 100).toFixed(1)),
+      boredom: Number((Number(h.boredom || 0) * 100).toFixed(1)),
+    }));
+  }, [data]);
+
   if (loading && !data) return <LoadingPanel />;
   if (err && !data) return <ErrorBanner error={err} />;
   if (!data) return <EmptyState title="暂无欲望状态数据" />;
@@ -119,6 +131,78 @@ export function DrivesPage({
           </Card>
         ))}
       </div>
+
+      {/* V3.0 M2 Affect Kernel Panel (fused into Drives page, zero extra menus) */}
+      {data.affect && (
+        <Card>
+          <CardHeader
+            title="情绪内核状态与演化曲线（AffectModulator · 有界调制）"
+            subtitle={`受控调制幅度硬上限 ±${Number(data.affect.maximum_influence || 0.15).toFixed(2)} · 永不触碰 L0–L3 Governance 与 Survival 紧急保护`}
+            action={<StatusBadge value={data.affect.enabled ? 'ENABLED' : 'DISABLED'} />}
+          />
+          <div className="p-4 space-y-4">
+            {data.affect.current_state ? (
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+                {[
+                  { k: 'valence', label: 'Valence（正负效价）', range: '[-1, 1]' },
+                  { k: 'arousal', label: 'Arousal（激活度）', range: '[0, 1]' },
+                  { k: 'confidence', label: 'Confidence（置信度）', range: '[0, 1]' },
+                  { k: 'frustration', label: 'Frustration（挫折度）', range: '[0, 1]' },
+                  { k: 'boredom', label: 'Boredom（厌倦度）', range: '[0, 1]' },
+                ].map((dim) => (
+                  <div key={dim.k} className="rounded-lg bg-slate-100/70 p-2.5 dark:bg-slate-900/70">
+                    <div className="text-[11px] text-slate-500">{dim.label}</div>
+                    <div className="mt-1 text-base font-semibold font-mono text-cyan-600 dark:text-cyan-400">
+                      {Number(data.affect.current_state[dim.k] ?? 0).toFixed(3)}
+                    </div>
+                    <div className="text-[10px] font-mono text-slate-400">{dim.range}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                当前情绪内核开关处于关闭状态（Feature Flag = false），完全按 V2.1 原始确定性公式运行；开启 AOC_KERNEL_V3__AFFECT_ENABLED=true 后将实时记录 5 维情绪状态与调制增量。
+              </div>
+            )}
+
+            {data.affect.enabled && data.affect.current_modulation && (
+              <div className="flex flex-wrap gap-3 text-[11px] font-mono text-slate-500">
+                <span>Curiosity Δ: {Number(data.affect.current_modulation.curiosity_priority_delta || 0).toFixed(4)}</span>
+                <span>·</span>
+                <span>Reproduction Δ: {Number(data.affect.current_modulation.reproduction_priority_delta || 0).toFixed(4)}</span>
+                <span>·</span>
+                <span>Retry Backoff ×{Number(data.affect.current_modulation.retry_backoff_multiplier || 1).toFixed(3)}</span>
+              </div>
+            )}
+
+            {affectSeries.length > 0 && (
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={affectSeries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.15)" />
+                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94a3b8' }} minTickGap={24} />
+                    <YAxis domain={[-100, 100]} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #334155',
+                        borderRadius: 8,
+                        fontSize: 12,
+                      }}
+                    />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <Line type="monotone" dataKey="valence" name="Valence" stroke="#10b981" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="arousal" name="Arousal" stroke="#f59e0b" strokeWidth={1.8} dot={false} />
+                    <Line type="monotone" dataKey="confidence" name="Confidence" stroke="#06b6d4" strokeWidth={1.8} dot={false} />
+                    <Line type="monotone" dataKey="frustration" name="Frustration" stroke="#ef4444" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="boredom" name="Boredom" stroke="#a855f7" strokeWidth={1.8} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
 
       {/* Historical curves */}
       <Card>
