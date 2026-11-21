@@ -1,0 +1,49 @@
+# Prometheus Alerting Rules for Artificial Organism Core (AOC V2.0)
+groups:
+  - name: aoc_v2_resource_and_health
+    interval: 30s
+    rules:
+      - alert: AOCCoreHighMemoryRSS
+        expr: process_resident_memory_bytes{job="aoc-core"} > 536870912
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AOC Core RSS exceeded 512MB redline"
+          description: "AOC Core resident memory has been above 512MB for 5 minutes."
+
+      - alert: AOCCycleFatalError
+        expr: increase(aoc_cycles_total{outcome="ERROR"}[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AOC AutonomousLoop recorded a cycle ERROR"
+          description: "At least one autonomous cycle ended with outcome=ERROR in the last 15m."
+
+      - alert: AOCCriticalSurvivalState
+        expr: aoc_drive_satisfaction{drive="survival"} < 0.30
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AOC Survival satisfaction dropped below critical threshold (0.30)"
+          description: "Check disk headroom, memory, PostgreSQL connectivity, and remote LLM availability."
+
+      - alert: AOCLLMHighFailureRate
+        expr: rate(aoc_llm_calls_total{result="error"}[10m]) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated remote LLM failure rate via LLMGateway"
+          description: "Remote vLLM endpoint is experiencing errors or timeouts; circuit breaker may engage."
+
+      - alert: AOCMemorySyncFailures
+        expr: increase(aoc_memory_writes_total{result="failed"}[15m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repeated Letta memory synchronization failures"
+          description: "Outbox events will retry with exponential backoff; inspect aoc-letta container health."
