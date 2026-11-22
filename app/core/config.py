@@ -160,6 +160,8 @@ class EmbeddingSettings(BaseModel):
 
 class TelegramSettings(BaseModel):
     enabled: bool = False
+    polling_enabled: bool = False
+    polling_interval_seconds: float = 5.0
     bot_token: SecretStr | None = None
     webhook_secret: SecretStr | None = None
     allowed_chat_ids: list[str] = Field(default_factory=list)
@@ -216,6 +218,10 @@ class KernelV3Settings(BaseModel):
     playbooks_enabled: bool = True
     open_public_perception_enabled: bool = False
     max_internal_curiosity_ratio: float = 0.45
+    # V4.1: Proactive rate-limited human outreach & bidirectional Telegram guidance
+    human_outreach_enabled: bool = True
+    human_outreach_cooldown_minutes: int = 120
+    human_outreach_topic_dedup_hours: float = 24.0
 
 
 class _YamlSource(PydanticBaseSettingsSource):

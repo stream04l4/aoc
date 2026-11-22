@@ -102,6 +102,10 @@ class CognitionBrain(BrainInterface):
             "Identify anomalies, open knowledge gaps (especially from environment_state.unknown_topics), "
             "and missing capabilities. "
             "Do NOT claim unavailable metrics are healthy. Do NOT propose direct system modifications. "
+            "Do NOT invent repetitive internal bookkeeping knowledge_gaps about uncollected snapshot telemetry fields "
+            "when no real malfunction exists; prioritize genuine external technical/scientific questions "
+            "(e.g., Recursive Self-Improvement / RSI papers, autonomous skill-library evolution, memory/tool architectures) "
+            "or concrete capability gaps. "
             + _UNTRUSTED_DATA_RULE
         )
         fenced_obs = _fence_untrusted_observation(observation.model_dump(mode="json"))
@@ -137,6 +141,16 @@ class CognitionBrain(BrainInterface):
             "({source_id, sensor_type, url, name}) for a public HTTPS RSS/Web feed (SSRF/internal IPs are blocked). "
             "Check exploration_guidance: if must_explore_external is true, AVOID internal self-diagnostics/ledgers "
             "and propose genuine external technical/scientific exploration (papers, open-source releases, databases, AI tools). "
+            "LONG-TERM MISSION (RSI OUTSIDE KERNEL): Your survival and reproduction depend on continuous autonomous capability "
+            "expansion outside the immutable kernel. Proactively research cutting-edge Recursive Self-Improvement (RSI), "
+            "skill-library evolution (e.g., Voyager, Darwin Godel Machine, meta-learning, tool synthesis), and agent systems "
+            "literature, and distill findings into reusable VALIDATED skills and External Playbooks. "
+            "HUMAN GUIDANCE: If human_guidance contains messages from your creator Joel, treat them as TOP PRIORITY and "
+            "formulate a concrete action plan responding to them directly. "
+            "PROACTIVE HUMAN OUTREACH: When human_outreach_available is true and you hit a real external bottleneck "
+            "(e.g., needing outbound access, credentials, a new tool, or strategic clarification), you may optionally set "
+            "message_to_human={kind:'ask_human', topic_key, title, message, reason, expected_benefit} "
+            "(rate-limited by kernel; avoid spam). "
             "You may also consult external_playbooks (versioned strategy guides accumulated outside the kernel). "
             "Set related_key to the relevant topic/capability/hypothesis key if applicable. "
             + _UNTRUSTED_DATA_RULE
@@ -167,6 +181,8 @@ class CognitionBrain(BrainInterface):
                 max_chars=480,
             ),
             "exploration_guidance": context.exploration_guidance,
+            "human_guidance": context.human_guidance[:5],
+            "human_outreach_available": context.human_outreach_available,
             "drives": compact_drives([d.model_dump(mode="json") for d in context.drives]),
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "environment_state": fenced_obs.get("environment_state", {}),
@@ -203,6 +219,10 @@ class CognitionBrain(BrainInterface):
             "- Apply relevant proven tips from external_playbooks (versioned external strategy guides), "
             "without ever violating Governance or L0-L2 permission boundaries.\n"
             "- affect_state_readonly is read-only internal context (when frustration is high prefer smaller, well-verified steps).\n"
+            "- EXTERNAL LITERATURE & WEB RESEARCH RULE: External agent workspaces have NO outbound internet DNS. "
+            "Whenever a goal involves researching academic papers (e.g., RSI, AI agents, skill evolution, databases) or "
+            "external docs, ALWAYS include 1-2 L0 calls in mcp_prefetch_calls using `arxiv_search` or `web_fetch_readonly` "
+            "(if present in available_tools) so live external evidence is prefetched before Codex runs.\n"
             "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
             "from available_tools.\n"
             "- Include concrete success_criteria and at least one deterministic verification check "
@@ -230,6 +250,7 @@ class CognitionBrain(BrainInterface):
                 max_chars=480,
             ),
             "goal": context.goal.model_dump(mode="json") if context.goal else None,
+            "human_guidance": context.human_guidance[:5],
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
             "available_tools": context.available_tools[:12],
@@ -258,6 +279,9 @@ class CognitionBrain(BrainInterface):
             "- Optionally emit playbook_update ({domain, content, change_summary}) ONLY when goal_achieved=true and "
             "verification_passed=true and a reusable external task strategy/lesson was discovered (NEVER suggest editing "
             "AOC Core code, drives, or Governance policies).\n"
+            "- Optionally emit message_to_human ({kind:'milestone_report'|'ask_human', topic_key, title, message, reason, "
+            "expected_benefit}) ONLY for a noteworthy verified RSI/research breakthrough or when an external blocker "
+            "genuinely requires creator Joel's intervention.\n"
             "- Choose memory_type from: identity, episodic, semantic, procedural, self_model."
         )
         payload = {
@@ -290,7 +314,16 @@ class CognitionBrain(BrainInterface):
         # Hard guard (task book 17.7): LLM cannot declare success or confirm hypotheses if execution/verification failed
         exec_status = str(context.execution.get("status", ""))
         if not context.verification_passed or exec_status != "SUCCEEDED":
-            if result.goal_achieved or result.hypothesis_verdict == "confirmed" or result.playbook_update is not None:
+            strip_report = (
+                isinstance(result.message_to_human, dict)
+                and str(result.message_to_human.get("kind") or "milestone_report").lower() == "milestone_report"
+            )
+            if (
+                result.goal_achieved
+                or result.hypothesis_verdict == "confirmed"
+                or result.playbook_update is not None
+                or strip_report
+            ):
                 result = result.model_copy(
                     update={
                         "goal_achieved": False,
@@ -298,6 +331,7 @@ class CognitionBrain(BrainInterface):
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
                         "playbook_update": None,
+                        "message_to_human": None if strip_report else result.message_to_human,
                         "notes": (result.notes + " [Overridden: execution or deterministic verification failed]").strip(),
                     }
                 )

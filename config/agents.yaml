@@ -124,3 +124,26 @@ mcp_servers:
               type: string
             limit:
               type: integer
+
+  - server_name: "aoc-mcp-arxiv"
+    enabled: true
+    command: ["${PYTHON}", "-m", "app.tools.builtin_servers", "aoc-mcp-arxiv"]
+    tools:
+      - tool_name: "arxiv_search"
+        description: "Read-only arXiv API paper search returning structured titles, authors, IDs, and abstracts (L0, SSRF-guarded). Use in mcp_prefetch_calls for RSI/AI/systems literature research."
+        permission_level: "L0"
+        timeout_seconds: 15.0
+        max_output_bytes: 16384
+        enabled: true
+        input_schema:
+          type: object
+          required: ["query"]
+          additionalProperties: false
+          properties:
+            query:
+              type: string
+            max_results:
+              type: integer
+            sort_by:
+              type: string
+              enum: ["relevance", "lastUpdatedDate", "submittedDate"]

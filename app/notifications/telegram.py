@@ -12,6 +12,7 @@ Security guarantees (Task Book Section 5.6.2):
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from typing import Any
 
@@ -19,6 +20,7 @@ import httpx
 
 from app.core.config import TelegramSettings
 from app.governance.approval import ApprovalService
+from app.notifications.human_bridge import HumanBridge
 from app.observability.logging import get_logger
 from app.storage.repository import StateRepository
 
@@ -60,6 +62,27 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
         )
         return text, reply_markup
 
+    if kind == "ask_human":
+        parts = [
+            "[AOC 主动求助 / 能力需求]",
+            f"主题：{payload.get('title', '未命名')}",
+            f"内容：{payload.get('message', '')}",
+        ]
+        if payload.get("reason"):
+            parts.append(f"原因：{payload['reason']}")
+        if payload.get("expected_benefit"):
+            parts.append(f"预期收益：{payload['expected_benefit']}")
+        parts.append("（直接在此回复文字，我将在下一轮自主思考中读取并优先响应；发送 /status 可查看当前状态）")
+        return "\n".join(parts), None
+    if kind == "milestone_report":
+        parts = [
+            "[AOC 自主进化阶段进展汇报]",
+            f"成果：{payload.get('title', '能力突破')}",
+            f"摘要：{payload.get('message', '')}",
+        ]
+        if payload.get("expected_benefit"):
+            parts.append(f"价值：{payload['expected_benefit']}")
+        return "\n".join(parts), None
     if kind == "critical_alert":
         return f"[AOC CRITICAL ALERT]\n{payload.get('message', '')}\nReason: {payload.get('reason', '')}", None
     if kind == "quota_recovered":
@@ -245,3 +268,231 @@ class TelegramWebhookHandler:
         if self.notifier is not None and callback_id:
             await self.notifier.answer_callback_query(callback_id, f"AOC task {result.get('status')}")
         return {"ok": True, "action": action, "result": result}
+
+
+class TelegramPoller:
+    """Long-polling Telegram `getUpdates` loop for bidirectional interaction without public HTTPS Webhook."""
+
+    def __init__(
+        self,
+        *,
+        settings: TelegramSettings,
+        notifier: TelegramNotifier,
+        webhook_handler: TelegramWebhookHandler,
+        human_bridge: HumanBridge,
+        repo: StateRepository,
+        lifecycle: Any = None,
+        status_fn: Any = None,
+    ) -> None:
+        self.settings = settings
+        self.notifier = notifier
+        self.webhook_handler = webhook_handler
+        self.human_bridge = human_bridge
+        self.repo = repo
+        self.lifecycle = lifecycle
+        self.status_fn = status_fn
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = False
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stopping = False
+        self._task = asyncio.create_task(self._run_forever(), name="aoc-telegram-poller")
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    def _is_authorized(self, chat_id: str, user_id: str) -> bool:
+        allowed_chats = {str(c).strip() for c in self.settings.allowed_chat_ids if str(c).strip()}
+        if not allowed_chats or chat_id not in allowed_chats:
+            return False
+        allowed_users = {str(u).strip() for u in self.settings.allowed_user_ids if str(u).strip()}
+        if allowed_users and user_id not in allowed_users:
+            return False
+        return True
+
+    async def handle_polled_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        """Process a single Telegram Update dict from getUpdates under strict allowlist enforcement."""
+        update_id = update.get("update_id")
+        cb = update.get("callback_query")
+        msg = update.get("message")
+
+        if isinstance(cb, dict):
+            frm = cb.get("from") or {}
+            chat = (cb.get("message") or {}).get("chat") or {}
+            chat_id = str(chat.get("id") or "")
+            user_id = str(frm.get("id") or "")
+            username = str(frm.get("username") or user_id or "telegram_user")
+            if not self._is_authorized(chat_id, user_id):
+                await self.repo.log_event(
+                    "telegram.unauthorized_chat",
+                    message=f"Ignored polled callback from unauthorized chat_id={chat_id}",
+                    level="warning",
+                )
+                return {"ok": False, "ignored": True, "reason": "unauthorized"}
+
+            raw_action = str(cb.get("data") or "").strip()
+            if ":" in raw_action:
+                action, nonce = raw_action.split(":", 1)
+                action = action.strip().lower()
+                if action in {"approve", "reject"} and nonce.strip():
+                    result = await self.webhook_handler.approval_service.decide_by_nonce(
+                        nonce.strip(),
+                        action=action,
+                        approver=f"telegram:{username}({user_id})",
+                        reason=f"Telegram polled {action} by {username}",
+                        channel="telegram",
+                    )
+                    cb_id = str(cb.get("id") or "")
+                    if cb_id:
+                        await self.notifier.answer_callback_query(cb_id, f"AOC task {result.get('status')}")
+                    return {"ok": True, "kind": "approval", "action": action, "result": result}
+            return {"ok": True, "ignored": True, "reason": "unsupported_callback"}
+
+        if not isinstance(msg, dict):
+            return {"ok": True, "ignored": True, "reason": "unsupported_update_type"}
+
+        frm = msg.get("from") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        user_id = str(frm.get("id") or "")
+        username = str(frm.get("username") or user_id or "joel")
+        if not self._is_authorized(chat_id, user_id):
+            await self.repo.log_event(
+                "telegram.unauthorized_chat",
+                message=f"Ignored polled message from unauthorized chat_id={chat_id}",
+                level="warning",
+            )
+            return {"ok": False, "ignored": True, "reason": "unauthorized"}
+
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            return {"ok": True, "ignored": True, "reason": "empty_text"}
+
+        parts = text.split()
+        cmd = parts[0].lower()
+        if len(parts) >= 2 and cmd in {"/approve", "/reject"}:
+            action = cmd.lstrip("/")
+            result = await self.webhook_handler.approval_service.decide_by_nonce(
+                parts[1].strip(),
+                action=action,
+                approver=f"telegram:{username}({user_id})",
+                reason=f"Telegram command {action} by {username}",
+                channel="telegram",
+            )
+            await self.notifier._post(
+                "sendMessage",
+                {"chat_id": chat_id, "text": f"已执行审批操作 {action}，当前状态：{result.get('status')}"},
+            )
+            return {"ok": True, "kind": "approval_cmd", "action": action, "result": result}
+
+        if cmd in {"/start", "/status"}:
+            status_text = "AOC 在线运行中。"
+            if self.status_fn is not None:
+                try:
+                    info = await self.status_fn()
+                    status_text = str(info or status_text)
+                except Exception as exc:
+                    status_text = f"AOC 在线（获取详细状态异常：{exc}）"
+            if cmd == "/start":
+                status_text += "\n\n直接发送任何文字，我将作为最高优先级引导写入下一轮自主思考循环。"
+            await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": status_text[:4000]})
+            return {"ok": True, "kind": "command", "command": cmd}
+
+        # Free-form creator guidance -> persist, wake organism, and acknowledge warmly
+        guidance = await self.human_bridge.record_human_guidance(
+            key=f"tg:{update_id if update_id is not None else 'msg'}",
+            text=text,
+            sender=username,
+            channel="telegram",
+            chat_id=chat_id,
+        )
+        if self.lifecycle is not None:
+            try:
+                self.lifecycle.wake(reason=f"telegram guidance from {username}")
+            except Exception:
+                pass
+        try:
+            await self.notifier._post(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": "✅ 已收到你的指令并唤醒思考循环，我会在下一轮优先阅读并执行你的建议。",
+                },
+            )
+        except Exception as exc:
+            logger.warning("telegram.poller_reply_failed", error=str(exc))
+        return {"ok": True, "kind": "guidance", "guidance_key": guidance["key"]}
+
+    async def poll_once(self) -> int:
+        """Fetch and process pending Telegram updates once, persisting monotonic update offset."""
+        cursors = await self.repo.list_world_items(kind="telegram_cursor")
+        cursor_item = next((c for c in cursors if c.get("key") == "offset"), None)
+        offset = int(((cursor_item or {}).get("value") or {}).get("next_offset") or 0)
+
+        body = await self.notifier._post(
+            "getUpdates",
+            {"offset": offset, "timeout": 5, "allowed_updates": ["message", "callback_query"]},
+        )
+        updates = body.get("result") or []
+        if not updates:
+            return 0
+
+        next_offset = offset
+        processed = 0
+        for upd in updates:
+            if not isinstance(upd, dict):
+                continue
+            uid = upd.get("update_id")
+            if isinstance(uid, int):
+                next_offset = max(next_offset, uid + 1)
+            try:
+                await self.handle_polled_update(upd)
+            except Exception as exc:
+                logger.warning("telegram.poller_update_error", update_id=uid, error=str(exc))
+            processed += 1
+
+        if next_offset > offset:
+            await self.repo.upsert_world_item(
+                kind="telegram_cursor",
+                key="offset",
+                value={"next_offset": next_offset},
+                status="active",
+                source="telegram_poller",
+            )
+        return processed
+
+    async def _run_forever(self) -> None:
+        logger.info("telegram_poller.started")
+        try:
+            await self.notifier._post("deleteWebhook", {"drop_pending_updates": False})
+        except Exception as exc:
+            logger.warning("telegram_poller.delete_webhook_degraded", error=str(exc))
+
+        interval = max(1.0, float(self.settings.polling_interval_seconds))
+        err_streak = 0
+        while not self._stopping:
+            try:
+                await self.poll_once()
+                err_streak = 0
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                err_streak += 1
+                backoff = min(60.0, interval * (2 ** min(err_streak, 4)))
+                logger.warning("telegram_poller.poll_error", error=str(exc), backoff_seconds=backoff)
+                await asyncio.sleep(backoff)
+        logger.info("telegram_poller.stopped")

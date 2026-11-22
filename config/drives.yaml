@@ -9,13 +9,14 @@ dynamics:
 
 arbitration:
   idle_threshold: 0.12           # if every priority is below this -> IDLE (no forced tasks)
-  persistence_gain: 0.6          # priority *= (1 + gain * persistence)
-  inhibition_strength: 0.6       # just-satisfied drive is suppressed by up to this fraction
+  persistence_gain: 1.0          # priority *= (1 + gain * persistence)
+  inhibition_strength: 0.70      # just-satisfied drive is suppressed by up to this fraction
   inhibition_tau_seconds: 1800   # suppression decays with this time constant
   cost_penalty: 0.10
   risk_penalty: 0.15
   survival_critical_threshold: 0.30   # survival satisfaction below this -> emergency override
   min_confidence: 0.2            # drives with confidence below this cannot win (insufficient data)
+  post_goal_satiation_enabled: true  # verified non-survival goal completion records satiation (prevents RSS gap_cap lock)
 
 drives:
   survival:
@@ -44,19 +45,19 @@ drives:
       critical_dimension: 0.15   # any single dimension below this -> urgency 1.0
 
   reproduction:
-    weight: 0.7
-    base_urgency: 0.1
-    urgency_deficit_gain: 0.5
+    weight: 0.75
+    base_urgency: 0.18
+    urgency_deficit_gain: 0.34
     urgency_trend_gain: 0.2
-    estimated_cost: 0.4
-    estimated_risk: 0.2
+    estimated_cost: 0.15
+    estimated_risk: 0.08
     acquired_capability_credit: 1.0  # Credit for ACQUIRED vs VALIDATED (1.0); static Agent caps ALWAYS = 0
     dimension_weights:
-      capability_coverage: 0.30      # Evidence-backed capability_profiles (ACQUIRED|VALIDATED) only (P1-7)
-      reusable_skills: 0.25          # Checksum-intact VALIDATED skills from skill_registry (P1-7)
-      capability_goals: 0.15
-      resource_reserve: 0.15
-      expansion_readiness: 0.15      # Identity + memory + knowledge transfer readiness + healthy agents
+      capability_coverage: 0.15      # Evidence-backed capability_profiles (ACQUIRED|VALIDATED) only (P1-7)
+      reusable_skills: 0.45          # Checksum-intact VALIDATED skills from skill_registry (P1-7)
+      capability_goals: 0.20
+      resource_reserve: 0.10
+      expansion_readiness: 0.10      # Identity + memory + knowledge transfer readiness + healthy agents
     targets:
       skills: 10                 # reusable procedural skills considered "fully stocked"
       capability_goals_window: 5 # completed capability goals considered "fully satisfied" (rolling window)
@@ -68,9 +69,9 @@ drives:
       - knowledge_summarization
 
   curiosity:
-    weight: 0.9
-    base_urgency: 0.15
-    urgency_deficit_gain: 0.6
+    weight: 1.15
+    base_urgency: 0.20
+    urgency_deficit_gain: 0.65
     urgency_trend_gain: 0.2
     estimated_cost: 0.3
     estimated_risk: 0.1

@@ -88,6 +88,7 @@ class TaskFinalizer:
         on_prediction_error: Callable[[float], None] | None = None,
         playbook_manager: Any = None,
         exploration_manager: Any = None,
+        human_bridge: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -107,6 +108,7 @@ class TaskFinalizer:
         self.skill_auto_crystallize = bool(skill_auto_crystallize)
         self.playbook_manager = playbook_manager
         self.exploration_manager = exploration_manager
+        self.human_bridge = human_bridge
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -690,6 +692,25 @@ class TaskFinalizer:
                 updated_outcome["playbook_evolution"] = playbook_evolution
                 await self.repo.update_task(task_uuid, outcome=updated_outcome)
 
+            # V4.1: Rate-limited proactive human outreach after evaluation (blocker ask or verified milestone)
+            if self.human_bridge is not None and isinstance(eval_res.message_to_human, dict):
+                try:
+                    m = eval_res.message_to_human
+                    m_kind = str(m.get("kind") or "milestone_report").strip().lower()
+                    allow_out = (m_kind == "ask_human") or (eval_res.goal_achieved and verification_passed)
+                    if allow_out and str(m.get("message") or "").strip():
+                        await self.human_bridge.maybe_send_outreach(
+                            kind=m_kind,
+                            topic_key=str(m.get("topic_key") or m.get("title") or goal_dict.get("related_key") or "eval"),
+                            title=str(m.get("title") or goal_dict.get("title") or "AOC Report")[:160],
+                            message=str(m.get("message") or ""),
+                            reason=str(m.get("reason") or ""),
+                            expected_benefit=str(m.get("expected_benefit") or ""),
+                            cycle_id=cycle_uuid,
+                        )
+                except Exception as exc:
+                    logger.warning("finalizer.human_outreach_degraded", execution_id=exec_key, error=str(exc))
+
             # Notify in-memory learning tracker (used by CuriosityDriveEvaluator)
             info_gain = 0.0
             if eval_res.goal_achieved and (measured_info_gain > 0 or eval_res.information_gain > 0 or eval_res.learned_facts):
@@ -703,6 +724,19 @@ class TaskFinalizer:
             post_obs = await self.perception.perceive(cycle_id=cycle_uuid, phase="post", persist=True)
             post_ctx = await self._build_post_drive_context(post_obs, now, info_gain=info_gain)
             post_drives = self.drives.compute_states(post_ctx, pre_drives)
+            arb_cfg = (getattr(self.drives, "config", None) or {}).get("arbitration") or {}
+            post_goal_satiation = bool(arb_cfg.get("post_goal_satiation_enabled", False))
+            if post_goal_satiation and eval_res.goal_achieved and verification_passed:
+                goal_drive = str(goal_dict.get("drive_type") or selected_drive or "").strip().lower()
+                if goal_drive in post_drives and goal_drive != DriveType.SURVIVAL.value:
+                    # Verified goal completion yields bounded satiation/inhibition so a saturated
+                    # gap signal does not lock one non-emergency drive permanently across cycles.
+                    post_drives[goal_drive] = post_drives[goal_drive].model_copy(
+                        update={
+                            "last_satisfied_at": now,
+                            "persistence": round(post_drives[goal_drive].persistence * 0.6, 6),
+                        }
+                    )
             if org_id is not None:
                 await self.repo.save_drive_states(org_id, post_drives.values(), cycle_id=cycle_uuid, phase="post")
 

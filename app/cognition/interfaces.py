@@ -67,6 +67,8 @@ class GoalProposal(BaseModel):
     discover_world_source: dict[str, Any] | None = None
     # V4.0 M3: optional external exploration topic {topic_key, domain, question}
     exploration_topic: dict[str, Any] | None = None
+    # V4.1: optional proactive outreach to creator Joel ({kind, topic_key, title, message, reason, expected_benefit})
+    message_to_human: dict[str, Any] | None = None
     usage: LLMUsage = Field(default_factory=LLMUsage)
 
     @field_validator("predicted_ig")
@@ -140,6 +142,9 @@ class CognitiveContext(BaseModel):
     # V4.0 M3: External self-evolving strategy playbooks & Curiosity anti-internal-loop guidance
     external_playbooks: list[dict[str, Any]] = Field(default_factory=list)
     exploration_guidance: dict[str, Any] | None = None
+    # V4.1: Pending creator instructions/replies from Telegram + outreach availability flag
+    human_guidance: list[dict[str, Any]] = Field(default_factory=list)
+    human_outreach_available: bool = False
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -167,6 +172,8 @@ class EvaluationResult(BaseModel):
     hypothesis_verdict: str | None = None  # confirmed | refuted | inconclusive
     # V4.0 M3: Optional external strategy playbook update ({domain, content, change_summary})
     playbook_update: dict[str, Any] | None = None
+    # V4.1: Optional milestone report or blocker outreach to creator Joel
+    message_to_human: dict[str, Any] | None = None
     should_persist_memory: bool = False
     memory_type: str = MemoryType.EPISODIC.value
     memory_importance: float = 0.5

@@ -413,7 +413,7 @@ async def test_v2_tools_api_endpoints(tmp_path: Path):
                 body = tr.json()
                 assert body["provider_kind"] == "tool_provider_mcp"
                 names = {t["tool_name"] for t in body["tools"]}
-                assert names == {"web_fetch_readonly", "workspace_filesystem", "git_docs_search"}
+                assert names == {"web_fetch_readonly", "workspace_filesystem", "git_docs_search", "arxiv_search"}
 
                 inv = await client.post(
                     "/v2/tools/workspace_filesystem/invoke",

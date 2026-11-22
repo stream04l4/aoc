@@ -104,6 +104,7 @@ class AutonomousLoop:
         world_pipeline: Any = None,
         playbook_manager: Any = None,
         exploration_manager: Any = None,
+        human_bridge: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -127,6 +128,7 @@ class AutonomousLoop:
         self.world_pipeline = world_pipeline
         self.playbook_manager = playbook_manager
         self.exploration_manager = exploration_manager
+        self.human_bridge = human_bridge
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -169,6 +171,7 @@ class AutonomousLoop:
             skill_auto_crystallize=kv3.skill_auto_crystallize_enabled,
             playbook_manager=playbook_manager,
             exploration_manager=exploration_manager,
+            human_bridge=human_bridge,
         )
 
     def _record_prediction_error(self, error: float) -> None:
@@ -550,6 +553,14 @@ class AutonomousLoop:
                 except Exception as exc:
                     logger.warning("cycle.playbooks_load_degraded", cycle_id=str(cycle_id), error=str(exc))
 
+            pending_human_guidance: list[dict[str, Any]] = []
+            if self.human_bridge is not None:
+                try:
+                    pending_human_guidance = await self.human_bridge.list_pending_guidance(limit=5)
+                except Exception as exc:
+                    logger.warning("cycle.human_guidance_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+            outreach_avail = bool(self.human_bridge is not None and getattr(self.human_bridge, "enabled", False))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -567,11 +578,37 @@ class AutonomousLoop:
                 active_hypotheses=active_hypotheses,
                 external_playbooks=external_playbooks,
                 exploration_guidance=exploration_guidance,
+                human_guidance=pending_human_guidance,
+                human_outreach_available=outreach_avail,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
 
             goal_proposal = await self._generate_goal_safe(cog_ctx, llm_available_for_brain, cycle_id)
+            if self.human_bridge is not None and pending_human_guidance:
+                try:
+                    await self.human_bridge.acknowledge_guidance(
+                        [str(g["key"]) for g in pending_human_guidance if g.get("key")],
+                        cycle_id=cycle_id,
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.human_guidance_ack_degraded", cycle_id=str(cycle_id), error=str(exc))
+            if self.human_bridge is not None and isinstance(goal_proposal.message_to_human, dict):
+                try:
+                    m = goal_proposal.message_to_human
+                    if str(m.get("message") or "").strip():
+                        outreach_res = await self.human_bridge.maybe_send_outreach(
+                            kind=str(m.get("kind") or "ask_human"),
+                            topic_key=str(m.get("topic_key") or m.get("title") or goal_proposal.title[:40]),
+                            title=str(m.get("title") or goal_proposal.title[:80]),
+                            message=str(m.get("message") or ""),
+                            reason=str(m.get("reason") or ""),
+                            expected_benefit=str(m.get("expected_benefit") or ""),
+                            cycle_id=cycle_id,
+                        )
+                        state_changes["human_outreach"] = outreach_res
+                except Exception as exc:
+                    logger.warning("cycle.human_outreach_degraded", cycle_id=str(cycle_id), error=str(exc))
             if not goal_proposal.should_act or not goal_proposal.title.strip():
                 outcome = "IDLE"
                 await self.lifecycle.transition(LifecycleState.IDLE, reason="Brain decided no action needed", cycle_id=cycle_id)

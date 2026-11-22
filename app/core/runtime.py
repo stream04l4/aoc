@@ -41,7 +41,8 @@ from app.memory.info_gain import InformationGainEvaluator
 from app.memory.interfaces import MemoryInterface
 from app.memory.letta_adapter import LettaAdapter
 from app.memory.retrieval import HybridRetrievalEngine
-from app.notifications.telegram import TelegramNotifier, TelegramWebhookHandler
+from app.notifications.human_bridge import HumanBridge
+from app.notifications.telegram import TelegramNotifier, TelegramPoller, TelegramWebhookHandler
 from app.observability.logging import configure_logging, get_logger
 from app.orchestration.backend import ExecutionBackendInterface, LocalSubprocessBackend
 from app.orchestration.finalizer import TaskFinalizer
@@ -193,12 +194,19 @@ class OrganismRuntime:
         app_ttl = float(((eff_policy_cfg or {}).get("approval") or {}).get("default_ttl_hours", 24.0))
         self.approval_service = ApprovalService(self.repo, self.orchestrator, default_ttl_hours=app_ttl)
         self.telegram_notifier = TelegramNotifier(self.settings.telegram)
+        self.human_bridge = HumanBridge(
+            repo=self.repo,
+            enabled=self.settings.kernel_v3.human_outreach_enabled,
+            cooldown_minutes=self.settings.kernel_v3.human_outreach_cooldown_minutes,
+            topic_dedup_hours=self.settings.kernel_v3.human_outreach_topic_dedup_hours,
+        )
         self.telegram_webhook = TelegramWebhookHandler(
             self.settings.telegram,
             self.approval_service,
             self.repo,
             notifier=self.telegram_notifier,
         )
+        self.telegram_poller: TelegramPoller | None = None
         self.outbox = OutboxDispatcher(
             self.repo,
             poll_interval=self.settings.lifecycle.outbox_poll_interval,
@@ -404,6 +412,7 @@ class OrganismRuntime:
             skill_auto_crystallize=self.settings.kernel_v3.skill_auto_crystallize_enabled,
             playbook_manager=self.playbook_manager,
             exploration_manager=self.exploration_manager,
+            human_bridge=self.human_bridge,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -469,6 +478,7 @@ class OrganismRuntime:
             world_pipeline=self.world_pipeline,
             playbook_manager=self.playbook_manager,
             exploration_manager=self.exploration_manager,
+            human_bridge=self.human_bridge,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error
@@ -479,10 +489,40 @@ class OrganismRuntime:
         if start_scheduler:
             self.outbox.start()
             self.scheduler.start()
+            if (
+                self.settings.telegram.enabled
+                and self.settings.telegram.polling_enabled
+                and self.telegram_notifier.configured
+                and self.settings.telegram.allowed_chat_ids
+            ):
+                async def _status_summary() -> str:
+                    st = await self.repo.get_organism_state(self.organism_id) if self.organism_id else {}
+                    dr = await self.repo.load_drive_states(self.organism_id) if self.organism_id else []
+                    dr_line = " | ".join(
+                        f"{d['drive_type']}: sat={d['satisfaction']:.2f}" for d in sorted(dr, key=lambda x: x["drive_type"])
+                    )
+                    return (
+                        f"AOC-001 ({self.lifecycle.state.value if self.lifecycle else 'UNKNOWN'})\n"
+                        f"周期: #{(st or {}).get('cycle_count', 0)}\n"
+                        f"内驱力: {dr_line or '暂无数据'}"
+                    )
+
+                self.telegram_poller = TelegramPoller(
+                    settings=self.settings.telegram,
+                    notifier=self.telegram_notifier,
+                    webhook_handler=self.telegram_webhook,
+                    human_bridge=self.human_bridge,
+                    repo=self.repo,
+                    lifecycle=self.lifecycle,
+                    status_fn=_status_summary,
+                )
+                self.telegram_poller.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))
         return {"organism_id": str(self.organism_id), "recovery": recovery}
 
     async def stop(self) -> None:
+        if self.telegram_poller is not None:
+            await self.telegram_poller.stop()
         await self.outbox.stop()
         if self.scheduler is not None:
             await self.scheduler.stop()

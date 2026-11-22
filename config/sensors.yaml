@@ -40,6 +40,18 @@ interest_keywords:
   - "linux"
   - "database"
   - "llm"
+  - "recursive"
+  - "self-improvement"
+  - "rsi"
+  - "self-evolution"
+  - "meta-learning"
+  - "skill"
+  - "continual"
+  - "autonomous"
+  - "reasoning"
+  - "tool-use"
+  - "memory"
+  - "letta"
 
 # Default configured sources (can be toggled via POST /v2/world/sources/{id}/enable|disable)
 sources:
@@ -79,6 +91,15 @@ sources:
     poll_interval_seconds: 3600
     config:
       url: "https://export.arxiv.org/rss/cs.AI"
+      max_items: 10
+  - source_id: "rss-arxiv-cs-lg"
+    sensor_type: "rss"
+    name: "arXiv cs.LG Machine Learning Feed"
+    enabled: true
+    reliability_score: 0.85
+    poll_interval_seconds: 3600
+    config:
+      url: "https://export.arxiv.org/rss/cs.LG"
       max_items: 10
   - source_id: "rss-github-pgvector-releases"
     sensor_type: "rss"

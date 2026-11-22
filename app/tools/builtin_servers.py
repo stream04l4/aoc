@@ -14,8 +14,10 @@ import os
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import quote_plus
 
 from app.perception.world.security import (
     ResponseTooLargeError,
@@ -28,6 +30,7 @@ from app.perception.world.security import (
 MAX_FS_FILE_BYTES = 2 * 1024 * 1024
 MAX_WEB_OUTPUT_CHARS = 14000
 MAX_GIT_RESULTS = 50
+_XXE_RE = re.compile(r"<!\s*(DOCTYPE|ENTITY)\b", re.I)
 
 
 def _validate_workspace_path(workspace_root: Path, workspace: str, rel_path: str) -> Path:
@@ -248,6 +251,81 @@ async def execute_git_docs_search(
     }
 
 
+async def execute_arxiv_search(
+    arguments: dict[str, Any],
+    *,
+    allowed_domains: Sequence[str] = ("export.arxiv.org",),
+    timeout_seconds: float = 15.0,
+    http_client: Any = None,
+    resolver: Any = None,
+) -> dict[str, Any]:
+    """Read-only arXiv Atom API paper search returning structured, sanitized paper metadata (V4.1 L0)."""
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise ValueError("Missing required argument: query")
+    try:
+        max_results = max(1, min(int(arguments.get("max_results", 5) or 5), 10))
+    except (TypeError, ValueError):
+        max_results = 5
+    sort_by = str(arguments.get("sort_by") or "relevance").strip()
+    if sort_by not in {"relevance", "lastUpdatedDate", "submittedDate"}:
+        sort_by = "relevance"
+
+    url = (
+        f"https://export.arxiv.org/api/query?search_query=all:{quote_plus(query)}"
+        f"&start=0&max_results={max_results}&sortBy={sort_by}&sortOrder=descending"
+    )
+    eff_domains = list(dict.fromkeys([*(str(d) for d in (allowed_domains or []) if d), "export.arxiv.org"]))
+    status, _headers, body, _final_url = await safe_http_fetch(
+        url,
+        allowed_domains=eff_domains,
+        max_bytes=2 * 1024 * 1024,
+        timeout_seconds=min(float(timeout_seconds), 15.0),
+        max_redirects=3,
+        http_client=http_client,
+        resolver=resolver,
+    )
+    if status >= 400:
+        raise RuntimeError(f"arxiv_search received HTTP {status}")
+
+    raw_xml = body.decode("utf-8", errors="replace").strip()
+    if not raw_xml:
+        return {"query": query, "sort_by": sort_by, "count": 0, "papers": []}
+    if _XXE_RE.search(raw_xml):
+        raise ValueError("Rejected arXiv XML containing DOCTYPE/ENTITY declarations")
+
+    root = ET.fromstring(raw_xml)
+    atom_ns = "{http://www.w3.org/2005/Atom}"
+    papers: list[dict[str, Any]] = []
+    for entry in root.findall(f"{atom_ns}entry")[:max_results]:
+        id_raw = (entry.findtext(f"{atom_ns}id") or "").strip()
+        arxiv_id = id_raw.rstrip("/").split("/")[-1] if id_raw else ""
+        title = sanitize_external_text(entry.findtext(f"{atom_ns}title") or "", max_chars=240)
+        summary = sanitize_external_text(entry.findtext(f"{atom_ns}summary") or "", max_chars=600)
+        published = (entry.findtext(f"{atom_ns}published") or "").strip()[:32]
+        authors: list[str] = []
+        for auth in entry.findall(f"{atom_ns}author")[:4]:
+            aname = sanitize_external_text(auth.findtext(f"{atom_ns}name") or "", max_chars=60)
+            if aname:
+                authors.append(aname)
+        papers.append(
+            {
+                "arxiv_id": arxiv_id,
+                "title": " ".join(title.split()),
+                "authors": authors,
+                "published": published,
+                "url": id_raw,
+                "summary": " ".join(summary.split()),
+            }
+        )
+    return {
+        "query": query,
+        "sort_by": sort_by,
+        "count": len(papers),
+        "papers": papers,
+    }
+
+
 async def _serve_stdio_mcp(server_name: str) -> None:
     """Minimal MCP JSON-RPC 2.0 stdio server loop supporting initialize, tools/list, and tools/call."""
     allowed_domains = json.loads(os.environ.get("AOC_MCP_ALLOWED_DOMAINS", "[]"))
@@ -258,6 +336,7 @@ async def _serve_stdio_mcp(server_name: str) -> None:
         "aoc-mcp-web": {"name": "web_fetch_readonly", "description": "Read-only allowlisted web fetch (L0)"},
         "aoc-mcp-fs": {"name": "workspace_filesystem", "description": "Workspace-locked filesystem operations (L0/L1)"},
         "aoc-mcp-gitdocs": {"name": "git_docs_search", "description": "Read-only Git log/grep/docs search (L0)"},
+        "aoc-mcp-arxiv": {"name": "arxiv_search", "description": "Read-only arXiv paper search (L0)"},
     }
 
     for raw_line in sys.stdin:
@@ -290,6 +369,8 @@ async def _serve_stdio_mcp(server_name: str) -> None:
                     data = await execute_workspace_filesystem(args, workspace_root=workspace_root, workspace=ws)
                 elif server_name == "aoc-mcp-gitdocs" and tname == "git_docs_search":
                     data = await execute_git_docs_search(args, allowed_git_roots=allowed_git_roots)
+                elif server_name == "aoc-mcp-arxiv" and tname == "arxiv_search":
+                    data = await execute_arxiv_search(args, allowed_domains=allowed_domains)
                 else:
                     raise ValueError(f"Tool '{tname}' not served by '{server_name}'")
                 result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}], "structured": data}
