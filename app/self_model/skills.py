@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -23,7 +24,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app.agents.base import sanitize_env
 from app.cognition.interfaces import ActionPlan
@@ -121,6 +122,18 @@ class SkillRegistryManager(SkillRegistryInterface):
             self.cfg = SelfModelConfig()
         self.self_model = self_model
         self.storage_dir = Path(self.cfg.skill_storage_dir).resolve()
+        self._on_skills_changed: Callable[[], Awaitable[Any]] | None = None
+        self.evolution_engine: Any = None
+
+    def set_on_skills_changed(self, hook: Callable[[], Awaitable[Any]] | None) -> None:
+        self._on_skills_changed = hook
+
+    async def _notify_skills_changed(self) -> None:
+        if self._on_skills_changed is not None:
+            try:
+                await self._on_skills_changed()
+            except Exception as exc:
+                logger.warning("skill.changed_hook_degraded", error=str(exc))
 
     def _safe_artifact_path(self, raw_path: str) -> Path:
         p = Path(raw_path).resolve()
@@ -145,6 +158,12 @@ class SkillRegistryManager(SkillRegistryInterface):
         permission_level: str = PermissionLevel.L1.value,
         source_task_id: uuid.UUID | str | None = None,
         source_execution_id: uuid.UUID | str | None = None,
+        canonical_name: str | None = None,
+        parent_version: str | None = None,
+        superseded_by: uuid.UUID | str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        evolution_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Register a skill strictly in `DRAFT` status after L0–L3 governance checks."""
         skey = str(skill_key).strip()
@@ -196,6 +215,25 @@ class SkillRegistryManager(SkillRegistryInterface):
             resolved_path = (safe_dir / fname).resolve()
             resolved_path.write_text(artifact_code, encoding="utf-8")
             checksum = compute_file_sha256(resolved_path)
+            # V4.0 M1: Write lightweight standard Skill Package manifest.json alongside skill artifact
+            manifest = {
+                "skill_key": skey,
+                "canonical_name": canonical_name or skey,
+                "version": ver,
+                "parent_version": parent_version,
+                "capability_key": ckey,
+                "description": description[:500],
+                "entrypoint": f"{fname}:execute",
+                "permission_level": effective_perm,
+                "input_schema": input_schema or {},
+                "output_schema": output_schema or {},
+                "artifact_checksum": checksum,
+            }
+            (safe_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            if isinstance(test_spec, dict) and test_spec.get("code"):
+                (safe_dir / "test_skill.py").write_text(str(test_spec["code"]), encoding="utf-8")
         elif artifact_path is not None:
             resolved_path = self._safe_artifact_path(artifact_path)
             if not resolved_path.exists() or not resolved_path.is_file():
@@ -204,6 +242,7 @@ class SkillRegistryManager(SkillRegistryInterface):
 
         task_uuid = uuid.UUID(str(source_task_id)) if source_task_id else None
         exec_uuid = uuid.UUID(str(source_execution_id)) if source_execution_id else None
+        sup_uuid = uuid.UUID(str(superseded_by)) if superseded_by else None
 
         # Always starts strictly as DRAFT; must pass validate_skill() to become VALIDATED
         row = await self.repo.create_or_update_skill(
@@ -220,6 +259,12 @@ class SkillRegistryManager(SkillRegistryInterface):
             status=SkillStatus.DRAFT.value,
             source_task_id=task_uuid,
             source_execution_id=exec_uuid,
+            canonical_name=canonical_name,
+            parent_version=parent_version,
+            superseded_by=sup_uuid,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            evolution_meta=evolution_meta,
         )
         return row
 
@@ -437,6 +482,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         else:
             new_status = SkillStatus.DRAFT.value
         await self.repo.update_skill_status(sid, new_status)
+        await self._notify_skills_changed()
 
         self_model_update: dict[str, Any] | None = None
         if new_status == SkillStatus.VALIDATED.value and self.self_model is not None:
@@ -468,6 +514,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         if sk is None:
             raise ValueError(f"Skill {skill_id} not found")
         await self.repo.update_skill_status(sid, SkillStatus.DEPRECATED.value)
+        await self._notify_skills_changed()
         await self.repo.log_event(
             "skill.revoked",
             message=f"Revoked skill {sk['skill_key']}@{sk['version']}: {reason}",
@@ -484,13 +531,20 @@ class SkillRegistryManager(SkillRegistryInterface):
                 continue
             reusable.append(
                 {
+                    "skill_id": sk["id"],
                     "skill_key": sk["skill_key"],
+                    "canonical_name": sk.get("canonical_name") or sk["skill_key"],
                     "version": sk["version"],
                     "capability_key": sk["capability_key"],
                     "description": str(sk.get("description") or "")[:240],
                     "artifact_path": sk.get("artifact_path"),
+                    "input_schema": sk.get("input_schema") or {},
+                    "output_schema": sk.get("output_schema") or {},
                     "steps": list(sk.get("steps") or [])[:5],
                     "permission_level": sk.get("permission_level", "L1"),
+                    "invocation_count": int(sk.get("invocation_count") or 0),
+                    "reuse_count": int(sk.get("reuse_count") or 0),
+                    "reuse_success_count": int(sk.get("reuse_success_count") or 0),
                 }
             )
             if len(reusable) >= limit:
@@ -551,12 +605,55 @@ class SkillRegistryManager(SkillRegistryInterface):
                 "violations": test_violations,
             }
 
-        slug = re.sub(r"[^a-z0-9_]+", "_", skill_key.strip().lower()).strip("_")[:64] or "skill_artifact"
+        from app.skills.evolution import canonicalize_skill_name
+
+        cap_norm = capability_key[:120] or "coding"
+        canonical_name = canonicalize_skill_name(skill_key, cap_norm, description)
+        raw_slug = re.sub(r"[^a-z0-9_]+", "_", skill_key.strip().lower()).strip("_")
+        # V4.0 M2: Never allow truncated goal sentences as skill_key; keep short clean keys intact
+        is_truncated_sentence = len(raw_slug) > 40 or raw_slug.startswith(("create_", "build_"))
+        slug = canonical_name.replace(".", "_")[:64] if (not raw_slug or is_truncated_sentence) else raw_slug[:64]
+
+        # V4.0 M2: If an active VALIDATED duplicate exists, evolve vNext instead of creating a duplicate row!
+        if self.evolution_engine is not None:
+            dup = await self.evolution_engine.find_duplicate_skill(
+                canonical_name=canonical_name,
+                capability_key=cap_norm,
+                description=description,
+            )
+            if dup is not None:
+                evo = await self.evolution_engine.evolve_skill(
+                    dup.matched_skill_id,
+                    new_artifact_code=art_code,
+                    new_test_code=test_code,
+                    change_type="minor",
+                    change_summary=f"Auto-evolved from workspace task ({description[:120]})",
+                    description=description[:500],
+                    new_permission_level=permission_level,
+                    source_task_id=source_task_id,
+                    source_execution_id=source_execution_id,
+                )
+                return {
+                    "crystallized": evo.promoted,
+                    "evolved": True,
+                    "promoted": evo.promoted,
+                    "rolled_back": evo.rolled_back,
+                    "skill_id": evo.new_skill_id or evo.base_skill_id,
+                    "skill_key": dup.matched_skill_key,
+                    "canonical_name": evo.canonical_name,
+                    "version": evo.new_version or evo.base_version,
+                    "status": SkillStatus.VALIDATED.value if evo.promoted else SkillStatus.DEPRECATED.value,
+                    "passed": evo.regression_passed and evo.new_tests_passed,
+                    "awaiting_human_approval": evo.awaiting_human_approval,
+                    "reason": evo.reason,
+                }
+
         try:
             reg_row = await self.register_skill(
                 skill_key=slug,
+                canonical_name=canonical_name,
                 version="1.0.0",
-                capability_key=capability_key[:120] or "coding",
+                capability_key=cap_norm,
                 description=description[:500],
                 artifact_code=art_code,
                 artifact_filename=art_file.name,
@@ -568,8 +665,10 @@ class SkillRegistryManager(SkillRegistryInterface):
             val_res = await self.validate_skill(reg_row["id"])
             return {
                 "crystallized": True,
+                "evolved": False,
                 "skill_id": reg_row["id"],
                 "skill_key": slug,
+                "canonical_name": canonical_name,
                 "status": val_res["status"],
                 "passed": val_res["passed"],
                 "awaiting_human_approval": val_res.get("awaiting_human_approval", False),

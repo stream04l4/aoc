@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Iterable
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,7 @@ from app.storage.models import (
     RunnerRegistryRow,
     SelfModelVersionRow,
     SensorCheckpoint,
+    SkillInvocationRow,
     SkillRegistryRow,
     SkillValidationResultRow,
     SystemConfig,
@@ -2431,7 +2432,10 @@ class StateRepository:
         return {
             "id": str(r.id),
             "skill_key": r.skill_key,
+            "canonical_name": r.canonical_name,
             "version": r.version,
+            "parent_version": r.parent_version,
+            "superseded_by": str(r.superseded_by) if r.superseded_by else None,
             "capability_key": r.capability_key,
             "source_task_id": str(r.source_task_id) if r.source_task_id else None,
             "source_execution_id": str(r.source_execution_id) if r.source_execution_id else None,
@@ -2441,8 +2445,15 @@ class StateRepository:
             "artifact_path": r.artifact_path,
             "artifact_checksum": r.artifact_checksum,
             "test_spec": r.test_spec or {},
+            "input_schema": r.input_schema or {},
+            "output_schema": r.output_schema or {},
             "permission_level": r.permission_level,
             "status": r.status,
+            "invocation_count": int(r.invocation_count or 0),
+            "reuse_count": int(r.reuse_count or 0),
+            "reuse_success_count": int(r.reuse_success_count or 0),
+            "last_invoked_at": r.last_invoked_at,
+            "evolution_meta": r.evolution_meta or {},
             "created_at": r.created_at,
             "updated_at": r.updated_at,
         }
@@ -2463,6 +2474,12 @@ class StateRepository:
         status: str = "DRAFT",
         source_task_id: uuid.UUID | None = None,
         source_execution_id: uuid.UUID | None = None,
+        canonical_name: str | None = None,
+        parent_version: str | None = None,
+        superseded_by: uuid.UUID | None = None,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        evolution_meta: dict[str, Any] | None = None,
         session: AsyncSession | None = None,
     ) -> dict[str, Any]:
         now = utcnow()
@@ -2490,6 +2507,12 @@ class StateRepository:
                     test_spec=_jsonable(test_spec or {}),
                     permission_level=permission_level,
                     status=status,
+                    canonical_name=canonical_name,
+                    parent_version=parent_version,
+                    superseded_by=superseded_by,
+                    input_schema=_jsonable(input_schema or {}),
+                    output_schema=_jsonable(output_schema or {}),
+                    evolution_meta=_jsonable(evolution_meta or {}),
                     created_at=now,
                     updated_at=now,
                 )
@@ -2504,6 +2527,18 @@ class StateRepository:
                 row.test_spec = _jsonable(test_spec or {})
                 row.permission_level = permission_level
                 row.status = status
+                if canonical_name is not None:
+                    row.canonical_name = canonical_name
+                if parent_version is not None:
+                    row.parent_version = parent_version
+                if superseded_by is not None:
+                    row.superseded_by = superseded_by
+                if input_schema is not None:
+                    row.input_schema = _jsonable(input_schema)
+                if output_schema is not None:
+                    row.output_schema = _jsonable(output_schema)
+                if evolution_meta is not None:
+                    row.evolution_meta = _jsonable(evolution_meta)
                 if source_task_id is not None:
                     row.source_task_id = source_task_id
                 if source_execution_id is not None:
@@ -2520,6 +2555,160 @@ class StateRepository:
                 await s.execute(select(SkillRegistryRow).where(SkillRegistryRow.id == skill_id))
             ).scalar_one_or_none()
             return self._skill_dict(row) if row is not None else None
+
+    async def get_skill_by_name(
+        self,
+        name: str,
+        *,
+        version: str | None = None,
+        validated_only: bool = False,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any] | None:
+        key = str(name or "").strip()
+        if not key:
+            return None
+        async with self._use_session(session) as s:
+            q = select(SkillRegistryRow).where(
+                or_(SkillRegistryRow.canonical_name == key, SkillRegistryRow.skill_key == key)
+            )
+            if version:
+                q = q.where(SkillRegistryRow.version == version)
+            if validated_only:
+                q = q.where(SkillRegistryRow.status == "VALIDATED")
+            rows = (await s.execute(q.order_by(SkillRegistryRow.updated_at.desc()).limit(10))).scalars().all()
+            if not rows:
+                return None
+            # Prefer VALIDATED when validated_only is False
+            rows.sort(key=lambda r: (1 if r.status == "VALIDATED" else 0, r.updated_at or utcnow()), reverse=True)
+            return self._skill_dict(rows[0])
+
+    async def record_skill_invocation(
+        self,
+        *,
+        skill_id: uuid.UUID,
+        skill_version: str,
+        invocation_source: str = "skill_first",
+        task_id: uuid.UUID | None = None,
+        cycle_id: uuid.UUID | None = None,
+        passed: bool = False,
+        latency_ms: float = 0.0,
+        estimated_saved_tokens: int = 0,
+        input_digest: str = "",
+        output_excerpt: str = "",
+        error: str | None = None,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        """Record a real SkillRuntime/MCP invocation and deterministically compute cross-task reuse."""
+        now = utcnow()
+        async with self._use_session(session) as s:
+            skill_row = (
+                await s.execute(select(SkillRegistryRow).where(SkillRegistryRow.id == skill_id))
+            ).scalar_one_or_none()
+            if skill_row is None:
+                raise ValueError(f"Skill {skill_id} not found")
+
+            # Strict cross-task reuse rule:
+            # 1. Same task as originating source_task_id is NEVER cross-task reuse.
+            # 2. Different task from originating source_task_id IS cross-task reuse.
+            # 3. Otherwise, check prior PASSED invocations on a different task_id or cycle_id.
+            is_reuse = False
+            if task_id is not None and skill_row.source_task_id is not None:
+                is_reuse = task_id != skill_row.source_task_id
+            else:
+                prior_rows = (
+                    await s.execute(
+                        select(SkillInvocationRow.task_id, SkillInvocationRow.cycle_id)
+                        .where(
+                            SkillInvocationRow.skill_id == skill_id,
+                            SkillInvocationRow.passed.is_(True),
+                        )
+                        .limit(50)
+                    )
+                ).all()
+                for prev_tid, prev_cid in prior_rows:
+                    if task_id is not None and prev_tid is not None and prev_tid != task_id:
+                        is_reuse = True
+                        break
+                    if task_id is None and cycle_id is not None and prev_cid is not None and prev_cid != cycle_id:
+                        is_reuse = True
+                        break
+                    if task_id is not None and prev_tid is None:
+                        is_reuse = True
+                        break
+
+            inv = SkillInvocationRow(
+                skill_id=skill_id,
+                skill_version=skill_version,
+                task_id=task_id,
+                cycle_id=cycle_id,
+                invocation_source=invocation_source[:24],
+                is_cross_task_reuse=is_reuse,
+                passed=bool(passed),
+                latency_ms=round(float(latency_ms or 0.0), 2),
+                estimated_saved_tokens=max(0, int(estimated_saved_tokens or 0)) if passed else 0,
+                input_digest=input_digest[:64],
+                output_excerpt=(output_excerpt or "")[:2000],
+                error=(error[:1000] if error else None),
+                created_at=now,
+            )
+            s.add(inv)
+            skill_row.invocation_count = int(skill_row.invocation_count or 0) + 1
+            if is_reuse:
+                skill_row.reuse_count = int(skill_row.reuse_count or 0) + 1
+                if passed:
+                    skill_row.reuse_success_count = int(skill_row.reuse_success_count or 0) + 1
+            skill_row.last_invoked_at = now
+            skill_row.updated_at = now
+            await s.flush()
+            return {
+                "id": str(inv.id),
+                "skill_id": str(inv.skill_id),
+                "skill_version": inv.skill_version,
+                "task_id": str(inv.task_id) if inv.task_id else None,
+                "cycle_id": str(inv.cycle_id) if inv.cycle_id else None,
+                "invocation_source": inv.invocation_source,
+                "is_cross_task_reuse": bool(inv.is_cross_task_reuse),
+                "passed": bool(inv.passed),
+                "latency_ms": float(inv.latency_ms),
+                "estimated_saved_tokens": int(inv.estimated_saved_tokens),
+                "input_digest": inv.input_digest,
+                "output_excerpt": inv.output_excerpt,
+                "error": inv.error,
+                "created_at": inv.created_at,
+            }
+
+    async def list_skill_invocations(
+        self,
+        *,
+        skill_id: uuid.UUID | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        async with self.db.session() as s:
+            q = select(SkillInvocationRow)
+            if skill_id is not None:
+                q = q.where(SkillInvocationRow.skill_id == skill_id)
+            rows = (
+                await s.execute(q.order_by(SkillInvocationRow.created_at.desc()).limit(limit))
+            ).scalars().all()
+            return [
+                {
+                    "id": str(r.id),
+                    "skill_id": str(r.skill_id),
+                    "skill_version": r.skill_version,
+                    "task_id": str(r.task_id) if r.task_id else None,
+                    "cycle_id": str(r.cycle_id) if r.cycle_id else None,
+                    "invocation_source": r.invocation_source,
+                    "is_cross_task_reuse": bool(r.is_cross_task_reuse),
+                    "passed": bool(r.passed),
+                    "latency_ms": float(r.latency_ms),
+                    "estimated_saved_tokens": int(r.estimated_saved_tokens),
+                    "input_digest": r.input_digest,
+                    "output_excerpt": r.output_excerpt,
+                    "error": r.error,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
 
     async def list_skills(
         self,
@@ -2550,6 +2739,59 @@ class StateRepository:
                 .values(status=status, updated_at=utcnow())
             )
             return (res.rowcount or 0) == 1
+
+    async def update_skill_metadata(
+        self,
+        skill_id: uuid.UUID,
+        *,
+        status: str | None = None,
+        canonical_name: str | None = None,
+        parent_version: str | None = None,
+        superseded_by: uuid.UUID | None = None,
+        clear_superseded_by: bool = False,
+        evolution_meta: dict[str, Any] | None = None,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any] | None:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(select(SkillRegistryRow).where(SkillRegistryRow.id == skill_id))
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if canonical_name is not None:
+                row.canonical_name = canonical_name
+            if parent_version is not None:
+                row.parent_version = parent_version
+            if clear_superseded_by:
+                row.superseded_by = None
+            elif superseded_by is not None:
+                row.superseded_by = superseded_by
+            if evolution_meta is not None:
+                merged = dict(row.evolution_meta or {})
+                merged.update(evolution_meta)
+                row.evolution_meta = _jsonable(merged)
+            row.updated_at = utcnow()
+            await s.flush()
+            return self._skill_dict(row)
+
+    async def list_skill_versions(
+        self, name_or_key: str, *, limit: int = 30
+    ) -> list[dict[str, Any]]:
+        key = str(name_or_key or "").strip()
+        if not key:
+            return []
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(SkillRegistryRow)
+                    .where(or_(SkillRegistryRow.canonical_name == key, SkillRegistryRow.skill_key == key))
+                    .order_by(SkillRegistryRow.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [self._skill_dict(r) for r in rows]
 
     async def record_skill_validation(
         self,

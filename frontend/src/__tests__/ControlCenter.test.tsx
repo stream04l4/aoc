@@ -258,4 +258,184 @@ describe('AOC Control Center UI', () => {
       expect(screen.getAllByText('已记录').length).toBe(3);
     });
   });
+
+  it('renders V4.0 Skill Reuse, Version Tree, External Playbooks, and External Exploration panels', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/v2/auth/me')) {
+        return new Response(
+          JSON.stringify({ name: 'joel-admin', scopes: ['admin', 'read'], source: 'env_admin' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/v2/control-center/overview')) {
+        return new Response(
+          JSON.stringify({
+            window_hours: 24,
+            organism: { name: 'AOC-001', lifecycle_state: 'ACTIVE', cycle_count: 700, scheduler_running: true },
+            latest_cycle: { cycle_id: 'cid-700', cycle_number: 700, selected_drive: 'curiosity' },
+            drives: [],
+            drive_trend: [],
+            active_goals: [],
+            recent_tasks: [],
+            recent_decisions: [],
+            recent_events: [],
+            components: {
+              core: { status: 'ok', rss_mb: 210.0 },
+              postgres: { status: 'ok', pgvector_enabled: true },
+              runner: { enabled: true, runners: [{ runner_id: 'host-runner-1', status: 'online' }] },
+              llm: { model: 'Qwen/Qwen3.8-27B-FP8', available: true, circuit_open: false },
+              letta: { available: true, memories_synced: 50, memories_total: 50 },
+              embedding: { provider: 'local_onnx', dimensions: 512, embedded_count: 50 },
+            },
+            organs: {
+              evolution: {
+                capabilities_total: 6,
+                capabilities_validated: 4,
+                capabilities_acquired: 1,
+                skills_total: 12,
+                skills_validated: 8,
+                skill_cross_task_reuses_window: 14,
+                estimated_saved_tokens_window: 168000,
+                playbooks_active_count: 3,
+                exploration_topics_total: 5,
+                exploration_topics_verified: 4,
+                verified_ig_per_1m_tokens: 5.2,
+                preflight_rejected_window: 0,
+                goal_dedup_skipped_window: 2,
+              },
+            },
+            stats: {
+              cycles_total_window: 20,
+              cycles_by_outcome: { SUCCEEDED: 18 },
+              tasks_total_window: 15,
+              tasks_by_status: { SUCCEEDED: 15 },
+              usage_by_category: {},
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/v2/control-center/self-model')) {
+        return new Response(
+          JSON.stringify({
+            identity: { id: 'org-1', name: 'AOC-001', version: '4.0.0' },
+            latest_snapshot: { version_number: 12, summary_text: 'V4 RSI snapshot' },
+            capabilities: [],
+            recent_evidence: [],
+            skills: [],
+            skill_reuse_summary: {
+              total_invocations: 20,
+              cross_task_reuses: 14,
+              cross_task_successes: 13,
+              reuse_success_rate: 0.9286,
+              estimated_saved_tokens: 168000,
+              reused_skill_count: 6,
+              canonical_families_count: 4,
+              recent_invocations: [
+                {
+                  id: 'inv-1',
+                  skill_name: 'data.coding.count_items',
+                  skill_version: '1.1.0',
+                  invocation_source: 'skill_first',
+                  is_cross_task_reuse: true,
+                  passed: true,
+                  latency_ms: 42.5,
+                  estimated_saved_tokens: 12000,
+                },
+              ],
+            },
+            skill_version_trees: [
+              {
+                canonical_name: 'data.coding.count_items',
+                version_count: 2,
+                total_reuses: 9,
+                active_version: '1.1.0',
+                versions: [
+                  { id: 'v2', version: '1.1.0', parent_version: '1.0.0', status: 'VALIDATED', permission_level: 'L1', invocation_count: 10, reuse_count: 9, reuse_success_count: 9, evolution_meta: {} },
+                ],
+              },
+            ],
+            external_playbooks: [
+              {
+                id: 'pb-1',
+                domain: 'curiosity',
+                status: 'active',
+                active_version: 2,
+                version_count: 3,
+                rollback_count: 1,
+                active_samples: 5,
+                active_successes: 5,
+                change_summary: 'Verified external research playbook',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/v2/control-center/world')) {
+        return new Response(
+          JSON.stringify({
+            poll_on_perceive: true,
+            open_public_perception_enabled: true,
+            importance_threshold: 0.45,
+            allowed_domains: ['arxiv.org', 'blog.pgvector.org'],
+            sources: [],
+            events: { total: 0, limit: 25, offset: 0, items: [] },
+            quarantined_injections: [],
+            world_states: [],
+            hypotheses: [],
+            exploration: {
+              total: 2,
+              verified_count: 1,
+              exploring_count: 1,
+              domains_summary: { databases: 1, ai_research: 1 },
+              topics: [
+                {
+                  id: 'et-1',
+                  key: 'pgvector_hnsw_tuning',
+                  status: 'verified',
+                  domain: 'databases',
+                  question: 'How does ef_search tune pgvector recall?',
+                  attempts: 1,
+                  verified_facts: ['pgvector 0.8 iterative_scan prevents empty filtered results'],
+                  information_gain: 0.62,
+                  source: 'execution:ex-1',
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify({ total: 0, limit: 20, offset: 0, items: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    render(<App />);
+    fireEvent.change(await screen.findByPlaceholderText(/输入 AOC_API__ADMIN_KEY/i), {
+      target: { value: 'test-admin-tok' },
+    });
+    fireEvent.click(screen.getByText('验证并进入 Control Center'));
+
+    await waitFor(() => {
+      expect(screen.getByText('V4.0 RSI BIO-ARCHITECTURE')).toBeInTheDocument();
+      expect(screen.getByText(/复用 14 次/)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('自我认知'));
+    await waitFor(() => {
+      expect(screen.getByText('data.coding.count_items')).toBeInTheDocument();
+      expect(screen.getByText(/Verified external research playbook/)).toBeInTheDocument();
+      expect(screen.getByText('跨任务复用')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('环境感知'));
+    await waitFor(() => {
+      expect(screen.getByText('公开 HTTPS 感知扩展 · 强 SSRF 防护')).toBeInTheDocument();
+      expect(screen.getByText('pgvector_hnsw_tuning')).toBeInTheDocument();
+    });
+  });
 });

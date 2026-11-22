@@ -679,7 +679,10 @@ class CapabilityEvidenceRow(Base):
 
 class SkillRegistryRow(Base):
     __tablename__ = "skill_registry"
-    __table_args__ = (UniqueConstraint("skill_key", "version", name="uq_skill_key_ver"),)
+    __table_args__ = (
+        UniqueConstraint("skill_key", "version", name="uq_skill_key_ver"),
+        Index("ix_skill_registry_canonical_name", "canonical_name"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     skill_key: Mapped[str] = mapped_column(String(128))
     version: Mapped[str] = mapped_column(String(32))
@@ -694,8 +697,41 @@ class SkillRegistryRow(Base):
     test_spec: Mapped[dict] = mapped_column(JsonType, default=dict)
     permission_level: Mapped[str] = mapped_column(String(4), default="L1")
     status: Mapped[str] = mapped_column(String(24), default="DRAFT")  # DRAFT | VALIDATED | DEPRECATED
+    # V4.0 M1/M2: canonical naming, versioning, schemas & real reuse counters
+    canonical_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    parent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    input_schema: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    output_schema: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    invocation_count: Mapped[int] = mapped_column(Integer, default=0)
+    reuse_count: Mapped[int] = mapped_column(Integer, default=0)
+    reuse_success_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_invoked_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    evolution_meta: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
     updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class SkillInvocationRow(Base):
+    __tablename__ = "skill_invocations"
+    __table_args__ = (
+        Index("ix_skill_invocations_skill_time", "skill_id", "created_at"),
+        Index("ix_skill_invocations_task", "task_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    skill_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("skill_registry.id", ondelete="CASCADE"))
+    skill_version: Mapped[str] = mapped_column(String(32))
+    task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    cycle_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    invocation_source: Mapped[str] = mapped_column(String(24), default="skill_first")  # skill_first|mcp|agent|api
+    is_cross_task_reuse: Mapped[bool] = mapped_column(Boolean, default=False)
+    passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    estimated_saved_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    input_digest: Mapped[str] = mapped_column(String(64), default="")
+    output_excerpt: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
 
 
 class SkillValidationResultRow(Base):

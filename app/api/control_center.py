@@ -63,6 +63,7 @@ from app.storage.models import (
     RunnerRegistryRow as RunnerRegistry,
     SelfModelVersionRow as SelfModelVersion,
     SensorCheckpoint,
+    SkillInvocationRow as SkillInvocation,
     SkillRegistryRow as SkillRegistry,
     SkillValidationResultRow as SkillValidationResult,
     TaskLifecycleEvent,
@@ -323,6 +324,12 @@ def create_control_center_router(get_runtime) -> APIRouter:
             hyp_rows = (
                 await s.execute(select(WorldState).where(WorldState.kind == "hypothesis"))
             ).scalars().all()
+            playbook_rows = (
+                await s.execute(select(WorldState).where(WorldState.kind == "external_playbook"))
+            ).scalars().all()
+            explore_rows = (
+                await s.execute(select(WorldState).where(WorldState.kind == "exploration_topic"))
+            ).scalars().all()
             cap_rows = (
                 await s.execute(select(CapabilityProfile).where(CapabilityProfile.organism_id == org_id))
                 if org_id
@@ -330,6 +337,11 @@ def create_control_center_router(get_runtime) -> APIRouter:
             )
             cap_list = cap_rows.scalars().all() if cap_rows is not None else []
             skill_rows = (await s.execute(select(SkillRegistry))).scalars().all()
+
+            inv_q = select(SkillInvocation)
+            if since is not None:
+                inv_q = inv_q.where(SkillInvocation.created_at >= since)
+            skill_inv_win = (await s.execute(inv_q)).scalars().all()
 
             pf_q = select(func.count(ActionPlanRow.id)).where(ActionPlanRow.preflight_status == "REJECT")
             dedup_q = select(func.count(CycleRecord.id)).where(CycleRecord.outcome == "GOAL_DEDUP_SKIPPED")
@@ -566,6 +578,24 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "capabilities_acquired": sum(1 for c in cap_list if c.maturity_status == "ACQUIRED"),
                     "skills_total": len(skill_rows),
                     "skills_validated": sum(1 for sk in skill_rows if sk.status == "VALIDATED"),
+                    "skill_invocations_window": len(skill_inv_win),
+                    "skill_cross_task_reuses_window": sum(1 for iv in skill_inv_win if iv.is_cross_task_reuse),
+                    "skill_reuse_success_rate": (
+                        round(
+                            sum(1 for iv in skill_inv_win if iv.is_cross_task_reuse and iv.passed)
+                            / max(1, sum(1 for iv in skill_inv_win if iv.is_cross_task_reuse)),
+                            4,
+                        )
+                        if any(iv.is_cross_task_reuse for iv in skill_inv_win)
+                        else None
+                    ),
+                    "estimated_saved_tokens_window": sum(
+                        int(iv.estimated_saved_tokens or 0) for iv in skill_inv_win if iv.passed
+                    ),
+                    "playbooks_active_count": sum(1 for p in playbook_rows if p.status == "active"),
+                    "exploration_topics_total": len(explore_rows),
+                    "exploration_topics_verified": sum(1 for e in explore_rows if e.status == "verified"),
+                    "open_public_perception_enabled": bool(rt.settings.kernel_v3.open_public_perception_enabled),
                     "verified_ig_per_1m_tokens": ig_per_1m_win,
                     "preflight_rejected_window": preflight_rejected_win,
                     "goal_dedup_skipped_window": dedup_skipped_win,
@@ -1716,32 +1746,63 @@ def create_control_center_router(get_runtime) -> APIRouter:
             else bool(sensors_cfg.get("poll_on_perceive", False))
         )
         hypotheses = []
+        exploration_topics = []
+        exploration_domains: dict[str, int] = {}
         for w in ws_rows:
-            if w.kind != "hypothesis":
-                continue
             val = w.value if isinstance(w.value, dict) else {}
-            ev_list = val.get("evidence") if isinstance(val.get("evidence"), list) else []
-            hypotheses.append(
-                {
-                    "id": str(w.id),
-                    "key": w.key,
-                    "status": w.status,
-                    "claim": val.get("claim", ""),
-                    "verification_hint": val.get("verification_hint", ""),
-                    "confidence": val.get("confidence", 0.5),
-                    "evidence_count": len(ev_list),
-                    "evidence": ev_list[-5:],
-                    "last_verdict_summary": val.get("last_verdict_summary"),
-                    "source": w.source,
-                    "updated_at": _iso(w.updated_at),
-                }
-            )
+            if w.kind == "hypothesis":
+                ev_list = val.get("evidence") if isinstance(val.get("evidence"), list) else []
+                hypotheses.append(
+                    {
+                        "id": str(w.id),
+                        "key": w.key,
+                        "status": w.status,
+                        "claim": val.get("claim", ""),
+                        "verification_hint": val.get("verification_hint", ""),
+                        "confidence": val.get("confidence", 0.5),
+                        "evidence_count": len(ev_list),
+                        "evidence": ev_list[-5:],
+                        "last_verdict_summary": val.get("last_verdict_summary"),
+                        "source": w.source,
+                        "updated_at": _iso(w.updated_at),
+                    }
+                )
+            elif w.kind == "exploration_topic":
+                dom = str(val.get("domain") or "general_tech")
+                exploration_domains[dom] = exploration_domains.get(dom, 0) + 1
+                exploration_topics.append(
+                    {
+                        "id": str(w.id),
+                        "key": w.key,
+                        "status": w.status,
+                        "domain": dom,
+                        "scope": val.get("scope", "external_exploration"),
+                        "question": val.get("question", ""),
+                        "attempts": int(val.get("attempts") or 0),
+                        "verified_facts": list(val.get("verified_facts") or [])[-5:],
+                        "information_gain": val.get("information_gain"),
+                        "source": w.source,
+                        "updated_at": _iso(w.updated_at),
+                    }
+                )
 
         return {
             "poll_on_perceive": eff_poll_on_perceive,
+            "open_public_perception_enabled": bool(rt.settings.kernel_v3.open_public_perception_enabled),
             "importance_threshold": float(sensors_cfg.get("importance_threshold", 0.45)),
-            "allowed_domains": list(sensors_cfg.get("allowed_domains") or []),
+            "allowed_domains": list(
+                rt.world_pipeline.allowed_domains
+                if rt.world_pipeline is not None
+                else (sensors_cfg.get("allowed_domains") or [])
+            ),
             "hypotheses": hypotheses,
+            "exploration": {
+                "total": len(exploration_topics),
+                "verified_count": sum(1 for t in exploration_topics if t["status"] == "verified"),
+                "exploring_count": sum(1 for t in exploration_topics if t["status"] == "exploring"),
+                "domains_summary": exploration_domains,
+                "topics": exploration_topics[:25],
+            },
             "mcp_tools": {
                 "in_loop_enabled": bool(rt.settings.kernel_v3.mcp_in_loop_enabled),
                 "max_calls_per_cycle": int(rt.settings.kernel_v3.max_mcp_calls_per_cycle),
@@ -1850,6 +1911,46 @@ def create_control_center_router(get_runtime) -> APIRouter:
             skill_vals = (
                 await s.execute(select(SkillValidationResult).order_by(desc(SkillValidationResult.executed_at)).limit(50))
             ).scalars().all()
+            skill_invs = (
+                await s.execute(select(SkillInvocation).order_by(desc(SkillInvocation.created_at)).limit(80))
+            ).scalars().all()
+            total_inv_cnt = int((await s.execute(select(func.count(SkillInvocation.id)))).scalar_one() or 0)
+            cross_reuse_cnt = int(
+                (
+                    await s.execute(
+                        select(func.count(SkillInvocation.id)).where(SkillInvocation.is_cross_task_reuse.is_(True))
+                    )
+                ).scalar_one()
+                or 0
+            )
+            cross_reuse_ok = int(
+                (
+                    await s.execute(
+                        select(func.count(SkillInvocation.id)).where(
+                            SkillInvocation.is_cross_task_reuse.is_(True),
+                            SkillInvocation.passed.is_(True),
+                        )
+                    )
+                ).scalar_one()
+                or 0
+            )
+            saved_tokens_total = int(
+                (
+                    await s.execute(
+                        select(func.coalesce(func.sum(SkillInvocation.estimated_saved_tokens), 0)).where(
+                            SkillInvocation.passed.is_(True)
+                        )
+                    )
+                ).scalar_one()
+                or 0
+            )
+            playbook_rows = (
+                await s.execute(
+                    select(WorldState)
+                    .where(WorldState.kind == "external_playbook")
+                    .order_by(desc(WorldState.updated_at))
+                )
+            ).scalars().all()
 
         vals_by_skill: dict[uuid.UUID, list[dict[str, Any]]] = {}
         for sv in skill_vals:
@@ -1859,6 +1960,64 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "passed": sv.passed,
                     "checks": sv.checks,
                     "executed_at": _iso(sv.executed_at),
+                }
+            )
+
+        skill_name_by_id = {sk.id: (sk.canonical_name or sk.skill_key) for sk in skills}
+        trees_map: dict[str, list[dict[str, Any]]] = {}
+        for sk in skills:
+            cname = sk.canonical_name or sk.skill_key
+            trees_map.setdefault(cname, []).append(
+                {
+                    "id": str(sk.id),
+                    "skill_key": sk.skill_key,
+                    "canonical_name": cname,
+                    "version": sk.version,
+                    "parent_version": sk.parent_version,
+                    "superseded_by": str(sk.superseded_by) if sk.superseded_by else None,
+                    "capability_key": sk.capability_key,
+                    "permission_level": sk.permission_level,
+                    "status": sk.status,
+                    "invocation_count": int(sk.invocation_count or 0),
+                    "reuse_count": int(sk.reuse_count or 0),
+                    "reuse_success_count": int(sk.reuse_success_count or 0),
+                    "evolution_meta": sk.evolution_meta or {},
+                    "updated_at": _iso(sk.updated_at),
+                }
+            )
+        skill_version_trees = [
+            {
+                "canonical_name": cname,
+                "version_count": len(vers),
+                "total_reuses": sum(v["reuse_count"] for v in vers),
+                "active_version": next((v["version"] for v in vers if v["status"] == "VALIDATED"), vers[0]["version"]),
+                "versions": sorted(vers, key=lambda v: v["version"], reverse=True),
+            }
+            for cname, vers in sorted(
+                trees_map.items(),
+                key=lambda kv: (-sum(v["reuse_count"] for v in kv[1]), -len(kv[1]), kv[0]),
+            )
+        ]
+
+        external_playbooks = []
+        for pb in playbook_rows:
+            val = pb.value if isinstance(pb.value, dict) else {}
+            vers = list(val.get("versions") or [])
+            active_ver = int(val.get("active_version") or 0)
+            active_entry = next((v for v in vers if int(v.get("version") or 0) == active_ver), None)
+            external_playbooks.append(
+                {
+                    "id": str(pb.id),
+                    "domain": val.get("domain") or pb.key,
+                    "status": pb.status,
+                    "active_version": active_ver,
+                    "version_count": len(vers),
+                    "rollback_count": sum(1 for v in vers if v.get("status") == "rolled_back"),
+                    "active_samples": int((active_entry or {}).get("samples") or 0),
+                    "active_successes": int((active_entry or {}).get("successes") or 0),
+                    "change_summary": (active_entry or {}).get("change_summary", ""),
+                    "versions": vers[-10:],
+                    "updated_at": _iso(pb.updated_at),
                 }
             )
 
@@ -1932,11 +2091,19 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 {
                     "id": str(sk.id),
                     "skill_key": sk.skill_key,
+                    "canonical_name": sk.canonical_name,
                     "version": sk.version,
+                    "parent_version": sk.parent_version,
+                    "superseded_by": str(sk.superseded_by) if sk.superseded_by else None,
                     "capability_key": sk.capability_key,
                     "description": sk.description,
                     "permission_level": sk.permission_level,
                     "status": sk.status,
+                    "invocation_count": int(sk.invocation_count or 0),
+                    "reuse_count": int(sk.reuse_count or 0),
+                    "reuse_success_count": int(sk.reuse_success_count or 0),
+                    "last_invoked_at": _iso(sk.last_invoked_at),
+                    "evolution_meta": sk.evolution_meta or {},
                     "artifact_path": sk.artifact_path,
                     "artifact_checksum": sk.artifact_checksum,
                     "validations": vals_by_skill.get(sk.id, []),
@@ -1944,6 +2111,33 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 }
                 for sk in skills
             ],
+            "skill_reuse_summary": {
+                "total_invocations": total_inv_cnt,
+                "cross_task_reuses": cross_reuse_cnt,
+                "cross_task_successes": cross_reuse_ok,
+                "reuse_success_rate": (round(cross_reuse_ok / cross_reuse_cnt, 4) if cross_reuse_cnt > 0 else None),
+                "estimated_saved_tokens": saved_tokens_total,
+                "reused_skill_count": sum(1 for sk in skills if int(sk.reuse_count or 0) > 0),
+                "canonical_families_count": len(skill_version_trees),
+                "recent_invocations": [
+                    {
+                        "id": str(iv.id),
+                        "skill_id": str(iv.skill_id),
+                        "skill_name": skill_name_by_id.get(iv.skill_id, str(iv.skill_id)[:8]),
+                        "skill_version": iv.skill_version,
+                        "invocation_source": iv.invocation_source,
+                        "is_cross_task_reuse": bool(iv.is_cross_task_reuse),
+                        "passed": bool(iv.passed),
+                        "latency_ms": round(float(iv.latency_ms or 0.0), 2),
+                        "estimated_saved_tokens": int(iv.estimated_saved_tokens or 0),
+                        "error": iv.error,
+                        "created_at": _iso(iv.created_at),
+                    }
+                    for iv in skill_invs[:25]
+                ],
+            },
+            "skill_version_trees": skill_version_trees[:30],
+            "external_playbooks": external_playbooks,
             "versions": [
                 {
                     "version_id": str(v.id),

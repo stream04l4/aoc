@@ -203,6 +203,19 @@ class KernelV3Settings(BaseModel):
     world_poll_on_perceive: bool | None = None
     # V3.0 M4: safe RSI foundation — auto-crystallize & L0/L1 auto-validate workspace skills
     skill_auto_crystallize_enabled: bool = True
+    # V4.0 M1: external Skill Runtime, MCP bridge & Skill-first Planning
+    skill_runtime_enabled: bool = True
+    skill_first_planning_enabled: bool = True
+    skill_mcp_bridge_enabled: bool = True
+    skill_exec_timeout_seconds: float = 15.0
+    # V4.0 M2: bounded RSI skill evolution limits (kernel-enforced, immutable by skills)
+    skill_evolution_enabled: bool = True
+    max_skill_versions_per_canonical: int = 10
+    skill_semantic_dedup_threshold: float = 0.65
+    # V4.0 M3: external Playbook self-evolution & open public-web curiosity perception (SSRF guarded)
+    playbooks_enabled: bool = True
+    open_public_perception_enabled: bool = False
+    max_internal_curiosity_ratio: float = 0.45
 
 
 class _YamlSource(PydanticBaseSettingsSource):

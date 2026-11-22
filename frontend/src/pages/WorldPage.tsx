@@ -42,8 +42,14 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
       <Card>
         <CardHeader
           title="数字环境传感器状态（RSS / Git / Web）"
-          subtitle={`poll_on_perceive = ${String(data.poll_on_perceive)} · 重要性入库阈值 = ${data.importance_threshold} · 允许白名单域 ${(data.allowed_domains || []).length} 个（支持好奇心受控动态扩展）`}
+          subtitle={`poll_on_perceive = ${String(data.poll_on_perceive)} · 重要性入库阈值 = ${data.importance_threshold} · 已放行域名 ${(data.allowed_domains || []).length} 个`}
           icon={<Radio className="h-4 w-4" />}
+          action={
+            <StatusBadge
+              value={data.open_public_perception_enabled ? 'ENABLED' : 'IDLE'}
+              label={data.open_public_perception_enabled ? '公开 HTTPS 感知扩展 · 强 SSRF 防护' : '严格域名白名单'}
+            />
+          }
         />
         <div className="grid grid-cols-1 gap-3 p-4 md:grid-cols-3">
           {(data.sources || []).map((s: any) => (
@@ -104,6 +110,66 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
               </div>
             )}
           </div>
+        </Card>
+      )}
+
+      {/* V4.0 Curiosity External Exploration Topics (anti-internal-loop multi-domain tracking) */}
+      {data.exploration && (
+        <Card>
+          <CardHeader
+            title="好奇心外部探索主题追踪（Exploration Topics · V4.0）"
+            subtitle={`复用 digital_world_state(kind=exploration_topic)，限制内部自查死循环并推动跨领域外部探索 · 已验证 ${data.exploration.verified_count || 0} / 总计 ${data.exploration.total || 0}`}
+            icon={<Globe className="h-4 w-4" />}
+            action={
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(data.exploration.domains_summary || {}).map(([dom, cnt]) => (
+                  <span
+                    key={dom}
+                    className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-[10px] font-mono text-cyan-700 dark:text-cyan-300"
+                  >
+                    {dom}: {String(cnt)}
+                  </span>
+                ))}
+              </div>
+            }
+          />
+          {(data.exploration.topics || []).length === 0 ? (
+            <div className="px-5 py-4 text-xs text-slate-500">
+              当前暂无外部探索主题；好奇心驱动向外探索时将自动记录主题领域、验证事实与信息增益。
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-200/70 dark:divide-slate-800/80">
+              {data.exploration.topics.slice(0, 15).map((t: any) => (
+                <div key={t.id} className="px-4 py-3 space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-xs font-semibold font-mono truncate">{t.key}</span>
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-mono text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                        {t.domain}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {t.information_gain != null && (
+                        <span className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
+                          IG {Number(t.information_gain).toFixed(2)}
+                        </span>
+                      )}
+                      <StatusBadge value={t.status || 'exploring'} />
+                    </div>
+                  </div>
+                  {t.question && <p className="text-xs text-slate-600 dark:text-slate-300">{t.question}</p>}
+                  {(t.verified_facts || []).length > 0 && (
+                    <p className="text-[11px] text-cyan-600 dark:text-cyan-400">
+                      已验证事实：{t.verified_facts[t.verified_facts.length - 1]}
+                    </p>
+                  )}
+                  <div className="text-[10px] font-mono text-slate-400">
+                    尝试 {t.attempts ?? 0} 次 · 来源：{t.source} · 更新：{formatTime(t.updated_at)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </Card>
       )}
 
@@ -234,7 +300,9 @@ export function WorldPage({ refreshTick }: { refreshTick: number }) {
         <Card className="lg:col-span-5">
           <CardHeader title="工作环境态（world_states 知识话题）" subtitle="直接驱动 Curiosity 欲望的开放与已解决主题" />
           <div className="divide-y divide-slate-200/70 max-h-[540px] overflow-y-auto dark:divide-slate-800/80">
-            {(data.world_states || []).filter((w: any) => w.kind !== 'hypothesis').map((w: any) => (
+            {(data.world_states || [])
+              .filter((w: any) => !['hypothesis', 'exploration_topic', 'external_playbook'].includes(w.kind))
+              .map((w: any) => (
               <div key={w.id} className="flex items-start justify-between gap-3 px-4 py-3">
                 <div className="min-w-0">
                   <div className="text-xs font-medium font-mono truncate">{w.key}</div>

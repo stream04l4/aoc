@@ -65,6 +65,8 @@ class GoalProposal(BaseModel):
     hypothesis_to_test: dict[str, Any] | None = None
     # V3.1: optional allowlist-governed curiosity source discovery {source_id, sensor_type, url, name}
     discover_world_source: dict[str, Any] | None = None
+    # V4.0 M3: optional external exploration topic {topic_key, domain, question}
+    exploration_topic: dict[str, Any] | None = None
     usage: LLMUsage = Field(default_factory=LLMUsage)
 
     @field_validator("predicted_ig")
@@ -96,6 +98,8 @@ class ActionPlan(BaseModel):
     verification: list[VerificationSpec] = Field(default_factory=list)
     # V3.0 M3: optional bounded L0 read-only MCP prefetch tool calls before external Agent dispatch
     mcp_prefetch_calls: list[dict[str, Any]] = Field(default_factory=list)
+    # V4.0 M1: optional Skill-first direct invocation ({skill_key, version?, input_data}) bypassing Codex
+    skill_invocation: dict[str, Any] | None = None
     # Advisory prediction ONLY — never directly updates drive satisfaction (task book 9.1)
     expected_improvement: float = 0.0
     rationale: str = ""
@@ -133,6 +137,9 @@ class CognitiveContext(BaseModel):
     # V3.1: Read-only internal affect snapshot & lightweight unverified/recent world hypotheses
     affect_state: dict[str, Any] | None = None
     active_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+    # V4.0 M3: External self-evolving strategy playbooks & Curiosity anti-internal-loop guidance
+    external_playbooks: list[dict[str, Any]] = Field(default_factory=list)
+    exploration_guidance: dict[str, Any] | None = None
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -158,6 +165,8 @@ class EvaluationResult(BaseModel):
     # V3.1: Lightweight hypothesis verification outcome (confirmed ONLY when verification_passed=True)
     hypothesis_key: str | None = None
     hypothesis_verdict: str | None = None  # confirmed | refuted | inconclusive
+    # V4.0 M3: Optional external strategy playbook update ({domain, content, change_summary})
+    playbook_update: dict[str, Any] | None = None
     should_persist_memory: bool = False
     memory_type: str = MemoryType.EPISODIC.value
     memory_importance: float = 0.5

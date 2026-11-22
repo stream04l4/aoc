@@ -98,9 +98,12 @@ class AutonomousLoop:
         approval_service: Any = None,
         self_model: Any = None,
         skill_registry: Any = None,
+        skill_runtime: Any = None,
         affect: Any = None,
         mcp_manager: Any = None,
         world_pipeline: Any = None,
+        playbook_manager: Any = None,
+        exploration_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -118,9 +121,12 @@ class AutonomousLoop:
         self.approval_service = approval_service
         self.self_model = self_model
         self.skill_registry = skill_registry
+        self.skill_runtime = skill_runtime
         self.affect = affect
         self.mcp_manager = mcp_manager
         self.world_pipeline = world_pipeline
+        self.playbook_manager = playbook_manager
+        self.exploration_manager = exploration_manager
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -161,6 +167,8 @@ class AutonomousLoop:
             self_model=self_model,
             skill_registry=skill_registry,
             skill_auto_crystallize=kv3.skill_auto_crystallize_enabled,
+            playbook_manager=playbook_manager,
+            exploration_manager=exploration_manager,
         )
 
     def _record_prediction_error(self, error: float) -> None:
@@ -520,6 +528,28 @@ class AutonomousLoop:
             except Exception as exc:
                 logger.warning("cycle.hypotheses_load_degraded", cycle_id=str(cycle_id), error=str(exc))
 
+            kv3 = self.settings.kernel_v3
+            lookback_h = max(24.0, float(kv3.goal_dedup_window_hours))
+            recent_goals = await self.repo.list_recent_goals(
+                since=now - timedelta(hours=lookback_h), limit=80
+            )
+            exploration_guidance: dict[str, Any] | None = None
+            if self.exploration_manager is not None:
+                try:
+                    exploration_guidance = await self.exploration_manager.build_guidance(recent_goals)
+                except Exception as exc:
+                    logger.warning("cycle.exploration_guidance_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+            external_playbooks: list[dict[str, Any]] = []
+            if self.playbook_manager is not None:
+                try:
+                    external_playbooks = await self.playbook_manager.list_playbooks_for_context(
+                        domains=[decision.selected_drive, "coding", "general"],
+                        limit=3,
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.playbooks_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -535,6 +565,8 @@ class AutonomousLoop:
                 validated_skills=reusable_skills,
                 affect_state=affect_state_snapshot,
                 active_hypotheses=active_hypotheses,
+                external_playbooks=external_playbooks,
+                exploration_guidance=exploration_guidance,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -553,7 +585,7 @@ class AutonomousLoop:
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
-            # V3.0 M1 + V3.1: Multi-Candidate Deterministic Goal Scoring, Deduplication & Cooldown Gate
+            # V3.0 M1 + V3.1 + V4.0 M3: Multi-Candidate Deterministic Goal Scoring, Dedup & External Exploration Bias
             goal_fp = compute_goal_fingerprint(
                 drive_type=decision.selected_drive,
                 title=goal_proposal.title,
@@ -561,11 +593,10 @@ class AutonomousLoop:
                 description=goal_proposal.description,
             )
             goal_candidates_audit: list[dict[str, Any]] = []
-            kv3 = self.settings.kernel_v3
             if kv3.goal_dedup_enabled and not bool(decision.constraints.get("emergency_mode")):
-                lookback_h = max(24.0, float(kv3.goal_dedup_window_hours))
-                recent_goals = await self.repo.list_recent_goals(
-                    since=now - timedelta(hours=lookback_h), limit=80
+                prefer_external = bool(
+                    decision.selected_drive == DriveType.CURIOSITY.value
+                    and (exploration_guidance or {}).get("must_explore_external")
                 )
                 sel_res = select_best_goal_candidate(
                     primary=goal_proposal,
@@ -574,6 +605,7 @@ class AutonomousLoop:
                     dedup_engine=self.goal_dedup,
                     now=now,
                     affect_state=affect_state_snapshot,
+                    prefer_external=prefer_external,
                 )
                 goal_candidates_audit = [c.model_dump(mode="json") for c in sel_res.candidates]
                 dedup_res = sel_res.selected_dedup
@@ -715,6 +747,30 @@ class AutonomousLoop:
                             payload={"source_id": req_sid, "sensor_type": req_type, "url": req_url, "error": str(exc)},
                             cycle_id=cycle_id,
                         )
+
+            # V4.0 M3: Track active external playbooks & Curiosity exploration topic lifecycle
+            if external_playbooks:
+                expected_outcome_payload["playbook_domains"] = [
+                    str(pb["domain"]) for pb in external_playbooks if pb.get("domain")
+                ]
+            if self.exploration_manager is not None and isinstance(goal_proposal.exploration_topic, dict):
+                et = goal_proposal.exploration_topic
+                et_key = str(et.get("topic_key") or goal_proposal.related_key or goal_proposal.title[:60]).strip()
+                et_q = str(et.get("question") or goal_proposal.title).strip()
+                et_dom = et.get("domain")
+                if et_key:
+                    try:
+                        tracked = await self.exploration_manager.upsert_topic(
+                            topic_key=et_key,
+                            question=et_q,
+                            domain=str(et_dom) if et_dom else None,
+                            status="exploring",
+                            source=f"cycle:{cycle_id}",
+                        )
+                        expected_outcome_payload["exploration_topic_key"] = tracked["key"]
+                        expected_outcome_payload["exploration_domain"] = tracked["domain"]
+                    except Exception as exc:
+                        logger.warning("cycle.exploration_topic_upsert_degraded", error=str(exc))
 
             goal_id = await self.repo.create_goal(
                 self.organism_id,
@@ -929,26 +985,45 @@ class AutonomousLoop:
                     plan = plan.model_copy(update={"description": enriched_desc})
 
             await self.repo.update_cycle(cycle_id, phase="AGENT_DISPATCH")
-            retry_backoff_mult = float(
-                ((decision.constraints or {}).get("affect_modulation") or {}).get("retry_backoff_multiplier", 1.0) or 1.0
-            )
-            dispatch_info = await self.orchestrator.submit_plan(
-                plan=plan,
-                verdict=verdict,
-                goal_id=goal_id,
-                plan_id=plan_id,
-                cycle_id=cycle_id,
-                retry_backoff_multiplier=retry_backoff_mult,
-            )
-            task_id = dispatch_info["task_id"]
+            task_state: dict[str, Any] | None = None
+            # V4.0 M1: Skill-First Execution — run matching VALIDATED skill directly via SkillRuntime (0 Codex tokens!)
+            if (
+                kv3.skill_first_planning_enabled
+                and self.skill_runtime is not None
+                and isinstance(plan.skill_invocation, dict)
+                and plan.skill_invocation.get("skill_key")
+            ):
+                task_state = await self._try_skill_first_execution(
+                    cycle_id=cycle_id,
+                    goal_id=goal_id,
+                    plan_id=plan_id,
+                    plan=plan,
+                    verdict=verdict,
+                )
 
-            # ── 11. WAIT / MONITOR ──────────────────────────────────────────
-            await self.repo.update_cycle(cycle_id, phase="WAIT_MONITOR")
-            task_state = await self.orchestrator.wait_for_task(
-                task_id=task_id,
-                max_wait_seconds=self.settings.runtime.max_wait_per_cycle_seconds,
-                poll_interval=self.settings.runtime.monitor_poll_seconds,
-            )
+            if task_state is None:
+                retry_backoff_mult = float(
+                    ((decision.constraints or {}).get("affect_modulation") or {}).get("retry_backoff_multiplier", 1.0) or 1.0
+                )
+                dispatch_info = await self.orchestrator.submit_plan(
+                    plan=plan,
+                    verdict=verdict,
+                    goal_id=goal_id,
+                    plan_id=plan_id,
+                    cycle_id=cycle_id,
+                    retry_backoff_multiplier=retry_backoff_mult,
+                )
+                task_id = dispatch_info["task_id"]
+
+                # ── 11. WAIT / MONITOR ──────────────────────────────────────────
+                await self.repo.update_cycle(cycle_id, phase="WAIT_MONITOR")
+                task_state = await self.orchestrator.wait_for_task(
+                    task_id=task_id,
+                    max_wait_seconds=self.settings.runtime.max_wait_per_cycle_seconds,
+                    poll_interval=self.settings.runtime.monitor_poll_seconds,
+                )
+            else:
+                task_id = task_state["task_id"]
             await self.repo.update_cycle(cycle_id, execution_summary=task_state)
 
             if not TaskStatus(task_state["status"]).is_terminal:
@@ -1183,6 +1258,137 @@ class AutonomousLoop:
                 rationale="Deterministic emergency fallback plan",
             )
         return ActionPlan(should_execute=False, rationale="LLM unavailable for planning")
+
+    async def _try_skill_first_execution(
+        self,
+        *,
+        cycle_id: uuid.UUID,
+        goal_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        plan: ActionPlan,
+        verdict: Any,
+    ) -> dict[str, Any] | None:
+        """Attempt direct isolated SkillRuntime execution before falling back to Codex (V4.0 M1)."""
+        inv_spec = plan.skill_invocation or {}
+        skill_ref = str(inv_spec.get("skill_key") or "").strip()
+        skill_ver = str(inv_spec.get("version")).strip() if inv_spec.get("version") else None
+        in_data = inv_spec.get("input_data") if isinstance(inv_spec.get("input_data"), dict) else {}
+        if not skill_ref or self.skill_runtime is None:
+            return None
+
+        task_uuid = uuid.uuid4()
+        try:
+            s_res = await self.skill_runtime.execute(
+                skill_ref,
+                in_data,
+                version=skill_ver,
+                invocation_source="skill_first",
+                task_id=task_uuid,
+                cycle_id=cycle_id,
+            )
+        except Exception as exc:
+            logger.warning("loop.skill_first_exception", skill_ref=skill_ref, error=str(exc))
+            await self.repo.log_decision(
+                decision_type="skill_first_fallback",
+                selected=plan.assigned_agent,
+                alternatives=[skill_ref],
+                reason=f"Skill-first execution raised exception ({exc}); falling back to {plan.assigned_agent}",
+                payload={"skill_key": skill_ref, "error": str(exc)},
+                cycle_id=cycle_id,
+            )
+            return None
+
+        if not s_res.ok:
+            await self.repo.log_decision(
+                decision_type="skill_first_fallback",
+                selected=plan.assigned_agent,
+                alternatives=[skill_ref],
+                reason=f"Skill-first '{skill_ref}' unavailable/failed ({s_res.error}); falling back to {plan.assigned_agent}",
+                payload=s_res.model_dump(mode="json"),
+                cycle_id=cycle_id,
+            )
+            return None
+
+        import json as _json
+
+        now = utcnow()
+        exec_uuid = uuid.uuid4()
+        ws = self.governance.prepare_workspace(str(task_uuid))
+        out_str = _json.dumps(s_res.output, ensure_ascii=False, default=str) if s_res.output is not None else s_res.stdout_excerpt
+        verif_dict = {
+            "passed": True,
+            "summary": f"SkillRuntime verified execution of {s_res.canonical_name or s_res.skill_key}@{s_res.version}",
+            "checks": [
+                {"kind": "skill_runtime_exit", "passed": True, "detail": f"latency_ms={s_res.latency_ms}"},
+                {"kind": "skill_schema_and_integrity", "passed": True, "detail": f"reuse={s_res.is_cross_task_reuse}"},
+            ],
+        }
+        outcome_dict = {
+            "execution_id": str(exec_uuid),
+            "agent_id": "skill_runtime",
+            "status": "SUCCEEDED",
+            "verification": verif_dict,
+            "skill_first_execution": {
+                "skill_id": s_res.skill_id,
+                "skill_key": s_res.skill_key,
+                "canonical_name": s_res.canonical_name,
+                "version": s_res.version,
+                "is_cross_task_reuse": s_res.is_cross_task_reuse,
+                "estimated_saved_tokens": s_res.estimated_saved_tokens,
+                "invocation_id": s_res.invocation_id,
+            },
+        }
+        await self.repo.create_task(
+            id=task_uuid,
+            plan_id=plan_id,
+            goal_id=goal_id,
+            cycle_id=cycle_id,
+            objective=plan.objective,
+            description=plan.description,
+            assigned_agent="skill_runtime",
+            expected_output=plan.expected_output,
+            workspace=ws,
+            timeout_seconds=int(self.skill_runtime.default_timeout_seconds),
+            resource_budget={"sandbox_mode": verdict.sandbox_mode, "skill_first": True},
+            permission_level=verdict.effective_level,
+            success_criteria=plan.success_criteria,
+            verification=[v.model_dump(mode="json") for v in plan.verification],
+            required_capability=plan.required_capability,
+            status=TaskStatus.SUCCEEDED.value,
+            attempt=1,
+            max_attempts=1,
+            tried_agents=["skill_runtime"],
+            outcome=outcome_dict,
+        )
+        await self.repo.create_execution(
+            task_uuid,
+            "skill_runtime",
+            "SUCCEEDED",
+            execution_id=exec_uuid,
+            attempt_number=1,
+            idempotency_key=f"skill_first:{task_uuid}",
+        )
+        await self.repo.update_execution(
+            exec_uuid,
+            completed_at=now,
+            result={"summary": f"SkillRuntime executed {s_res.canonical_name or s_res.skill_key}@{s_res.version}", "output": s_res.output},
+            stdout=out_str[:8000],
+            verification=verif_dict,
+            resource_usage={"wall_seconds": round(s_res.latency_ms / 1000.0, 3), "estimated_saved_tokens": s_res.estimated_saved_tokens},
+        )
+        await self.repo.log_decision(
+            decision_type="skill_first_execution",
+            selected=s_res.canonical_name or s_res.skill_key,
+            alternatives=[plan.assigned_agent],
+            reason=f"Skill-first directly executed '{s_res.canonical_name or s_res.skill_key}@{s_res.version}' in {s_res.latency_ms}ms (bypassed {plan.assigned_agent})",
+            payload=outcome_dict["skill_first_execution"],
+            cycle_id=cycle_id,
+        )
+        return (await self.repo.get_task(task_uuid)) or {
+            "task_id": str(task_uuid),
+            "status": TaskStatus.SUCCEEDED.value,
+            "outcome": outcome_dict,
+        }
 
     async def _run_mcp_prefetch(
         self,

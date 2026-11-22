@@ -51,12 +51,16 @@ from app.perception.agent_sensor import AgentSensor
 from app.perception.environment_sensor import EnvironmentSensor
 from app.perception.manager import SensorManager
 from app.perception.system_sensor import SystemSensor
+from app.perception.world.exploration import ExplorationManager
 from app.perception.world.git_sensor import GitWorldSensor
 from app.perception.world.pipeline import WorldEventPipeline
 from app.perception.world.rss_sensor import RSSWorldSensor
 from app.perception.world.web_sensor import WebChangeWorldSensor
 from app.self_model.manager import SelfModelManager
 from app.self_model.skills import SkillRegistryManager
+from app.skills.evolution import SkillEvolutionEngine
+from app.skills.playbooks import PlaybookManager
+from app.skills.runtime import SkillRuntime
 from app.storage.database import Database
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository
@@ -278,6 +282,7 @@ class OrganismRuntime:
             embedding_service=self.embedding_service,
             allowed_domains=allowed_domains,
             allowed_git_roots=allowed_git_roots,
+            open_public_https=self.settings.kernel_v3.open_public_perception_enabled,
         )
         self.env_sensor.world_pipeline = self.world_pipeline
         if self.settings.kernel_v3.world_poll_on_perceive is not None:
@@ -300,6 +305,10 @@ class OrganismRuntime:
         self._affect_cfg: dict[str, Any] = get_affect_config()
         self.self_model: SelfModelManager | None = None
         self.skill_registry: SkillRegistryManager | None = None
+        self.skill_runtime: SkillRuntime | None = None
+        self.skill_evolution: SkillEvolutionEngine | None = None
+        self.playbook_manager: PlaybookManager | None = None
+        self.exploration_manager: ExplorationManager | None = None
         self.affect: AffectModulator | None = None
 
         self.loop: AutonomousLoop | None = None
@@ -336,6 +345,37 @@ class OrganismRuntime:
             skill_registry=self.skill_registry,
         )
         self.skill_registry.self_model = self.self_model
+        # V4.0 M1/M2: External isolated SkillRuntime, Bounded RSI Evolution Engine & MCP bridge
+        if self.settings.kernel_v3.skill_evolution_enabled:
+            self.skill_evolution = SkillEvolutionEngine(
+                repo=self.repo,
+                skill_registry=self.skill_registry,
+                max_versions_per_canonical=self.settings.kernel_v3.max_skill_versions_per_canonical,
+                dedup_threshold=self.settings.kernel_v3.skill_semantic_dedup_threshold,
+            )
+            self.skill_registry.evolution_engine = self.skill_evolution
+        if self.settings.kernel_v3.skill_runtime_enabled:
+            self.skill_runtime = SkillRuntime(
+                repo=self.repo,
+                skill_registry=self.skill_registry,
+                governance=self.governance,
+                default_timeout_seconds=self.settings.kernel_v3.skill_exec_timeout_seconds,
+            )
+            if self.settings.kernel_v3.skill_mcp_bridge_enabled and self.mcp_manager is not None:
+                self.mcp_manager.attach_skill_runtime(self.skill_runtime)
+                self.skill_registry.set_on_skills_changed(self.mcp_manager.sync_validated_skills_as_tools)
+                await self.mcp_manager.sync_validated_skills_as_tools()
+
+        # V4.0 M3: External Self-Evolving Playbooks & Curiosity Anti-Internal-Loop Manager
+        if self.settings.kernel_v3.playbooks_enabled:
+            self.playbook_manager = PlaybookManager(
+                repo=self.repo,
+                storage_dir=Path(ws_root) / "playbooks",
+            )
+        self.exploration_manager = ExplorationManager(
+            repo=self.repo,
+            max_internal_curiosity_ratio=self.settings.kernel_v3.max_internal_curiosity_ratio,
+        )
 
         # Optional bounded Affect modulation layer (V2.0 P1-9 / V3.0 M2)
         eff_affect_cfg = dict(self._affect_cfg or {})
@@ -362,6 +402,8 @@ class OrganismRuntime:
             self_model=self.self_model,
             skill_registry=self.skill_registry,
             skill_auto_crystallize=self.settings.kernel_v3.skill_auto_crystallize_enabled,
+            playbook_manager=self.playbook_manager,
+            exploration_manager=self.exploration_manager,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -421,9 +463,12 @@ class OrganismRuntime:
             approval_service=self.approval_service,
             self_model=self.self_model,
             skill_registry=self.skill_registry,
+            skill_runtime=self.skill_runtime,
             affect=self.affect,
             mcp_manager=self.mcp_manager,
             world_pipeline=self.world_pipeline,
+            playbook_manager=self.playbook_manager,
+            exploration_manager=self.exploration_manager,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error

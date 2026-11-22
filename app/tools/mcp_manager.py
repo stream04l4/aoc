@@ -87,6 +87,40 @@ class MCPClientManager(ToolProviderInterface):
         self.allowed_domains = list(allowed_domains)
         self.allowed_git_roots = list(allowed_git_roots)
         self._tools: dict[str, ToolSpec] = {}
+        self._skill_runtime: Any = None
+
+    def attach_skill_runtime(self, skill_runtime: Any) -> None:
+        """Attach external SkillRuntime so VALIDATED skills expose as unified MCP tools (V4.0 M1)."""
+        self._skill_runtime = skill_runtime
+
+    async def sync_validated_skills_as_tools(self, limit: int = 30) -> int:
+        """Register integrity-verified VALIDATED skills as callable `skill:<name>` MCP tools."""
+        if self._skill_runtime is None:
+            return 0
+        # Remove stale dynamic skill tools before refreshing
+        for k in [name for name, spec in self._tools.items() if spec.provider_kind == "tool_provider_skill"]:
+            self._tools.pop(k, None)
+        skills = await self._skill_runtime.skill_registry.list_reusable_skills_for_context(limit=limit)
+        added = 0
+        for sk in skills:
+            ref_name = str(sk.get("canonical_name") or sk["skill_key"])
+            tname = f"skill:{ref_name}"
+            spec = ToolSpec(
+                tool_name=tname,
+                server_name="aoc-skill-runtime",
+                provider_kind="tool_provider_skill",
+                description=(
+                    f"[Skill v{sk.get('version', '1.0.0')} · {sk.get('capability_key', 'coding')}] "
+                    f"{sk.get('description', '')}"
+                )[:300],
+                permission_level=str(sk.get("permission_level") or "L1"),
+                timeout_seconds=float(self._skill_runtime.default_timeout_seconds),
+                enabled=True,
+                input_schema=dict(sk.get("input_schema") or {}),
+            )
+            self.register_tool(spec)
+            added += 1
+        return added
 
     def register_tool(self, spec: ToolSpec) -> None:
         self._tools[spec.tool_name] = spec
@@ -266,7 +300,48 @@ class MCPClientManager(ToolProviderInterface):
             reason=f"Allowed MCP tool '{spec.tool_name}' at {verdict.effective_level}",
         )
 
-        # 4. Execute over real stdio JSON-RPC 2.0 child process with strict timeout & sanitized env
+        # 4. V4.0 M1: Unified SkillRuntime execution path for `skill:*` tools (shares single runtime & version index)
+        if spec.provider_kind == "tool_provider_skill" and self._skill_runtime is not None:
+            s_res = await self._skill_runtime.execute(
+                spec.tool_name,
+                req.arguments,
+                invocation_source="mcp",
+                task_id=task_uuid,
+                cycle_id=cycle_uuid,
+                timeout_seconds=spec.timeout_seconds,
+                approved_l2=req.approved_l2,
+            )
+            await self.repo.record_usage(
+                category="mcp_tool",
+                amount=1.0,
+                seconds=s_res.latency_ms / 1000.0,
+                details={
+                    "tool_name": spec.tool_name,
+                    "server_name": spec.server_name,
+                    "skill_id": s_res.skill_id,
+                    "skill_version": s_res.version,
+                    "is_cross_task_reuse": s_res.is_cross_task_reuse,
+                    "ok": s_res.ok,
+                },
+                cycle_id=cycle_uuid,
+                task_id=task_uuid,
+            )
+            return ToolCallResult(
+                tool_name=spec.tool_name,
+                server_name=spec.server_name,
+                provider_kind=spec.provider_kind,
+                ok=s_res.ok,
+                output=s_res.output,
+                denied=s_res.denied,
+                requires_approval=s_res.requires_approval,
+                requested_level=req_level_str,
+                effective_level=verdict.effective_level,
+                error=s_res.error,
+                latency_ms=s_res.latency_ms,
+                policy_evaluation_id=str(eval_id),
+            )
+
+        # 5. Execute over real stdio JSON-RPC 2.0 child process with strict timeout & sanitized env
         workspace = req.workspace or self.governance.prepare_workspace(req.task_id or f"mcp-{uuid.uuid4().hex[:8]}")
         try:
             structured, truncated = await self._call_stdio_server(spec, req.arguments, workspace=workspace)
