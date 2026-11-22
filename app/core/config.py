@@ -203,6 +203,11 @@ class KernelV3Settings(BaseModel):
     world_poll_on_perceive: bool | None = None
     # V3.0 M4: safe RSI foundation — auto-crystallize & L0/L1 auto-validate workspace skills
     skill_auto_crystallize_enabled: bool = True
+    # V4.0 M1: external Skill Runtime, MCP bridge & Skill-first Planning
+    skill_runtime_enabled: bool = True
+    skill_first_planning_enabled: bool = True
+    skill_mcp_bridge_enabled: bool = True
+    skill_exec_timeout_seconds: float = 15.0
 
 
 class _YamlSource(PydanticBaseSettingsSource):

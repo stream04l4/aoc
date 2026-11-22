@@ -57,6 +57,7 @@ from app.perception.world.rss_sensor import RSSWorldSensor
 from app.perception.world.web_sensor import WebChangeWorldSensor
 from app.self_model.manager import SelfModelManager
 from app.self_model.skills import SkillRegistryManager
+from app.skills.runtime import SkillRuntime
 from app.storage.database import Database
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository
@@ -300,6 +301,7 @@ class OrganismRuntime:
         self._affect_cfg: dict[str, Any] = get_affect_config()
         self.self_model: SelfModelManager | None = None
         self.skill_registry: SkillRegistryManager | None = None
+        self.skill_runtime: SkillRuntime | None = None
         self.affect: AffectModulator | None = None
 
         self.loop: AutonomousLoop | None = None
@@ -336,6 +338,18 @@ class OrganismRuntime:
             skill_registry=self.skill_registry,
         )
         self.skill_registry.self_model = self.self_model
+        # V4.0 M1: External isolated SkillRuntime + automatic MCP tool bridge
+        if self.settings.kernel_v3.skill_runtime_enabled:
+            self.skill_runtime = SkillRuntime(
+                repo=self.repo,
+                skill_registry=self.skill_registry,
+                governance=self.governance,
+                default_timeout_seconds=self.settings.kernel_v3.skill_exec_timeout_seconds,
+            )
+            if self.settings.kernel_v3.skill_mcp_bridge_enabled and self.mcp_manager is not None:
+                self.mcp_manager.attach_skill_runtime(self.skill_runtime)
+                self.skill_registry.set_on_skills_changed(self.mcp_manager.sync_validated_skills_as_tools)
+                await self.mcp_manager.sync_validated_skills_as_tools()
 
         # Optional bounded Affect modulation layer (V2.0 P1-9 / V3.0 M2)
         eff_affect_cfg = dict(self._affect_cfg or {})
@@ -421,6 +435,7 @@ class OrganismRuntime:
             approval_service=self.approval_service,
             self_model=self.self_model,
             skill_registry=self.skill_registry,
+            skill_runtime=self.skill_runtime,
             affect=self.affect,
             mcp_manager=self.mcp_manager,
             world_pipeline=self.world_pipeline,

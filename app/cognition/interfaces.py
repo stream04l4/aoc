@@ -96,6 +96,8 @@ class ActionPlan(BaseModel):
     verification: list[VerificationSpec] = Field(default_factory=list)
     # V3.0 M3: optional bounded L0 read-only MCP prefetch tool calls before external Agent dispatch
     mcp_prefetch_calls: list[dict[str, Any]] = Field(default_factory=list)
+    # V4.0 M1: optional Skill-first direct invocation ({skill_key, version?, input_data}) bypassing Codex
+    skill_invocation: dict[str, Any] | None = None
     # Advisory prediction ONLY — never directly updates drive satisfaction (task book 9.1)
     expected_improvement: float = 0.0
     rationale: str = ""
