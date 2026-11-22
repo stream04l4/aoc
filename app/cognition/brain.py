@@ -123,8 +123,12 @@ class CognitionBrain(BrainInterface):
             "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
             "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
             "For curiosity drive, you may verify an unverified entry in active_hypotheses, attach a new lightweight "
-            "hypothesis_to_test ({key, claim, verification_hint}), or optionally suggest discover_world_source "
-            "({source_id, sensor_type, url, name}) using an allowlisted RSS/Web feed. "
+            "hypothesis_to_test ({key, claim, verification_hint}), attach an external exploration_topic "
+            "({topic_key, domain, question}), or optionally suggest discover_world_source "
+            "({source_id, sensor_type, url, name}) for a public HTTPS RSS/Web feed (SSRF/internal IPs are blocked). "
+            "Check exploration_guidance: if must_explore_external is true, AVOID internal self-diagnostics/ledgers "
+            "and propose genuine external technical/scientific exploration (papers, open-source releases, databases, AI tools). "
+            "You may also consult external_playbooks (versioned strategy guides accumulated outside the kernel). "
             "Set related_key to the relevant topic/capability/hypothesis key if applicable. "
             + _UNTRUSTED_DATA_RULE
         )
@@ -135,6 +139,8 @@ class CognitionBrain(BrainInterface):
             "constraints": context.decision.constraints,
             "affect_state_readonly": context.affect_state,
             "active_hypotheses": context.active_hypotheses[:8],
+            "external_playbooks": context.external_playbooks[:3],
+            "exploration_guidance": context.exploration_guidance,
             "drives": [d.model_dump(mode="json") for d in context.drives],
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "environment_state": fenced_obs.get("environment_state", {}),
@@ -168,6 +174,8 @@ class CognitionBrain(BrainInterface):
             "if an existing validated skill matches the goal, set skill_invocation={skill_key, input_data} "
             "(matching its input_schema) so AOC executes it directly via SkillRuntime (zero Codex tokens!). "
             "Only dispatch Codex to write code when no existing validated skill covers the task.\n"
+            "- Apply relevant proven tips from external_playbooks (versioned external strategy guides), "
+            "without ever violating Governance or L0-L2 permission boundaries.\n"
             "- affect_state_readonly is read-only internal context (when frustration is high prefer smaller, well-verified steps).\n"
             "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
             "from available_tools.\n"
@@ -181,6 +189,7 @@ class CognitionBrain(BrainInterface):
             "constraints": context.decision.constraints,
             "affect_state_readonly": context.affect_state,
             "active_hypotheses": context.active_hypotheses[:5],
+            "external_playbooks": context.external_playbooks[:3],
             "goal": context.goal.model_dump(mode="json") if context.goal else None,
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
@@ -207,6 +216,9 @@ class CognitionBrain(BrainInterface):
             "- Set resolved_topic ONLY if the topic was genuinely researched and verified.\n"
             "- If the task tested a hypothesis, set hypothesis_key and hypothesis_verdict ('confirmed'|'refuted'|'inconclusive') "
             "ONLY when backed by observed execution evidence (NEVER mark confirmed if verification_passed is false).\n"
+            "- Optionally emit playbook_update ({domain, content, change_summary}) ONLY when goal_achieved=true and "
+            "verification_passed=true and a reusable external task strategy/lesson was discovered (NEVER suggest editing "
+            "AOC Core code, drives, or Governance policies).\n"
             "- Choose memory_type from: identity, episodic, semantic, procedural, self_model."
         )
         payload = {
@@ -239,13 +251,14 @@ class CognitionBrain(BrainInterface):
         # Hard guard (task book 17.7): LLM cannot declare success or confirm hypotheses if execution/verification failed
         exec_status = str(context.execution.get("status", ""))
         if not context.verification_passed or exec_status != "SUCCEEDED":
-            if result.goal_achieved or result.hypothesis_verdict == "confirmed":
+            if result.goal_achieved or result.hypothesis_verdict == "confirmed" or result.playbook_update is not None:
                 result = result.model_copy(
                     update={
                         "goal_achieved": False,
                         "resolved_topic": None,
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
+                        "playbook_update": None,
                         "notes": (result.notes + " [Overridden: execution or deterministic verification failed]").strip(),
                     }
                 )

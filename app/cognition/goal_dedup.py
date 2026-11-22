@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from app.cognition.interfaces import GoalProposal
 from app.memory.embedding import cosine_similarity
 from app.perception.interfaces import utcnow
+from app.perception.world.exploration import classify_exploration_scope
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]")
 _STOPWORDS = frozenset(
@@ -320,6 +321,7 @@ def select_best_goal_candidate(
     dedup_engine: GoalDedupEngine,
     now: datetime | None = None,
     affect_state: dict[str, Any] | None = None,
+    prefer_external: bool = False,
 ) -> GoalSelectionResult:
     """Evaluate primary + up to 2 alternative_goals through GoalDedupEngine and deterministically pick best.
 
@@ -352,6 +354,7 @@ def select_best_goal_candidate(
                     predicted_ig=max(0.0, min(1.0, alt_pred_ig)),
                     hypothesis_to_test=raw_alt.get("hypothesis_to_test") if isinstance(raw_alt.get("hypothesis_to_test"), dict) else None,
                     discover_world_source=raw_alt.get("discover_world_source") if isinstance(raw_alt.get("discover_world_source"), dict) else None,
+                    exploration_topic=raw_alt.get("exploration_topic") if isinstance(raw_alt.get("exploration_topic"), dict) else None,
                 ),
             )
         )
@@ -384,7 +387,14 @@ def select_best_goal_candidate(
             # When bored, reward higher expected IG slightly more; when frustrated, slightly favor focused related_key goals
             affect_fit = 0.05 * boredom * pred_ig + (0.04 * frustration if prop.related_key else 0.0)
             primary_bonus = 0.10 if src == "primary" else 0.0
-            score = round(0.50 * pred_ig + 0.25 * novelty_term + specificity + affect_fit + primary_bonus, 4)
+            external_bias = 0.0
+            if prefer_external:
+                scope = classify_exploration_scope(prop.title, prop.description, prop.related_key)
+                external_bias = 0.25 if scope == "external_exploration" else -0.30
+            score = max(
+                0.0,
+                round(0.50 * pred_ig + 0.25 * novelty_term + specificity + affect_fit + primary_bonus + external_bias, 4),
+            )
             scored.append((score, -idx, src, prop, dec))
         else:
             score = 0.0

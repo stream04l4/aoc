@@ -49,6 +49,8 @@ class WorldEventPipeline:
         embedding_service: EmbeddingService | None = None,
         allowed_domains: Sequence[str] = (),
         allowed_git_roots: Sequence[str] = (),
+        open_public_https: bool = False,
+        max_dynamic_sources: int = 20,
     ) -> None:
         self.repo = repo
         self._sensors: dict[str, DigitalWorldSensor] = {s.sensor_type: s for s in sensors}
@@ -57,6 +59,8 @@ class WorldEventPipeline:
         self.embedding_service = embedding_service
         self.allowed_domains = list(allowed_domains)
         self.allowed_git_roots = list(allowed_git_roots)
+        self.open_public_https = bool(open_public_https)
+        self.max_dynamic_sources = max(1, int(max_dynamic_sources))
 
     def register_sensor(self, sensor: DigitalWorldSensor) -> None:
         self._sensors[sensor.sensor_type] = sensor
@@ -71,28 +75,62 @@ class WorldEventPipeline:
         reliability_score: float = 0.75,
         poll_interval_seconds: int = 3600,
         enabled: bool = True,
+        resolver: Any = None,
     ) -> dict[str, Any]:
-        """Guarded extension port for dynamically adding external perception sources (V3.0 M3+).
+        """Guarded extension port for dynamically adding external perception sources (V3.0 M3 / V4.0 M3).
 
-        Enforces strict allowlist validation for RSS/Web domains and Git roots so future
-        curiosity-driven topic discovery can never bypass SSRF or filesystem containment.
+        - When `open_public_https=False` (strict mode): requires hostname in `allowed_domains`.
+        - When `open_public_https=True` (V4.0 M3 Curiosity mode): permits ANY public HTTPS domain
+          while strictly enforcing SSRF/private/loopback/metadata IP blocking and max source cap,
+          and propagates the approved public hostname to active RSS/Web sensors.
         """
+        import ipaddress
         from urllib.parse import urlparse
         from pathlib import Path
+        from app.perception.world.security import is_blocked_ip, validate_and_resolve_url
 
         stype = str(sensor_type or "").strip().lower()
         if stype not in {"rss", "web", "git"}:
             raise ValueError(f"Unsupported dynamic sensor_type '{stype}'")
 
+        existing_sources = await self.repo.list_world_sources()
+        if len(existing_sources) >= self.max_dynamic_sources and not any(
+            s.get("source_id") == source_id.strip()[:120] for s in existing_sources
+        ):
+            raise PermissionError(f"Dynamic source cap reached ({len(existing_sources)}/{self.max_dynamic_sources})")
+
         if stype in {"rss", "web"}:
             url = str(config.get("url") or "").strip()
             parsed = urlparse(url)
-            host = (parsed.hostname or "").lower()
+            host = (parsed.hostname or "").lower().rstrip(".")
             if parsed.scheme != "https" or not host:
                 raise PermissionError(f"Dynamic {stype} source requires https URL with valid host")
+            if parsed.username or parsed.password:
+                raise PermissionError("Credentials embedded in URL are forbidden")
+            if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".lan")):
+                raise PermissionError(f"Internal hostname '{host}' is forbidden")
+            # Reject bare IP literals outright
+            try:
+                ipaddress.ip_address(host)
+                if is_blocked_ip(host):
+                    raise PermissionError(f"Blocked private/loopback/metadata IP literal: {host}")
+                raise PermissionError(f"Bare IP literal '{host}' is not allowed for dynamic perception sources")
+            except ValueError:
+                pass
+
             allowed_low = {d.lower() for d in self.allowed_domains}
-            if allowed_low and host not in allowed_low:
-                raise PermissionError(f"Domain '{host}' is not in allowed_domains allowlist")
+            if not self.open_public_https:
+                if allowed_low and host not in allowed_low:
+                    raise PermissionError(f"Domain '{host}' is not in allowed_domains allowlist")
+            else:
+                # V4.0 M3: Verify DNS resolution blocks ALL private/loopback/link-local/metadata IPs
+                await validate_and_resolve_url(url, [host], resolver=resolver, allow_http=False)
+                if host not in allowed_low:
+                    self.allowed_domains.append(host)
+                    for sensor in self._sensors.values():
+                        doms = getattr(sensor, "allowed_domains", None)
+                        if isinstance(doms, list) and host not in {d.lower() for d in doms}:
+                            doms.append(host)
         elif stype == "git":
             repo_raw = str(config.get("repo_path") or "").strip()
             if not repo_raw:

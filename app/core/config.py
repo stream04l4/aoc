@@ -212,6 +212,10 @@ class KernelV3Settings(BaseModel):
     skill_evolution_enabled: bool = True
     max_skill_versions_per_canonical: int = 10
     skill_semantic_dedup_threshold: float = 0.65
+    # V4.0 M3: external Playbook self-evolution & open public-web curiosity perception (SSRF guarded)
+    playbooks_enabled: bool = True
+    open_public_perception_enabled: bool = False
+    max_internal_curiosity_ratio: float = 0.45
 
 
 class _YamlSource(PydanticBaseSettingsSource):

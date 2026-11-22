@@ -102,6 +102,8 @@ class AutonomousLoop:
         affect: Any = None,
         mcp_manager: Any = None,
         world_pipeline: Any = None,
+        playbook_manager: Any = None,
+        exploration_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -123,6 +125,8 @@ class AutonomousLoop:
         self.affect = affect
         self.mcp_manager = mcp_manager
         self.world_pipeline = world_pipeline
+        self.playbook_manager = playbook_manager
+        self.exploration_manager = exploration_manager
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -163,6 +167,8 @@ class AutonomousLoop:
             self_model=self_model,
             skill_registry=skill_registry,
             skill_auto_crystallize=kv3.skill_auto_crystallize_enabled,
+            playbook_manager=playbook_manager,
+            exploration_manager=exploration_manager,
         )
 
     def _record_prediction_error(self, error: float) -> None:
@@ -522,6 +528,28 @@ class AutonomousLoop:
             except Exception as exc:
                 logger.warning("cycle.hypotheses_load_degraded", cycle_id=str(cycle_id), error=str(exc))
 
+            kv3 = self.settings.kernel_v3
+            lookback_h = max(24.0, float(kv3.goal_dedup_window_hours))
+            recent_goals = await self.repo.list_recent_goals(
+                since=now - timedelta(hours=lookback_h), limit=80
+            )
+            exploration_guidance: dict[str, Any] | None = None
+            if self.exploration_manager is not None:
+                try:
+                    exploration_guidance = await self.exploration_manager.build_guidance(recent_goals)
+                except Exception as exc:
+                    logger.warning("cycle.exploration_guidance_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+            external_playbooks: list[dict[str, Any]] = []
+            if self.playbook_manager is not None:
+                try:
+                    external_playbooks = await self.playbook_manager.list_playbooks_for_context(
+                        domains=[decision.selected_drive, "coding", "general"],
+                        limit=3,
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.playbooks_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -537,6 +565,8 @@ class AutonomousLoop:
                 validated_skills=reusable_skills,
                 affect_state=affect_state_snapshot,
                 active_hypotheses=active_hypotheses,
+                external_playbooks=external_playbooks,
+                exploration_guidance=exploration_guidance,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -555,7 +585,7 @@ class AutonomousLoop:
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
-            # V3.0 M1 + V3.1: Multi-Candidate Deterministic Goal Scoring, Deduplication & Cooldown Gate
+            # V3.0 M1 + V3.1 + V4.0 M3: Multi-Candidate Deterministic Goal Scoring, Dedup & External Exploration Bias
             goal_fp = compute_goal_fingerprint(
                 drive_type=decision.selected_drive,
                 title=goal_proposal.title,
@@ -563,11 +593,10 @@ class AutonomousLoop:
                 description=goal_proposal.description,
             )
             goal_candidates_audit: list[dict[str, Any]] = []
-            kv3 = self.settings.kernel_v3
             if kv3.goal_dedup_enabled and not bool(decision.constraints.get("emergency_mode")):
-                lookback_h = max(24.0, float(kv3.goal_dedup_window_hours))
-                recent_goals = await self.repo.list_recent_goals(
-                    since=now - timedelta(hours=lookback_h), limit=80
+                prefer_external = bool(
+                    decision.selected_drive == DriveType.CURIOSITY.value
+                    and (exploration_guidance or {}).get("must_explore_external")
                 )
                 sel_res = select_best_goal_candidate(
                     primary=goal_proposal,
@@ -576,6 +605,7 @@ class AutonomousLoop:
                     dedup_engine=self.goal_dedup,
                     now=now,
                     affect_state=affect_state_snapshot,
+                    prefer_external=prefer_external,
                 )
                 goal_candidates_audit = [c.model_dump(mode="json") for c in sel_res.candidates]
                 dedup_res = sel_res.selected_dedup
@@ -717,6 +747,30 @@ class AutonomousLoop:
                             payload={"source_id": req_sid, "sensor_type": req_type, "url": req_url, "error": str(exc)},
                             cycle_id=cycle_id,
                         )
+
+            # V4.0 M3: Track active external playbooks & Curiosity exploration topic lifecycle
+            if external_playbooks:
+                expected_outcome_payload["playbook_domains"] = [
+                    str(pb["domain"]) for pb in external_playbooks if pb.get("domain")
+                ]
+            if self.exploration_manager is not None and isinstance(goal_proposal.exploration_topic, dict):
+                et = goal_proposal.exploration_topic
+                et_key = str(et.get("topic_key") or goal_proposal.related_key or goal_proposal.title[:60]).strip()
+                et_q = str(et.get("question") or goal_proposal.title).strip()
+                et_dom = et.get("domain")
+                if et_key:
+                    try:
+                        tracked = await self.exploration_manager.upsert_topic(
+                            topic_key=et_key,
+                            question=et_q,
+                            domain=str(et_dom) if et_dom else None,
+                            status="exploring",
+                            source=f"cycle:{cycle_id}",
+                        )
+                        expected_outcome_payload["exploration_topic_key"] = tracked["key"]
+                        expected_outcome_payload["exploration_domain"] = tracked["domain"]
+                    except Exception as exc:
+                        logger.warning("cycle.exploration_topic_upsert_degraded", error=str(exc))
 
             goal_id = await self.repo.create_goal(
                 self.organism_id,

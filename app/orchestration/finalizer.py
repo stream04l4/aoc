@@ -86,6 +86,8 @@ class TaskFinalizer:
         skill_registry: Any = None,
         skill_auto_crystallize: bool = True,
         on_prediction_error: Callable[[float], None] | None = None,
+        playbook_manager: Any = None,
+        exploration_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -103,6 +105,8 @@ class TaskFinalizer:
         self.self_model = self_model
         self.skill_registry = skill_registry
         self.skill_auto_crystallize = bool(skill_auto_crystallize)
+        self.playbook_manager = playbook_manager
+        self.exploration_manager = exploration_manager
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -285,13 +289,18 @@ class TaskFinalizer:
                 )
 
             # Hard invariant (Task Book 17.7): LLM cannot declare success or confirm hypotheses if verification failed
-            if not verification_passed and (eval_res.goal_achieved or eval_res.hypothesis_verdict == "confirmed"):
+            if not verification_passed and (
+                eval_res.goal_achieved
+                or eval_res.hypothesis_verdict == "confirmed"
+                or eval_res.playbook_update is not None
+            ):
                 eval_res = eval_res.model_copy(
                     update={
                         "goal_achieved": False,
                         "resolved_topic": None,
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
+                        "playbook_update": None,
                     }
                 )
 
@@ -616,6 +625,71 @@ class TaskFinalizer:
                 except Exception as exc:
                     logger.warning("finalizer.skill_crystallize_degraded", execution_id=exec_key, error=str(exc))
 
+            # V4.0 M3: External Playbook outcome tracking, auto-rollback & autonomous evolution (fault-isolated)
+            playbook_evolution: dict[str, Any] = {}
+            if self.playbook_manager is not None:
+                try:
+                    exp_out = goal_dict.get("expected_outcome") or {}
+                    cand_domains = list(exp_out.get("playbook_domains") or [])
+                    for extra_d in (selected_drive, effective_cap_key):
+                        if extra_d and extra_d not in cand_domains:
+                            cand_domains.append(str(extra_d))
+                    tracked_outcomes: list[dict[str, Any]] = []
+                    for dom in cand_domains:
+                        tr = await self.playbook_manager.record_outcome_and_check_rollback(
+                            domain=dom,
+                            succeeded=bool(eval_res.goal_achieved and verification_passed),
+                            verified_ig=measured_info_gain,
+                        )
+                        if tr.get("tracked"):
+                            tracked_outcomes.append(tr)
+                    if tracked_outcomes:
+                        playbook_evolution["outcomes"] = tracked_outcomes
+
+                    if eval_res.goal_achieved and verification_passed and isinstance(eval_res.playbook_update, dict):
+                        pb_dom = str(eval_res.playbook_update.get("domain") or selected_drive or "general").strip()
+                        pb_content = str(eval_res.playbook_update.get("content") or "").strip()
+                        pb_summary = str(eval_res.playbook_update.get("change_summary") or eval_res.summary or "")[:300]
+                        if pb_content:
+                            rev = await self.playbook_manager.save_revision(
+                                domain=pb_dom,
+                                content=pb_content,
+                                change_summary=pb_summary,
+                                source=f"execution:{exec_key}",
+                            )
+                            playbook_evolution["revision"] = rev
+                except Exception as exc:
+                    logger.warning("finalizer.playbook_evolution_degraded", execution_id=exec_key, error=str(exc))
+
+            # V4.0 M3: Mark Curiosity exploration topic as verified on verified achievement
+            if self.exploration_manager is not None and eval_res.goal_achieved and verification_passed:
+                try:
+                    exp_out = goal_dict.get("expected_outcome") or {}
+                    exp_key = exp_out.get("exploration_topic_key") or (
+                        eval_res.resolved_topic if selected_drive == DriveType.CURIOSITY.value else None
+                    )
+                    if exp_key:
+                        fact_txt = (
+                            str(eval_res.learned_facts[0])
+                            if eval_res.learned_facts
+                            else str(eval_res.summary or "")[:300]
+                        )
+                        await self.exploration_manager.upsert_topic(
+                            topic_key=str(exp_key),
+                            question=str(goal_dict.get("title") or exp_key),
+                            domain=exp_out.get("exploration_domain"),
+                            status="verified",
+                            source=f"execution:{exec_key}",
+                            verified_fact=fact_txt,
+                            information_gain=measured_info_gain,
+                        )
+                except Exception as exc:
+                    logger.warning("finalizer.exploration_topic_degraded", execution_id=exec_key, error=str(exc))
+
+            if playbook_evolution:
+                updated_outcome["playbook_evolution"] = playbook_evolution
+                await self.repo.update_task(task_uuid, outcome=updated_outcome)
+
             # Notify in-memory learning tracker (used by CuriosityDriveEvaluator)
             info_gain = 0.0
             if eval_res.goal_achieved and (measured_info_gain > 0 or eval_res.information_gain > 0 or eval_res.learned_facts):
@@ -696,6 +770,7 @@ class TaskFinalizer:
                 **expected_vs_actual,
                 "memory_writes": memory_writes,
                 "skill_crystallized": skill_crystallized,
+                "playbook_evolution": playbook_evolution or None,
                 "prediction_calibration": prediction_calibration,
                 "finalized_at": now.isoformat(),
             }
