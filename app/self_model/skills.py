@@ -123,6 +123,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         self.self_model = self_model
         self.storage_dir = Path(self.cfg.skill_storage_dir).resolve()
         self._on_skills_changed: Callable[[], Awaitable[Any]] | None = None
+        self.evolution_engine: Any = None
 
     def set_on_skills_changed(self, hook: Callable[[], Awaitable[Any]] | None) -> None:
         self._on_skills_changed = hook
@@ -604,12 +605,55 @@ class SkillRegistryManager(SkillRegistryInterface):
                 "violations": test_violations,
             }
 
-        slug = re.sub(r"[^a-z0-9_]+", "_", skill_key.strip().lower()).strip("_")[:64] or "skill_artifact"
+        from app.skills.evolution import canonicalize_skill_name
+
+        cap_norm = capability_key[:120] or "coding"
+        canonical_name = canonicalize_skill_name(skill_key, cap_norm, description)
+        raw_slug = re.sub(r"[^a-z0-9_]+", "_", skill_key.strip().lower()).strip("_")
+        # V4.0 M2: Never allow truncated goal sentences as skill_key; keep short clean keys intact
+        is_truncated_sentence = len(raw_slug) > 40 or raw_slug.startswith(("create_", "build_"))
+        slug = canonical_name.replace(".", "_")[:64] if (not raw_slug or is_truncated_sentence) else raw_slug[:64]
+
+        # V4.0 M2: If an active VALIDATED duplicate exists, evolve vNext instead of creating a duplicate row!
+        if self.evolution_engine is not None:
+            dup = await self.evolution_engine.find_duplicate_skill(
+                canonical_name=canonical_name,
+                capability_key=cap_norm,
+                description=description,
+            )
+            if dup is not None:
+                evo = await self.evolution_engine.evolve_skill(
+                    dup.matched_skill_id,
+                    new_artifact_code=art_code,
+                    new_test_code=test_code,
+                    change_type="minor",
+                    change_summary=f"Auto-evolved from workspace task ({description[:120]})",
+                    description=description[:500],
+                    new_permission_level=permission_level,
+                    source_task_id=source_task_id,
+                    source_execution_id=source_execution_id,
+                )
+                return {
+                    "crystallized": evo.promoted,
+                    "evolved": True,
+                    "promoted": evo.promoted,
+                    "rolled_back": evo.rolled_back,
+                    "skill_id": evo.new_skill_id or evo.base_skill_id,
+                    "skill_key": dup.matched_skill_key,
+                    "canonical_name": evo.canonical_name,
+                    "version": evo.new_version or evo.base_version,
+                    "status": SkillStatus.VALIDATED.value if evo.promoted else SkillStatus.DEPRECATED.value,
+                    "passed": evo.regression_passed and evo.new_tests_passed,
+                    "awaiting_human_approval": evo.awaiting_human_approval,
+                    "reason": evo.reason,
+                }
+
         try:
             reg_row = await self.register_skill(
                 skill_key=slug,
+                canonical_name=canonical_name,
                 version="1.0.0",
-                capability_key=capability_key[:120] or "coding",
+                capability_key=cap_norm,
                 description=description[:500],
                 artifact_code=art_code,
                 artifact_filename=art_file.name,
@@ -621,8 +665,10 @@ class SkillRegistryManager(SkillRegistryInterface):
             val_res = await self.validate_skill(reg_row["id"])
             return {
                 "crystallized": True,
+                "evolved": False,
                 "skill_id": reg_row["id"],
                 "skill_key": slug,
+                "canonical_name": canonical_name,
                 "status": val_res["status"],
                 "passed": val_res["passed"],
                 "awaiting_human_approval": val_res.get("awaiting_human_approval", False),

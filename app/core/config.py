@@ -208,6 +208,10 @@ class KernelV3Settings(BaseModel):
     skill_first_planning_enabled: bool = True
     skill_mcp_bridge_enabled: bool = True
     skill_exec_timeout_seconds: float = 15.0
+    # V4.0 M2: bounded RSI skill evolution limits (kernel-enforced, immutable by skills)
+    skill_evolution_enabled: bool = True
+    max_skill_versions_per_canonical: int = 10
+    skill_semantic_dedup_threshold: float = 0.65
 
 
 class _YamlSource(PydanticBaseSettingsSource):

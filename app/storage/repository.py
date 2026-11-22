@@ -2740,6 +2740,59 @@ class StateRepository:
             )
             return (res.rowcount or 0) == 1
 
+    async def update_skill_metadata(
+        self,
+        skill_id: uuid.UUID,
+        *,
+        status: str | None = None,
+        canonical_name: str | None = None,
+        parent_version: str | None = None,
+        superseded_by: uuid.UUID | None = None,
+        clear_superseded_by: bool = False,
+        evolution_meta: dict[str, Any] | None = None,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any] | None:
+        async with self._use_session(session) as s:
+            row = (
+                await s.execute(select(SkillRegistryRow).where(SkillRegistryRow.id == skill_id))
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if canonical_name is not None:
+                row.canonical_name = canonical_name
+            if parent_version is not None:
+                row.parent_version = parent_version
+            if clear_superseded_by:
+                row.superseded_by = None
+            elif superseded_by is not None:
+                row.superseded_by = superseded_by
+            if evolution_meta is not None:
+                merged = dict(row.evolution_meta or {})
+                merged.update(evolution_meta)
+                row.evolution_meta = _jsonable(merged)
+            row.updated_at = utcnow()
+            await s.flush()
+            return self._skill_dict(row)
+
+    async def list_skill_versions(
+        self, name_or_key: str, *, limit: int = 30
+    ) -> list[dict[str, Any]]:
+        key = str(name_or_key or "").strip()
+        if not key:
+            return []
+        async with self.db.session() as s:
+            rows = (
+                await s.execute(
+                    select(SkillRegistryRow)
+                    .where(or_(SkillRegistryRow.canonical_name == key, SkillRegistryRow.skill_key == key))
+                    .order_by(SkillRegistryRow.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            return [self._skill_dict(r) for r in rows]
+
     async def record_skill_validation(
         self,
         *,

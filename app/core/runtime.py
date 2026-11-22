@@ -57,6 +57,7 @@ from app.perception.world.rss_sensor import RSSWorldSensor
 from app.perception.world.web_sensor import WebChangeWorldSensor
 from app.self_model.manager import SelfModelManager
 from app.self_model.skills import SkillRegistryManager
+from app.skills.evolution import SkillEvolutionEngine
 from app.skills.runtime import SkillRuntime
 from app.storage.database import Database
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
@@ -302,6 +303,7 @@ class OrganismRuntime:
         self.self_model: SelfModelManager | None = None
         self.skill_registry: SkillRegistryManager | None = None
         self.skill_runtime: SkillRuntime | None = None
+        self.skill_evolution: SkillEvolutionEngine | None = None
         self.affect: AffectModulator | None = None
 
         self.loop: AutonomousLoop | None = None
@@ -338,7 +340,15 @@ class OrganismRuntime:
             skill_registry=self.skill_registry,
         )
         self.skill_registry.self_model = self.self_model
-        # V4.0 M1: External isolated SkillRuntime + automatic MCP tool bridge
+        # V4.0 M1/M2: External isolated SkillRuntime, Bounded RSI Evolution Engine & MCP bridge
+        if self.settings.kernel_v3.skill_evolution_enabled:
+            self.skill_evolution = SkillEvolutionEngine(
+                repo=self.repo,
+                skill_registry=self.skill_registry,
+                max_versions_per_canonical=self.settings.kernel_v3.max_skill_versions_per_canonical,
+                dedup_threshold=self.settings.kernel_v3.skill_semantic_dedup_threshold,
+            )
+            self.skill_registry.evolution_engine = self.skill_evolution
         if self.settings.kernel_v3.skill_runtime_enabled:
             self.skill_runtime = SkillRuntime(
                 repo=self.repo,
