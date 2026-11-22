@@ -9,6 +9,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.cognition.context_compactor import (
+    compact_drives,
+    compact_hypotheses,
+    compact_memories,
+    compact_observation_dict,
+    compact_playbooks,
+    rank_and_compact_skills,
+)
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import (
     ActionPlan,
@@ -96,10 +104,11 @@ class CognitionBrain(BrainInterface):
             "Do NOT claim unavailable metrics are healthy. Do NOT propose direct system modifications. "
             + _UNTRUSTED_DATA_RULE
         )
+        fenced_obs = _fence_untrusted_observation(observation.model_dump(mode="json"))
         payload = {
-            "observation": _fence_untrusted_observation(observation.model_dump(mode="json")),
-            "drives": [d.model_dump(mode="json") for d in drives],
-            "recent_memories": memories[:10],
+            "observation": compact_observation_dict(fenced_obs, max_events=5, max_topics=8),
+            "drives": compact_drives([d.model_dump(mode="json") for d in drives]),
+            "recent_memories": compact_memories(memories, max_items=6, max_summary_chars=220),
         }
         return await self._gateway.complete_structured(
             operation="assess",
@@ -132,24 +141,41 @@ class CognitionBrain(BrainInterface):
             "Set related_key to the relevant topic/capability/hypothesis key if applicable. "
             + _UNTRUSTED_DATA_RULE
         )
-        fenced_obs = _fence_untrusted_observation(context.observation.model_dump(mode="json"))
+        fenced_obs = compact_observation_dict(
+            _fence_untrusted_observation(context.observation.model_dump(mode="json")),
+            max_events=5,
+            max_topics=8,
+        )
+        query_hint = " ".join(
+            [
+                str(context.decision.selected_drive or ""),
+                str(context.decision.reason or ""),
+                str(context.assessment.summary if context.assessment else ""),
+                str(context.assessment.recommended_focus if context.assessment else ""),
+            ]
+        )
         payload = {
             "selected_drive": context.decision.selected_drive,
             "decision_reason": context.decision.reason,
             "constraints": context.decision.constraints,
             "affect_state_readonly": context.affect_state,
-            "active_hypotheses": context.active_hypotheses[:8],
-            "external_playbooks": context.external_playbooks[:3],
+            "active_hypotheses": compact_hypotheses(context.active_hypotheses, max_items=5),
+            "external_playbooks": compact_playbooks(
+                context.external_playbooks,
+                domain_hints=[context.decision.selected_drive, "general"],
+                max_items=2,
+                max_chars=480,
+            ),
             "exploration_guidance": context.exploration_guidance,
-            "drives": [d.model_dump(mode="json") for d in context.drives],
+            "drives": compact_drives([d.model_dump(mode="json") for d in context.drives]),
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "environment_state": fenced_obs.get("environment_state", {}),
             "external_events": fenced_obs.get("external_events", []),
-            "system_state": context.observation.system_state,
+            "system_state": fenced_obs.get("system_state", {}),
             "available_agents": context.available_agents,
-            "validated_skills": context.validated_skills[:8],
+            "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=query_hint, top_k=5),
             "budget_remaining": context.budget_remaining,
-            "active_goals": context.active_goals[:5],
+            "active_goals": context.active_goals[:4],
         }
         proposal = await self._gateway.complete_structured(
             operation="generate_goal",
@@ -184,19 +210,32 @@ class CognitionBrain(BrainInterface):
             "- Keep timeout_seconds realistic (60-300s) and within budget.\n"
             "- Never delegate open-ended infinite exploration."
         )
+        plan_query = " ".join(
+            [
+                str(context.decision.selected_drive or ""),
+                str(context.goal.title if context.goal else ""),
+                str(context.goal.description if context.goal else ""),
+                str(context.goal.related_key if context.goal else ""),
+            ]
+        )
         payload = {
             "selected_drive": context.decision.selected_drive,
             "constraints": context.decision.constraints,
             "affect_state_readonly": context.affect_state,
-            "active_hypotheses": context.active_hypotheses[:5],
-            "external_playbooks": context.external_playbooks[:3],
+            "active_hypotheses": compact_hypotheses(context.active_hypotheses, max_items=4),
+            "external_playbooks": compact_playbooks(
+                context.external_playbooks,
+                domain_hints=[context.decision.selected_drive, "coding", "general"],
+                max_items=2,
+                max_chars=480,
+            ),
             "goal": context.goal.model_dump(mode="json") if context.goal else None,
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
-            "available_tools": context.available_tools,
-            "validated_skills": context.validated_skills[:8],
+            "available_tools": context.available_tools[:12],
+            "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=plan_query, top_k=5),
             "budget_remaining": context.budget_remaining,
-            "memories": context.memories[:8],
+            "memories": compact_memories(context.memories, max_items=5, max_summary_chars=220),
         }
         return await self._gateway.complete_structured(
             operation="plan",

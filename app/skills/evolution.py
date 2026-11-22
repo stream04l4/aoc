@@ -374,8 +374,8 @@ class SkillEvolutionEngine:
                 permission_level=target_perm,
                 input_schema=new_input_schema if new_input_schema is not None else (base.get("input_schema") or {}),
                 output_schema=new_output_schema if new_output_schema is not None else (base.get("output_schema") or {}),
-                source_task_id=source_task_id,
-                source_execution_id=source_execution_id,
+                source_task_id=source_task_id or base.get("source_task_id"),
+                source_execution_id=source_execution_id or base.get("source_execution_id"),
                 evolution_meta={
                     "parent_skill_id": str(base_uuid),
                     "parent_version": base["version"],

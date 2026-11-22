@@ -165,6 +165,14 @@ export function OrganismAnatomy({
     capabilities_acquired: 0,
     skills_total: 0,
     skills_validated: 0,
+    skill_invocations_window: 0,
+    skill_cross_task_reuses_window: 0,
+    skill_reuse_success_rate: null,
+    estimated_saved_tokens_window: 0,
+    playbooks_active_count: 0,
+    exploration_topics_total: 0,
+    exploration_topics_verified: 0,
+    open_public_perception_enabled: false,
     verified_ig_per_1m_tokens: 0,
     preflight_rejected_window: 0,
     goal_dedup_skipped_window: 0,
@@ -201,7 +209,7 @@ export function OrganismAnatomy({
                 数字生命体全息总览 · 类人内核与四大外接器官
               </h3>
               <span className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-[10px] font-mono font-medium text-cyan-700 dark:text-cyan-300">
-                V3.2 BIO-ARCHITECTURE
+                V4.0 RSI BIO-ARCHITECTURE
               </span>
             </div>
             <p className="text-[11px] text-slate-500 dark:text-slate-400">
@@ -798,9 +806,12 @@ export function OrganismAnatomy({
           className="flex items-center justify-between rounded-xl border border-slate-200/80 bg-white/80 px-3.5 py-2.5 text-left hover:border-cyan-400/60 transition-colors cursor-pointer dark:border-slate-800 dark:bg-slate-900/70"
         >
           <div>
-            <div className="text-[10px] text-slate-500">RSI 技能结晶（Skill Registry）</div>
+            <div className="text-[10px] text-slate-500">RSI 技能进化与复用（Skill Runtime）</div>
             <div className="mt-0.5 text-sm font-semibold font-mono text-cyan-600 dark:text-cyan-400">
-              {evoInfo.skills_validated} 可复用 / {evoInfo.skills_total} 总计
+              {evoInfo.skills_validated} 有效 / {evoInfo.skills_total} 总 · 复用 {evoInfo.skill_cross_task_reuses_window || 0} 次
+            </div>
+            <div className="mt-0.5 text-[10px] font-mono text-slate-400">
+              省 {formatNumber(evoInfo.estimated_saved_tokens_window || 0)} Tok · Playbook {evoInfo.playbooks_active_count || 0}
             </div>
           </div>
           <Cpu className="h-4 w-4 text-cyan-500 shrink-0" />
@@ -808,13 +819,16 @@ export function OrganismAnatomy({
 
         <button
           type="button"
-          onClick={() => nav('governance')}
+          onClick={() => nav('world')}
           className="flex items-center justify-between rounded-xl border border-slate-200/80 bg-white/80 px-3.5 py-2.5 text-left hover:border-emerald-400/60 transition-colors cursor-pointer dark:border-slate-800 dark:bg-slate-900/70"
         >
           <div>
-            <div className="text-[10px] text-slate-500">单位认知效率（IG / 1M Tok）</div>
+            <div className="text-[10px] text-slate-500">认知效率与外部探索（IG / 1M Tok）</div>
             <div className="mt-0.5 text-sm font-semibold font-mono text-emerald-600 dark:text-emerald-400">
               {Number(evoInfo.verified_ig_per_1m_tokens || 0).toFixed(2)}
+            </div>
+            <div className="mt-0.5 text-[10px] font-mono text-slate-400">
+              外部探索 {evoInfo.exploration_topics_verified || 0}/{evoInfo.exploration_topics_total || 0} 已验证
             </div>
           </div>
           <ArrowUpRight className="h-4 w-4 text-emerald-500 shrink-0" />
