@@ -121,6 +121,13 @@ describe('AOC Control Center UI', () => {
     await waitFor(() => {
       expect(screen.getByText('AOC-001')).toBeInTheDocument();
       expect(screen.getByText('224.5 MB')).toBeInTheDocument();
+      // V3.2 Humanoid Organism & Four Pluggable Organs centerpiece
+      expect(screen.getByRole('img', { name: /AOC 拟人数字生命体/ })).toBeInTheDocument();
+      expect(screen.getByText('外接大脑 · Brain (LLM)')).toBeInTheDocument();
+      expect(screen.getByText(/外接感知 · Perception/)).toBeInTheDocument();
+      expect(screen.getByText(/外接记忆 · Memory/)).toBeInTheDocument();
+      expect(screen.getByText(/外接行动 · Action/)).toBeInTheDocument();
+      expect(screen.getByText(/类人生命内核 · AOC-001/)).toBeInTheDocument();
     });
 
     // Navigate to Configuration Center and verify redaction & risk note render

@@ -32,17 +32,33 @@ export type NavPage =
   | 'config'
   | 'logs';
 
-export const NAV_ITEMS: { id: NavPage; label: string; en: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { id: 'overview', label: '生命体总览', en: 'Overview', icon: Activity },
-  { id: 'mind', label: '认知与决策', en: 'Mind', icon: Brain },
-  { id: 'drives', label: '欲望系统', en: 'Drives', icon: Flame },
-  { id: 'tasks', label: '任务与执行', en: 'Tasks & Agents', icon: ListChecks },
-  { id: 'memory', label: '记忆中心', en: 'Memory', icon: Database },
-  { id: 'world', label: '环境感知', en: 'World', icon: Globe },
-  { id: 'self-model', label: '自我认知', en: 'Self Model', icon: Fingerprint },
-  { id: 'governance', label: '安全与审批', en: 'Governance', icon: Shield },
-  { id: 'config', label: '配置中心', en: 'Configuration', icon: SlidersHorizontal },
-  { id: 'logs', label: '运行日志', en: 'Logs & Events', icon: ScrollText },
+export type NavGroup = 'hub' | 'kernel' | 'organs' | 'ops';
+
+export const NAV_GROUPS: { id: NavGroup; title: string; subtitle: string }[] = [
+  { id: 'hub', title: '生命体总控', subtitle: 'ORGANISM' },
+  { id: 'kernel', title: '类人内核', subtitle: 'KERNEL' },
+  { id: 'organs', title: '四大外接器官', subtitle: 'ORGANS' },
+  { id: 'ops', title: '系统运维', subtitle: 'OPS' },
+];
+
+export const NAV_ITEMS: {
+  id: NavPage;
+  group: NavGroup;
+  label: string;
+  en: string;
+  badge?: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  { id: 'overview', group: 'hub', label: '生命体总览', en: 'Overview', icon: Activity },
+  { id: 'drives', group: 'kernel', label: '欲望系统', en: 'Drives · Affect', icon: Flame },
+  { id: 'self-model', group: 'kernel', label: '自我认知', en: 'Self · RSI', icon: Fingerprint },
+  { id: 'governance', group: 'kernel', label: '安全与审批', en: 'Governance', icon: Shield },
+  { id: 'mind', group: 'organs', label: '认知与决策', en: 'Brain · LLM', icon: Brain },
+  { id: 'world', group: 'organs', label: '环境感知', en: 'Perception · MCP', icon: Globe },
+  { id: 'memory', group: 'organs', label: '记忆中心', en: 'Memory · Letta', icon: Database },
+  { id: 'tasks', group: 'organs', label: '任务与执行', en: 'Action · Agents', icon: ListChecks },
+  { id: 'config', group: 'ops', label: '配置中心', en: 'Config', icon: SlidersHorizontal },
+  { id: 'logs', group: 'ops', label: '运行日志', en: 'Logs', icon: ScrollText },
 ];
 
 export function Layout({
@@ -93,7 +109,7 @@ export function Layout({
               Control Center
             </div>
             <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-              {organismName || 'AOC-001'} · V2.1
+              {organismName || 'AOC-001'} · V3.2 类人内核
             </div>
           </div>
         </div>
@@ -105,30 +121,45 @@ export function Layout({
         </button>
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-2.5 py-3 space-y-0.5">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = item.id === activePage;
+      <nav className="flex-1 overflow-y-auto px-2.5 py-3 space-y-3.5">
+        {NAV_GROUPS.map((grp) => {
+          const items = NAV_ITEMS.filter((i) => i.group === grp.id);
           return (
-            <button
-              key={item.id}
-              onClick={() => {
-                onNavigate(item.id);
-                setMobileOpen(false);
-              }}
-              className={cn(
-                'flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors cursor-pointer',
-                active
-                  ? 'bg-cyan-500/12 text-cyan-700 dark:text-cyan-300 border border-cyan-500/25'
-                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800/70 dark:hover:text-slate-100 border border-transparent'
-              )}
-            >
-              <Icon className="h-4 w-4 shrink-0" />
-              <span className="truncate">{item.label}</span>
-              <span className="ml-auto text-[10px] text-slate-400 dark:text-slate-500 font-mono">
-                {item.en}
-              </span>
-            </button>
+            <div key={grp.id} className="space-y-0.5">
+              <div className="flex items-center justify-between px-3 pb-1">
+                <span className="text-[10px] font-semibold tracking-wider text-slate-400 dark:text-slate-500">
+                  {grp.title}
+                </span>
+                <span className="text-[9px] font-mono text-slate-300 dark:text-slate-600">
+                  {grp.subtitle}
+                </span>
+              </div>
+              {items.map((item) => {
+                const Icon = item.icon;
+                const active = item.id === activePage;
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => {
+                      onNavigate(item.id);
+                      setMobileOpen(false);
+                    }}
+                    className={cn(
+                      'flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors cursor-pointer',
+                      active
+                        ? 'bg-cyan-500/12 text-cyan-700 dark:text-cyan-300 border border-cyan-500/25'
+                        : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800/70 dark:hover:text-slate-100 border border-transparent'
+                    )}
+                  >
+                    <Icon className="h-4 w-4 shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                    <span className="ml-auto text-[10px] text-slate-400 dark:text-slate-500 font-mono truncate">
+                      {item.en}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           );
         })}
       </nav>

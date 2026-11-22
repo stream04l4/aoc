@@ -317,11 +317,61 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 except Exception:
                     pg_vector_enabled = False
 
+            # V3.2 Organism Organs & RSI Evolution real-time telemetry (0 fabricated metrics)
+            world_sources = (await s.execute(select(WorldEventSource).order_by(WorldEventSource.source_id))).scalars().all()
+            world_events_total = int((await s.execute(select(func.count(WorldEventRow.id)))).scalar_one() or 0)
+            hyp_rows = (
+                await s.execute(select(WorldState).where(WorldState.kind == "hypothesis"))
+            ).scalars().all()
+            cap_rows = (
+                await s.execute(select(CapabilityProfile).where(CapabilityProfile.organism_id == org_id))
+                if org_id
+                else None
+            )
+            cap_list = cap_rows.scalars().all() if cap_rows is not None else []
+            skill_rows = (await s.execute(select(SkillRegistry))).scalars().all()
+
+            pf_q = select(func.count(ActionPlanRow.id)).where(ActionPlanRow.preflight_status == "REJECT")
+            dedup_q = select(func.count(CycleRecord.id)).where(CycleRecord.outcome == "GOAL_DEDUP_SKIPPED")
+            ig_q = select(func.coalesce(func.sum(MemoryIndex.information_gain), 0.0)).where(
+                MemoryIndex.information_gain.is_not(None)
+            )
+            if since is not None:
+                pf_q = pf_q.where(ActionPlanRow.created_at >= since)
+                dedup_q = dedup_q.where(CycleRecord.started_at >= since)
+                ig_q = ig_q.where(MemoryIndex.created_at >= since)
+            preflight_rejected_win = int((await s.execute(pf_q)).scalar_one() or 0)
+            dedup_skipped_win = int((await s.execute(dedup_q)).scalar_one() or 0)
+            sum_ig_win = float((await s.execute(ig_q)).scalar_one() or 0.0)
+
         sys_obs = (latest_obs.system_state if latest_obs else {}) or {}
         llm_obs = sys_obs.get("llm") if isinstance(sys_obs, dict) else None
         resources_obs = (latest_obs.available_resources if latest_obs else {}) or (
             sys_obs.get("resources") if isinstance(sys_obs, dict) else {}
         ) or {}
+
+        affect_enabled_now = bool(rt.affect and rt.affect.enabled)
+        affect_state_now = rt.affect.state.model_dump(mode="json") if affect_enabled_now else None
+        affect_mod_now = rt.affect.compute_modulation().model_dump(mode="json") if affect_enabled_now else {"enabled": False}
+        mcp_registered_ov = rt.mcp_manager.summary_for_brain() if rt.mcp_manager is not None else []
+        sensors_cfg_ov = get_sensors_config()
+        eff_poll_ov = (
+            bool(rt.settings.kernel_v3.world_poll_on_perceive)
+            if rt.settings.kernel_v3.world_poll_on_perceive is not None
+            else bool(sensors_cfg_ov.get("poll_on_perceive", False))
+        )
+        llm_tok_win = float((usage_by_cat.get("llm") or {}).get("total_amount") or 0.0)
+        ig_per_1m_win = round((sum_ig_win / (llm_tok_win / 1_000_000.0)), 4) if llm_tok_win > 0 else 0.0
+        agent_list_ov = [
+            {
+                "agent_id": a.agent_id,
+                "name": a.name,
+                "enabled": a.enabled,
+                "healthy": bool((a.probe or {}).get("ok", False)),
+                "version": (a.probe or {}).get("version"),
+            }
+            for a in agents
+        ]
 
         return {
             "timestamp": _iso(utcnow()),
@@ -459,16 +509,67 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     "dimensions": active_model.dimensions if active_model else rt.settings.embedding.dimensions,
                     "embedded_count": emb_total,
                 },
-                "agents": [
-                    {
-                        "agent_id": a.agent_id,
-                        "name": a.name,
-                        "enabled": a.enabled,
-                        "healthy": bool((a.probe or {}).get("ok", False)),
-                        "version": (a.probe or {}).get("version"),
-                    }
-                    for a in agents
-                ],
+                "agents": agent_list_ov,
+            },
+            "affect": {
+                "enabled": affect_enabled_now,
+                "current_state": affect_state_now,
+                "current_modulation": affect_mod_now,
+            },
+            "organs": {
+                "brain": {
+                    "model": rt.settings.llm.model,
+                    "available": llm_obs.get("available") if isinstance(llm_obs, dict) else None,
+                    "latency_ms": llm_obs.get("latency_ms") if isinstance(llm_obs, dict) else None,
+                    "circuit_open": bool(getattr(rt.llm_gateway, "circuit_open", False)),
+                    "calls_window": int((usage_by_cat.get("llm") or {}).get("calls") or 0),
+                    "tokens_window": int(round(llm_tok_win)),
+                    "avg_seconds": float((usage_by_cat.get("llm") or {}).get("avg_seconds") or 0.0),
+                },
+                "perception": {
+                    "poll_on_perceive": eff_poll_ov,
+                    "sources_total": len(world_sources),
+                    "sources_enabled": sum(1 for ws in world_sources if ws.enabled),
+                    "active_source_names": [ws.source_id for ws in world_sources if ws.enabled][:6],
+                    "events_total": world_events_total,
+                    "hypotheses_total": len(hyp_rows),
+                    "hypotheses_confirmed": sum(1 for h in hyp_rows if h.status == "confirmed"),
+                    "mcp_enabled": bool(rt.settings.kernel_v3.mcp_in_loop_enabled),
+                    "mcp_tools_count": len(mcp_registered_ov),
+                    "mcp_tools": [t.get("tool_name") for t in mcp_registered_ov][:6],
+                },
+                "memory": {
+                    "provider": rt.settings.memory.provider,
+                    "letta_available": bool(rt.memory.backend_available),
+                    "memories_synced": mem_synced,
+                    "memories_total": mem_total,
+                    "pgvector_enabled": pg_vector_enabled,
+                    "embedding_provider": rt.settings.embedding.provider,
+                    "embedding_dim": active_model.dimensions if active_model else rt.settings.embedding.dimensions,
+                    "embedded_count": emb_total,
+                    "outbox_pending": int(outbox_counts.get("pending", 0)) + int(outbox_counts.get("failed", 0)),
+                },
+                "action": {
+                    "runner_enabled": rt.settings.runner.enabled,
+                    "runner_online": bool(runners and runners[0].status == "online"),
+                    "runner_id": runners[0].runner_id if runners else "local-fallback",
+                    "agents": agent_list_ov,
+                    "agents_total": len(agent_list_ov),
+                    "agents_healthy": sum(1 for a in agent_list_ov if a["healthy"]),
+                    "tasks_window": sum(task_statuses.values()),
+                    "tasks_succeeded": int(task_statuses.get("SUCCEEDED", 0)),
+                    "tasks_failed": int(task_statuses.get("FAILED", 0)),
+                },
+                "evolution": {
+                    "capabilities_total": len(cap_list),
+                    "capabilities_validated": sum(1 for c in cap_list if c.maturity_status == "VALIDATED"),
+                    "capabilities_acquired": sum(1 for c in cap_list if c.maturity_status == "ACQUIRED"),
+                    "skills_total": len(skill_rows),
+                    "skills_validated": sum(1 for sk in skill_rows if sk.status == "VALIDATED"),
+                    "verified_ig_per_1m_tokens": ig_per_1m_win,
+                    "preflight_rejected_window": preflight_rejected_win,
+                    "goal_dedup_skipped_window": dedup_skipped_win,
+                },
             },
             "stats": {
                 "cycles_by_outcome": cycle_outcomes,

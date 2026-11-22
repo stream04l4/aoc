@@ -177,6 +177,7 @@ export function App() {
           principal={principal}
           onOpenCycle={handleOpenCycle}
           onOpenTask={handleOpenTask}
+          onNavigate={setActivePage}
         />
       )}
       {activePage === 'mind' && (

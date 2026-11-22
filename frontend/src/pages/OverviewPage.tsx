@@ -39,6 +39,8 @@ import {
   StatCard,
   StatusBadge,
 } from '../components/ui';
+import { NavPage } from '../components/Layout';
+import { OrganismAnatomy } from '../components/OrganismAnatomy';
 
 export function OverviewPage({
   data,
@@ -48,6 +50,7 @@ export function OverviewPage({
   principal,
   onOpenCycle,
   onOpenTask,
+  onNavigate,
 }: {
   data: any;
   loading: boolean;
@@ -56,6 +59,7 @@ export function OverviewPage({
   principal: PrincipalInfo;
   onOpenCycle: (cycleId: string) => void;
   onOpenTask: (taskId: string) => void;
+  onNavigate?: (page: NavPage) => void;
 }) {
   const [ctrlBusy, setCtrlBusy] = React.useState(false);
   const [ctrlMsg, setCtrlMsg] = React.useState<string | null>(null);
@@ -162,6 +166,9 @@ export function OverviewPage({
           <div className="mt-3 text-xs text-cyan-600 dark:text-cyan-400">{ctrlMsg}</div>
         )}
       </Card>
+
+      {/* V3.2 Humanoid Digital Organism & Four Pluggable Organs Centerpiece */}
+      <OrganismAnatomy data={data} onNavigate={onNavigate} />
 
       {/* Top KPI Grid */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">

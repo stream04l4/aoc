@@ -37,3 +37,50 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.45);
 }
+
+/* V3.2 Humanoid Organism bio-cybernetic animations */
+@keyframes aoc-breathe {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+}
+
+@keyframes aoc-flow {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes aoc-spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.aoc-breathe {
+  animation: aoc-breathe 3.6s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.aoc-flow-line {
+  stroke-dasharray: 5 7;
+  animation: aoc-flow 1.8s linear infinite;
+}
+
+.aoc-spin-slow {
+  animation: aoc-spin-slow 24s linear infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
