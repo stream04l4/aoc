@@ -164,6 +164,7 @@ class AutonomousLoop:
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
+        self._consecutive_dedup_skips: dict[str, int] = {}
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -629,14 +630,6 @@ class AutonomousLoop:
             )
 
             goal_proposal = await self._generate_goal_safe(cog_ctx, llm_available_for_brain, cycle_id)
-            if self.human_bridge is not None and pending_human_guidance:
-                try:
-                    await self.human_bridge.acknowledge_guidance(
-                        [str(g["key"]) for g in pending_human_guidance if g.get("key")],
-                        cycle_id=cycle_id,
-                    )
-                except Exception as exc:
-                    logger.warning("cycle.human_guidance_ack_degraded", cycle_id=str(cycle_id), error=str(exc))
             if self.human_bridge is not None and isinstance(goal_proposal.message_to_human, dict):
                 try:
                     m = goal_proposal.message_to_human
@@ -654,6 +647,14 @@ class AutonomousLoop:
                 except Exception as exc:
                     logger.warning("cycle.human_outreach_degraded", cycle_id=str(cycle_id), error=str(exc))
             if not goal_proposal.should_act or not goal_proposal.title.strip():
+                if self.human_bridge is not None and pending_human_guidance:
+                    try:
+                        await self.human_bridge.acknowledge_guidance(
+                            [str(g["key"]) for g in pending_human_guidance if g.get("key")],
+                            cycle_id=cycle_id,
+                        )
+                    except Exception as exc:
+                        logger.warning("cycle.human_guidance_ack_degraded", cycle_id=str(cycle_id), error=str(exc))
                 outcome = "IDLE"
                 await self.lifecycle.transition(LifecycleState.IDLE, reason="Brain decided no action needed", cycle_id=cycle_id)
                 await self._finalize_cycle(
@@ -687,6 +688,7 @@ class AutonomousLoop:
                     now=now,
                     affect_state=affect_state_snapshot,
                     prefer_external=prefer_external,
+                    has_human_guidance=bool(pending_human_guidance),
                 )
                 goal_candidates_audit = [c.model_dump(mode="json") for c in sel_res.candidates]
                 dedup_res = sel_res.selected_dedup
@@ -722,7 +724,7 @@ class AutonomousLoop:
                         status=GoalStatus.REJECTED.value if dedup_res.decision == "REJECT" else GoalStatus.ABANDONED.value,
                         goal_fingerprint=goal_fp,
                         duplicate_of=dup_uuid,
-                        cooldown_until=dedup_res.cooldown_until,
+                        cooldown_until=None if dedup_res.decision == "DEFER" else dedup_res.cooldown_until,
                         predicted_ig=round(float(goal_proposal.predicted_ig or 0.0), 4),
                     )
                     await self.repo.log_decision(
@@ -745,6 +747,21 @@ class AutonomousLoop:
                     )
                     outcome = "GOAL_DEDUP_SKIPPED"
                     self._low_ig_streak += 1
+                    cur_drive = decision.selected_drive
+                    self._consecutive_dedup_skips[cur_drive] = self._consecutive_dedup_skips.get(cur_drive, 0) + 1
+                    post_drives_dedup = dict(pre_drives)
+                    arb_cfg = (getattr(self.drives, "config", None) or {}).get("arbitration") or {}
+                    if (
+                        cur_drive != DriveType.SURVIVAL.value
+                        and bool(arb_cfg.get("post_goal_satiation_enabled", False))
+                        and self._consecutive_dedup_skips[cur_drive] >= 2
+                        and cur_drive in post_drives_dedup
+                    ):
+                        st = post_drives_dedup[cur_drive]
+                        post_drives_dedup[cur_drive] = st.model_copy(
+                            update={"last_satisfied_at": now, "persistence": round(st.persistence * 0.5, 6)}
+                        )
+                        self._consecutive_dedup_skips[cur_drive] = 0
                     await self.lifecycle.transition(
                         LifecycleState.IDLE,
                         reason=f"Goal deduplicated ({dedup_res.reason_code})",
@@ -754,13 +771,23 @@ class AutonomousLoop:
                         cycle_id,
                         outcome,
                         pre_drives,
-                        pre_drives,
+                        post_drives_dedup,
                         {"action": "dedup_skipped", "goal_dedup": dedup_res.model_dump(mode="json")},
                         t0,
                     )
                     return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
                 # Adopt the highest-scoring non-duplicate candidate (primary or alternative fallback!)
                 goal_proposal = sel_res.selected_proposal
+
+            self._consecutive_dedup_skips[decision.selected_drive] = 0
+            if self.human_bridge is not None and pending_human_guidance:
+                try:
+                    await self.human_bridge.acknowledge_guidance(
+                        [str(g["key"]) for g in pending_human_guidance if g.get("key")],
+                        cycle_id=cycle_id,
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.human_guidance_ack_degraded", cycle_id=str(cycle_id), error=str(exc))
 
             # V3.1: Record lightweight world hypothesis (distinct from verified facts) if proposed
             expected_outcome_payload = dict(goal_proposal.expected_outcome or {})
@@ -1529,7 +1556,10 @@ class AutonomousLoop:
             if not isinstance(raw_call, dict):
                 continue
             tool_name = str(raw_call.get("tool_name") or "").strip()
-            args = dict(raw_call.get("arguments") or {}) if isinstance(raw_call.get("arguments"), dict) else {}
+            raw_args = raw_call.get("arguments")
+            if not isinstance(raw_args, dict):
+                raw_args = raw_call.get("args")
+            args = dict(raw_args) if isinstance(raw_args, dict) else {}
             if not tool_name:
                 continue
 

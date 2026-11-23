@@ -612,3 +612,423 @@ async def test_v4_2_end_to_end_emergent_discovery_without_preset_rss_or_arxiv_to
     finally:
         await rt.stop()
         await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v4_2_1_inv_multihop_dedup_and_human_guidance_override():
+    """Verify inv: threads allow distinct hops while blocking paraphrases, and human_guidance overrides cooldown."""
+    import uuid
+    from datetime import timedelta
+
+    from app.cognition.goal_dedup import GoalDedupEngine, compute_goal_fingerprint, select_best_goal_candidate
+
+    now = utcnow()
+    eng = GoalDedupEngine(dedup_window_hours=6.0, lexical_threshold=0.72, low_ig_threshold=0.15)
+
+    hop1_title = "Check local repo fixtures for commit a0ce82764c"
+    hop1_desc = "Search isolated runtime snapshot for commit a0ce82764c evidence."
+    hop1_fp = compute_goal_fingerprint(
+        drive_type="curiosity",
+        title=hop1_title,
+        related_key="inv:aoc_v4_1_trusted_commit_evidence",
+        description=hop1_desc,
+    )
+    hop2_title = "Read-only public GitHub provenance check for stream04l4/aoc"
+    hop2_desc = "Fetch public commit metadata from https://github.com/stream04l4/aoc via web_fetch_readonly."
+    hop2_fp = compute_goal_fingerprint(
+        drive_type="curiosity",
+        title=hop2_title,
+        related_key="inv:aoc_v4_1_trusted_commit_evidence",
+        description=hop2_desc,
+    )
+    # Distinct hops on the same inv: thread MUST produce distinct fingerprints
+    assert hop1_fp != hop2_fp
+
+    recent = [
+        {
+            "goal_id": str(uuid.uuid4()),
+            "drive_type": "curiosity",
+            "title": hop1_title,
+            "description": hop1_desc,
+            "related_key": "inv:aoc_v4_1_trusted_commit_evidence",
+            "goal_fingerprint": hop1_fp,
+            "status": "ACHIEVED",
+            "verified_ig": 0.50,
+            "created_at": now - timedelta(minutes=10),
+            "cooldown_until": now + timedelta(minutes=45),
+        }
+    ]
+
+    # 1. Distinct next hop on the same inv: thread MUST be accepted even though hop1 is in cooldown
+    sel_hop2 = select_best_goal_candidate(
+        primary=GoalProposal(
+            title=hop2_title,
+            description=hop2_desc,
+            drive_type="curiosity",
+            related_key="inv:aoc_v4_1_trusted_commit_evidence",
+            predicted_ig=0.60,
+        ),
+        drive_type="curiosity",
+        recent_goals=recent,
+        dedup_engine=eng,
+        now=now,
+    )
+    assert sel_hop2.selected_proposal is not None
+    assert sel_hop2.selected_dedup.decision == "ACCEPT"
+
+    # 2. Paraphrase repeat of hop1 on the same inv: thread MUST still be rejected/deferred
+    d_repeat = eng.evaluate(
+        proposal=GoalProposal(
+            title="Inspect local repo fixtures for commit a0ce82764c",
+            description="Search isolated runtime snapshot for commit a0ce82764c evidence.",
+            drive_type="curiosity",
+            related_key="inv:aoc_v4_1_trusted_commit_evidence",
+        ),
+        drive_type="curiosity",
+        recent_goals=recent,
+        now=now,
+    )
+    assert d_repeat.decision in {"DEFER", "REJECT"}
+
+    # 3. Even if hop2 itself was previously ABANDONED and in cooldown, fresh human_guidance overrides cooldown
+    recent_with_hop2_cooldown = recent + [
+        {
+            "goal_id": str(uuid.uuid4()),
+            "drive_type": "curiosity",
+            "title": hop2_title,
+            "description": hop2_desc,
+            "related_key": "inv:aoc_v4_1_trusted_commit_evidence",
+            "goal_fingerprint": hop2_fp,
+            "status": "ABANDONED",
+            "verified_ig": None,
+            "created_at": now - timedelta(minutes=5),
+            "cooldown_until": now + timedelta(minutes=60),
+        }
+    ]
+    d_blocked = eng.evaluate(
+        proposal=GoalProposal(
+            title=hop2_title,
+            description=hop2_desc,
+            drive_type="curiosity",
+            related_key="inv:aoc_v4_1_trusted_commit_evidence",
+        ),
+        drive_type="curiosity",
+        recent_goals=recent_with_hop2_cooldown,
+        now=now,
+        has_human_guidance=False,
+    )
+    assert d_blocked.decision == "DEFER"
+    assert d_blocked.reason_code == "GOAL_IN_COOLDOWN"
+
+    sel_guided = select_best_goal_candidate(
+        primary=GoalProposal(
+            title=hop2_title,
+            description=hop2_desc,
+            drive_type="curiosity",
+            related_key="inv:aoc_v4_1_trusted_commit_evidence",
+            predicted_ig=0.65,
+        ),
+        drive_type="curiosity",
+        recent_goals=recent_with_hop2_cooldown,
+        dedup_engine=eng,
+        now=now,
+        has_human_guidance=True,
+    )
+    assert sel_guided.selected_proposal is not None
+    assert sel_guided.selected_dedup.decision == "ACCEPT"
+
+    # 4. Concurrent ACTIVE goal on the same inv: thread still blocks even with human_guidance
+    recent_active = [
+        {
+            "goal_id": str(uuid.uuid4()),
+            "drive_type": "curiosity",
+            "title": hop1_title,
+            "description": hop1_desc,
+            "related_key": "inv:aoc_v4_1_trusted_commit_evidence",
+            "goal_fingerprint": hop1_fp,
+            "status": "ACTIVE",
+            "created_at": now - timedelta(minutes=2),
+        }
+    ]
+    d_active = eng.evaluate(
+        proposal=GoalProposal(
+            title=hop2_title,
+            description=hop2_desc,
+            drive_type="curiosity",
+            related_key="inv:aoc_v4_1_trusted_commit_evidence",
+        ),
+        drive_type="curiosity",
+        recent_goals=recent_active,
+        now=now,
+        has_human_guidance=True,
+    )
+    assert d_active.decision == "REJECT"
+
+
+@pytest.mark.asyncio
+async def test_v4_2_1_generate_goal_exposes_available_tools_and_mcp_args_alias(tmp_path: Path, monkeypatch):
+    """Verify generate_goal payload exposes available_tools and _run_mcp_prefetch accepts 'args' alias."""
+    import uuid as _uuid
+
+    from app.cognition.brain import CognitionBrain
+    from app.core.enums import DriveType
+    from app.drives.interfaces import DriveDecision, DriveState
+    from app.perception.interfaces import Observation
+
+    seen_payloads: list[dict[str, Any]] = []
+
+    class _SpyGateway:
+        async def complete_structured(self, *, operation: str, system_prompt: str, user_payload: Any, schema_cls: Any):
+            seen_payloads.append({"op": operation, "system_prompt": system_prompt, "user_payload": user_payload})
+            return GoalProposal(should_act=False)
+
+    now = utcnow()
+    brain = CognitionBrain(_SpyGateway())
+    tools_for_brain = [
+        {"tool_name": "web_search", "server_name": "aoc-mcp-search", "permission_level": "L0", "enabled": True},
+        {"tool_name": "web_fetch_readonly", "server_name": "aoc-mcp-web", "permission_level": "L0", "enabled": True},
+    ]
+    await brain.generate_goal(
+        CognitiveContext(
+            observation=Observation(timestamp=now, confidence=1.0),
+            drives=[DriveState(drive_type="curiosity", satisfaction=0.4, urgency=0.6, confidence=1.0)],
+            decision=DriveDecision(
+                selected_drive=DriveType.CURIOSITY.value,
+                priority_score=0.7,
+                alternative_drives=[],
+                reason="curiosity",
+                constraints={},
+                timestamp=now,
+                scores={},
+            ),
+            available_tools=tools_for_brain,
+        )
+    )
+    assert len(seen_payloads) == 1
+    assert "available_tools" in seen_payloads[0]["user_payload"]
+    exposed_names = {t["tool_name"] for t in seen_payloads[0]["user_payload"]["available_tools"]}
+    assert {"web_search", "web_fetch_readonly"} <= exposed_names
+    assert "available_tools" in seen_payloads[0]["system_prompt"]
+
+    # Verify AutonomousLoop._run_mcp_prefetch accepts "args" alias when LLM emits "args" instead of "arguments"
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'v421_prefetch.db'}"
+    db = Database(db_url)
+    await _init_db(db)
+    reg = AgentRegistry()
+    reg.register(_StubEmergentAgent())
+    rt = OrganismRuntime(
+        settings=Settings(
+            api=ApiSettings(host="127.0.0.1", auth_enabled=False),
+            database=DatabaseSettings(url=db_url),
+            governance=GovernanceSettings(workspace_root=str(tmp_path / "ws")),
+            perception=PerceptionSettings(llm_probe=True, host_metrics=False),
+            memory=MemorySettings(provider="none"),
+            embedding=EmbeddingSettings(provider="hash_fallback"),
+            runner=RunnerSettings(enabled=False),
+            kernel_v3=KernelV3Settings(
+                open_public_perception_enabled=True,
+                searxng_url="http://aoc-searxng:8080",
+                investigations_enabled=True,
+                world_poll_on_perceive=False,
+            ),
+        ),
+        db=db,
+        brain=_StubEmergentBrain(),
+        registry=reg,
+        drive_config=get_drive_config(),
+        auto_load_agents=False,
+        llm_probe_fn=_llm_ok,
+    )
+    try:
+        await rt.start(start_scheduler=False)
+        captured_args: list[dict[str, Any]] = []
+
+        async def _fake_stdio(spec, args, *, workspace):
+            captured_args.append(dict(args))
+            return (
+                {
+                    "query": args.get("query"),
+                    "count": 1,
+                    "results": [
+                        {
+                            "title": "AOC Repo",
+                            "url": "https://github.com/stream04l4/aoc",
+                            "domain": "github.com",
+                            "snippet": "Public repo.",
+                        }
+                    ],
+                },
+                False,
+            )
+
+        monkeypatch.setattr(rt.mcp_manager, "_call_stdio_server", _fake_stdio)
+
+        plan = ActionPlan(
+            should_execute=True,
+            goal_title="Search GitHub repo",
+            objective="Run web_search via args alias",
+            description="Check public repository.",
+            assigned_agent="codex",
+            permission_level="L1",
+            mcp_prefetch_calls=[{"tool_name": "web_search", "args": {"query": "stream04l4/aoc", "max_results": 3}}],
+            verification=[VerificationSpec(kind="non_empty_output")],
+        )
+        audit, enriched = await rt.loop._run_mcp_prefetch(cycle_id=_uuid.uuid4(), plan=plan)
+        assert audit and audit[0]["ok"] is True
+        assert captured_args[0]["query"] == "stream04l4/aoc"
+        assert enriched and "https://github.com/stream04l4/aoc" in enriched
+    finally:
+        await rt.stop()
+        await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v4_2_1_world_item_long_key_truncation_and_dedup_drive_rotation(tmp_path: Path):
+    """Verify >250-char world_states.key is idempotently truncated and 2x GOAL_DEDUP_SKIPPED applies drive inhibition without acking human_guidance."""
+    import uuid
+    from datetime import timedelta
+
+    from app.cognition.goal_dedup import compute_goal_fingerprint
+    from app.drives.interfaces import DriveState
+    from app.notifications.human_bridge import HumanBridge
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'v421_rot.db'}"
+    db = Database(db_url)
+    await _init_db(db)
+
+    long_key = "stdlib_commit_topic_reconciliation: " + ("x" * 320)
+
+    class _DupBrain(BrainInterface):
+        async def assess(self, observation, memories, drives) -> AssessmentResult:
+            return AssessmentResult(summary="Assess curiosity gaps", confidence=0.9)
+
+        async def generate_goal(self, context: CognitiveContext) -> GoalProposal:
+            return GoalProposal(
+                should_act=True,
+                title="Repeated curiosity topic already in cooldown",
+                description="Inspect stale_topic again.",
+                drive_type=context.decision.selected_drive,
+                related_key="stale_topic",
+                predicted_ig=0.5,
+            )
+
+        async def plan(self, context: CognitiveContext) -> ActionPlan:
+            return ActionPlan(should_execute=False)
+
+        async def evaluate(self, context: EvaluationContext) -> EvaluationResult:
+            return EvaluationResult(goal_achieved=False, summary="unused")
+
+    reg = AgentRegistry()
+    reg.register(_StubEmergentAgent())
+    settings = Settings(
+        api=ApiSettings(host="127.0.0.1", auth_enabled=False),
+        database=DatabaseSettings(url=db_url),
+        governance=GovernanceSettings(workspace_root=str(tmp_path / "ws")),
+        perception=PerceptionSettings(llm_probe=True, host_metrics=False),
+        memory=MemorySettings(provider="none"),
+        embedding=EmbeddingSettings(provider="hash_fallback"),
+        runner=RunnerSettings(enabled=False),
+        kernel_v3=KernelV3Settings(
+            investigations_enabled=False,
+            world_poll_on_perceive=False,
+            skill_auto_crystallize_enabled=False,
+            human_outreach_enabled=True,
+        ),
+    )
+    drive_cfg = get_drive_config()
+    drive_cfg["arbitration"]["post_goal_satiation_enabled"] = True
+
+    rt = OrganismRuntime(
+        settings=settings,
+        db=db,
+        brain=_DupBrain(),
+        registry=reg,
+        drive_config=drive_cfg,
+        auto_load_agents=False,
+        llm_probe_fn=_llm_ok,
+    )
+    try:
+        await rt.start(start_scheduler=False)
+
+        # 1. Verify long world_states.key is safely bounded <= 250 chars and idempotent across repeated upserts
+        r1 = await rt.repo.upsert_world_item(
+            kind="capability",
+            key=long_key,
+            value={"summary": "first"},
+            status="acquired",
+            source="test:1",
+        )
+        r2 = await rt.repo.upsert_world_item(
+            kind="capability",
+            key=long_key,
+            value={"summary": "second"},
+            status="acquired",
+            source="test:2",
+        )
+        assert len(r1["key"]) <= 250
+        assert r1["key"] == r2["key"]
+        cap_rows = await rt.repo.list_world_items(kind="capability")
+        assert len(cap_rows) == 1 and cap_rows[0]["value"]["summary"] == "second"
+
+        # 2. Seed open curiosity gaps + active cooldown goal + pending human_guidance.
+        # Because an ACTIVE goal exists for stale_topic, dedup returns REJECT even with human_guidance,
+        # allowing us to verify human_guidance stays pending and 2 consecutive skips inhibit curiosity.
+        now = utcnow()
+        for i in range(5):
+            await rt.repo.upsert_world_item(
+                kind="knowledge_topic",
+                key=f"open_gap_{i}",
+                value={"title": f"Gap {i}"},
+                status="open",
+                source="environment",
+            )
+        seed_cid, _ = await rt.repo.start_cycle(rt.organism_id, "ACTIVE")
+        fp = compute_goal_fingerprint(
+            drive_type="curiosity",
+            title="Repeated curiosity topic already in cooldown",
+            related_key="stale_topic",
+            description="Inspect stale_topic again.",
+        )
+        await rt.repo.create_goal(
+            rt.organism_id,
+            seed_cid,
+            drive_type="curiosity",
+            title="Repeated curiosity topic already in cooldown",
+            description="Inspect stale_topic again.",
+            related_key="stale_topic",
+            status="ACTIVE",
+            goal_fingerprint=fp,
+            cooldown_until=now + timedelta(minutes=60),
+        )
+        await rt.repo.update_cycle(seed_cid, outcome="SUCCEEDED")
+
+        hb = rt.human_bridge or HumanBridge(repo=rt.repo, enabled=True)
+        await hb.record_human_guidance(key="tg:999", text="Check stream04l4/aoc", sender="joel", chat_id="1")
+
+        # Keep reproduction satisfied so curiosity wins both dedup-skip cycles
+        ds_rows = await rt.repo.load_drive_states(rt.organism_id)
+        for r in ds_rows:
+            if r["drive_type"] == "reproduction":
+                r["last_satisfied_at"] = now.isoformat()
+            elif r["drive_type"] == "curiosity":
+                r["last_satisfied_at"] = None
+                r["persistence"] = 1.0
+        await rt.repo.save_drive_states(rt.organism_id, [DriveState(**r) for r in ds_rows], cycle_id=None, phase="pre")
+
+        c1 = await rt.loop.run_cycle()
+        assert c1["outcome"] == "GOAL_DEDUP_SKIPPED"
+        assert c1["decision"]["selected_drive"] == "curiosity"
+        assert len(await hb.list_pending_guidance()) == 1  # NOT swallowed on skipped cycle!
+        assert c1["drives_post"]["curiosity"]["last_satisfied_at"] is None
+
+        c2 = await rt.loop.run_cycle()
+        assert c2["outcome"] == "GOAL_DEDUP_SKIPPED"
+        assert c2["decision"]["selected_drive"] == "curiosity"
+        assert len(await hb.list_pending_guidance()) == 1  # still pending!
+        # After 2 consecutive skips, bounded frustration inhibition is applied to allow drive rotation
+        assert c2["drives_post"]["curiosity"]["last_satisfied_at"] is not None
+        assert float(c2["drives_post"]["curiosity"]["persistence"]) < float(c2["drives_pre"]["curiosity"]["persistence"])
+    finally:
+        await rt.stop()
+        await db.dispose()
+

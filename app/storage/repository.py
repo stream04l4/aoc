@@ -6,6 +6,7 @@ they never import SQLAlchemy sessions themselves.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -305,14 +306,18 @@ class StateRepository:
         is_simulated: bool | None = None,
         session: AsyncSession | None = None,
     ) -> dict:
+        safe_key = str(key).strip()
+        if len(safe_key) > 250:
+            digest = hashlib.sha256(safe_key.encode("utf-8")).hexdigest()[:12]
+            safe_key = f"{safe_key[:230]}_{digest}"
         async with self._use_session(session) as s:
             row = (
-                await s.execute(select(WorldState).where(WorldState.kind == kind, WorldState.key == key))
+                await s.execute(select(WorldState).where(WorldState.kind == kind, WorldState.key == safe_key))
             ).scalar_one_or_none()
             if row is None:
                 row = WorldState(
                     kind=kind,
-                    key=key,
+                    key=safe_key,
                     value=_jsonable(value or {}),
                     status=status or "open",
                     source=source or "environment",

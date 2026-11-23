@@ -89,7 +89,10 @@ def compute_goal_fingerprint(
     """Stable SHA-256 prefix fingerprint invariant to minor phrasing/whitespace differences."""
     drive_norm = (drive_type or "").strip().lower()
     rel_norm = re.sub(r"\s+", " ", (related_key or "").strip().lower())
-    if rel_norm:
+    if rel_norm.startswith("inv:"):
+        toks = sorted(_canonical_tokens(f"{title} {description[:120]}"))[:12]
+        canonical = f"{drive_norm}|inv:{rel_norm}|tok:{' '.join(toks)}"
+    elif rel_norm:
         canonical = f"{drive_norm}|key:{rel_norm}"
     else:
         toks = sorted(_canonical_tokens(f"{title} {description[:120]}"))[:16]
@@ -156,6 +159,7 @@ class GoalDedupEngine:
         now: datetime | None = None,
         candidate_embedding: Sequence[float] | None = None,
         recent_embeddings: dict[str, Sequence[float]] | None = None,
+        has_human_guidance: bool = False,
     ) -> GoalDedupDecision:
         now = now or utcnow()
         fp = compute_goal_fingerprint(
@@ -165,6 +169,7 @@ class GoalDedupEngine:
             description=proposal.description,
         )
         cand_rel = (proposal.related_key or "").strip().lower()
+        is_inv = cand_rel.startswith("inv:")
         cand_toks = _canonical_tokens(f"{proposal.title} {proposal.description[:160]}")
         window_cutoff = now - timedelta(hours=self.dedup_window_hours)
         emb_map = recent_embeddings or {}
@@ -197,9 +202,25 @@ class GoalDedupEngine:
 
             same_fp = (g_fp == fp)
             same_rel = bool(cand_rel and g_rel and cand_rel == g_rel and g_drive == drive_type.lower())
+            # Multi-hop investigation threads (`inv:...`) reuse one thread key across distinct hops;
+            # never let one hop's related_key or cooldown block a genuinely distinct next hop.
+            same_rel_blocks = same_rel and not is_inv
 
-            # 1. Active cooldown gate (highest priority)
-            if (same_fp or same_rel) and isinstance(g_cooldown, datetime) and g_cooldown > now:
+            # Always block concurrent overlap on an already-ACTIVE goal
+            if (same_fp or same_rel) and g_status == "ACTIVE":
+                code = "DUPLICATE_GOAL_FINGERPRINT" if same_fp else "DUPLICATE_RELATED_KEY"
+                return GoalDedupDecision(
+                    decision="REJECT",
+                    fingerprint=fp,
+                    reason_code=code,
+                    duplicate_of=gid or None,
+                    similarity=1.0,
+                    cooldown_until=now + timedelta(minutes=self.failed_cooldown_minutes),
+                    notes=[f"Goal overlaps already-ACTIVE goal {gid[:8]} ({code})"],
+                )
+
+            # 1. Active cooldown gate (bypassed when fresh human_guidance directs the organism)
+            if not has_human_guidance and (same_fp or same_rel_blocks) and isinstance(g_cooldown, datetime) and g_cooldown > now:
                 return GoalDedupDecision(
                     decision="DEFER",
                     fingerprint=fp,
@@ -216,7 +237,7 @@ class GoalDedupEngine:
                 continue
 
             # 2. Exact fingerprint or related_key repetition inside window
-            if same_fp or same_rel:
+            if not has_human_guidance and (same_fp or same_rel_blocks):
                 code = "DUPLICATE_GOAL_FINGERPRINT" if same_fp else "DUPLICATE_RELATED_KEY"
                 # If already active/in-progress, or already failed/rejected, or achieved with low IG -> block!
                 is_low_ig = (g_ver_ig is not None) and (float(g_ver_ig) < self.low_ig_threshold)
@@ -242,7 +263,8 @@ class GoalDedupEngine:
             # 3. Lexical / Semantic paraphrase detection (same drive)
             # If BOTH goals specify explicit, distinct related_keys (e.g., "t-0" vs "t-1"),
             # they target different concrete entities/topics — never false-positive on templated titles!
-            if g_drive != drive_type.lower():
+            # Also skip paraphrase blocking when fresh human_guidance is actively guiding retries.
+            if has_human_guidance or g_drive != drive_type.lower():
                 continue
             if cand_rel and g_rel and cand_rel != g_rel:
                 continue
@@ -322,6 +344,7 @@ def select_best_goal_candidate(
     now: datetime | None = None,
     affect_state: dict[str, Any] | None = None,
     prefer_external: bool = False,
+    has_human_guidance: bool = False,
 ) -> GoalSelectionResult:
     """Evaluate primary + up to 2 alternative_goals through GoalDedupEngine and deterministically pick best.
 
@@ -372,6 +395,7 @@ def select_best_goal_candidate(
             drive_type=drive_type,
             recent_goals=recent_goals,
             now=now,
+            has_human_guidance=has_human_guidance,
         )
         if first_dedup is None:
             first_dedup = dec

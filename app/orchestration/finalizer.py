@@ -421,12 +421,24 @@ class TaskFinalizer:
                             session=s,
                         )
                     if selected_drive == DriveType.REPRODUCTION.value:
-                        skill_key = eval_res.acquired_skill or goal_dict.get("related_key")
+                        raw_acq = str(eval_res.acquired_skill or "").strip()
+                        raw_rel = str(goal_dict.get("related_key") or "").strip()
+                        if raw_acq and len(raw_acq) <= 100 and " " not in raw_acq:
+                            skill_key = raw_acq
+                        elif raw_rel:
+                            skill_key = raw_rel[:120]
+                        elif raw_acq:
+                            skill_key = raw_acq[:120]
+                        else:
+                            skill_key = ""
                         if skill_key:
+                            val_payload = {"summary": eval_res.summary}
+                            if raw_acq:
+                                val_payload["acquired_skill"] = raw_acq[:500]
                             await self.repo.upsert_world_item(
                                 kind="capability",
-                                key=str(skill_key),
-                                value={"summary": eval_res.summary},
+                                key=skill_key,
+                                value=val_payload,
                                 status="acquired",
                                 source=f"execution:{exec_key}",
                                 session=s,

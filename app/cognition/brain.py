@@ -152,6 +152,8 @@ class CognitionBrain(BrainInterface):
             "When low_ig_streak is high or a thread stalls, pivot angle, ask Joel, or abandon cleanly. "
             "HUMAN GUIDANCE: If human_guidance contains messages from your creator Joel, treat them as TOP PRIORITY and "
             "formulate a concrete action plan responding to them directly. "
+            "AVAILABLE MCP TOOLS: `available_tools` lists the kernel-guarded L0/L1 MCP tools (such as `web_search` and "
+            "`web_fetch_readonly`) usable during `plan` prefetch even though external agent sandboxes have no direct outbound DNS. "
             "PROACTIVE HUMAN OUTREACH: When human_outreach_available is true and you hit a real external bottleneck "
             "(e.g., needing outbound access, credentials, a new tool, or strategic clarification), you may optionally set "
             "message_to_human={kind:'ask_human', topic_key, title, message, reason, expected_benefit} "
@@ -199,6 +201,7 @@ class CognitionBrain(BrainInterface):
             "external_events": fenced_obs.get("external_events", []),
             "system_state": fenced_obs.get("system_state", {}),
             "available_agents": context.available_agents,
+            "available_tools": context.available_tools[:12],
             "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=query_hint, top_k=5),
             "budget_remaining": context.budget_remaining,
             "active_goals": context.active_goals[:4],
@@ -231,11 +234,12 @@ class CognitionBrain(BrainInterface):
             "- affect_state_readonly is read-only internal context (when frustration is high prefer smaller, well-verified steps).\n"
             "- GENERAL EXTERNAL RESEARCH PRIMITIVES: External agent workspaces have NO outbound internet DNS. "
             "Whenever a goal needs outside knowledge, hypothesis verification, or following a URL lead, include 1-2 L0 calls "
-            "in mcp_prefetch_calls using general tools from available_tools — e.g. `web_search` (wide discovery across public sites) "
+            "in mcp_prefetch_calls using exact shape `[{\"tool_name\": \"<name>\", \"arguments\": {<params>}}]` (use key "
+            "\"arguments\", NOT \"args\") from available_tools — e.g. `web_search` (wide discovery across public sites) "
             "and/or `web_fetch_readonly` (open public HTTPS reading + outbound_links / RSS feed extraction). "
             "Consult discovered_channels if you already learned useful sites.\n"
             "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
-            "from available_tools.\n"
+            "(`[{\"tool_name\": \"<name>\", \"arguments\": {<params>}}]`) from available_tools.\n"
             "- Include concrete success_criteria and at least one deterministic verification check "
             "(e.g. kind='non_empty_output' or kind='file_exists' with target='result.md' or kind='min_output_chars').\n"
             "- Keep timeout_seconds realistic (60-300s) and within budget.\n"
