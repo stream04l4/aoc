@@ -246,5 +246,56 @@ def compact_drives(drives: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def compact_investigations(threads: list[dict[str, Any]], *, max_items: int = 2) -> list[dict[str, Any]]:
+    """Keep active multi-hop investigation threads compact with pending leads & recent findings."""
+    out: list[dict[str, Any]] = []
+    for t in (threads or [])[: max(1, int(max_items))]:
+        if not isinstance(t, dict):
+            continue
+        pending = [
+            {
+                "lead_id": ld.get("lead_id"),
+                "kind": ld.get("kind"),
+                "target": _trim_text(ld.get("target"), 160),
+                "note": _trim_text(ld.get("note"), 100),
+            }
+            for ld in (t.get("leads") or [])
+            if isinstance(ld, dict) and ld.get("status") == "pending"
+        ][:4]
+        out.append(
+            {
+                "thread_key": t.get("thread_key"),
+                "stage": t.get("stage"),
+                "origin_drive": t.get("origin_drive"),
+                "core_question": _trim_text(t.get("core_question"), 200),
+                "hops": f"{int(t.get('hops_taken') or 0)}/{int(t.get('max_hops') or 6)}",
+                "low_ig_streak": int(t.get("low_ig_streak") or 0),
+                "pending_leads": pending,
+                "recent_findings": [_trim_text(f, 160) for f in (t.get("findings") or [])[-3:]],
+            }
+        )
+    return out
+
+
+def compact_channels(channels: list[dict[str, Any]], *, max_items: int = 6) -> list[dict[str, Any]]:
+    """Keep organically discovered external knowledge channels compact for CognitiveContext."""
+    out: list[dict[str, Any]] = []
+    for ch in (channels or [])[: max(1, int(max_items))]:
+        if not isinstance(ch, dict):
+            continue
+        out.append(
+            {
+                "domain": ch.get("domain"),
+                "channel_type": ch.get("channel_type"),
+                "entry_url": _trim_text(ch.get("entry_url"), 160),
+                "feed_url": _trim_text(ch.get("feed_url"), 160),
+                "registered_source_id": ch.get("registered_source_id"),
+                "utility_score": ch.get("utility_score"),
+                "notes": _trim_text(ch.get("notes"), 140),
+            }
+        )
+    return out
+
+
 def estimate_payload_chars(payload: Any) -> int:
     return len(json.dumps(payload, ensure_ascii=False, default=str))

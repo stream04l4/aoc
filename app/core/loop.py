@@ -78,6 +78,36 @@ class CycleInProgressError(RuntimeError):
     """Raised when a cycle trigger arrives while another cycle is actively executing."""
 
 
+def _format_mcp_output_for_prefetch(tool_name: str, output: Any) -> str:
+    """Format structured MCP outputs cleanly while preserving outbound_links & discovered_feeds."""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, dict):
+        return str(output)
+    if tool_name == "web_search":
+        lines = [f"Search query: {output.get('query', '')} (results={output.get('count', 0)})"]
+        for i, item in enumerate(list(output.get("results") or [])[:6], start=1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"{i}. [{item.get('domain', '')}] {item.get('title', '')} | URL: {item.get('url', '')} | {item.get('snippet', '')}"
+            )
+        return "\n".join(lines)
+    if tool_name == "web_fetch_readonly":
+        lines = [
+            f"Fetched URL: {output.get('url', '')} (status={output.get('status_code', '')})",
+            f"Excerpt: {str(output.get('markdown_excerpt') or '')[:2200]}",
+        ]
+        feeds = list(output.get("discovered_feeds") or [])
+        if feeds:
+            lines.append("Discovered Feeds: " + "; ".join(f"{f.get('title', '')} -> {f.get('url', '')}" for f in feeds[:3]))
+        links = list(output.get("outbound_links") or [])
+        if links:
+            lines.append("Outbound Links: " + "; ".join(f"{l.get('text', '')} ({l.get('url', '')})" for l in links[:8]))
+        return "\n".join(lines)
+    return str(output)
+
+
 class AutonomousLoop:
     def __init__(
         self,
@@ -105,6 +135,7 @@ class AutonomousLoop:
         playbook_manager: Any = None,
         exploration_manager: Any = None,
         human_bridge: Any = None,
+        investigation_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -129,6 +160,7 @@ class AutonomousLoop:
         self.playbook_manager = playbook_manager
         self.exploration_manager = exploration_manager
         self.human_bridge = human_bridge
+        self.investigation_manager = investigation_manager
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -172,6 +204,8 @@ class AutonomousLoop:
             playbook_manager=playbook_manager,
             exploration_manager=exploration_manager,
             human_bridge=human_bridge,
+            investigation_manager=investigation_manager,
+            world_pipeline=world_pipeline,
         )
 
     def _record_prediction_error(self, error: float) -> None:
@@ -561,6 +595,14 @@ class AutonomousLoop:
                     logger.warning("cycle.human_guidance_load_degraded", cycle_id=str(cycle_id), error=str(exc))
             outreach_avail = bool(self.human_bridge is not None and getattr(self.human_bridge, "enabled", False))
 
+            active_investigations: list[dict[str, Any]] = []
+            discovered_channels: list[dict[str, Any]] = []
+            if self.investigation_manager is not None:
+                try:
+                    active_investigations, discovered_channels = await self.investigation_manager.build_context_snapshot()
+                except Exception as exc:
+                    logger.warning("cycle.investigations_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -580,6 +622,8 @@ class AutonomousLoop:
                 exploration_guidance=exploration_guidance,
                 human_guidance=pending_human_guidance,
                 human_outreach_available=outreach_avail,
+                active_investigations=active_investigations,
+                discovered_channels=discovered_channels,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -808,6 +852,27 @@ class AutonomousLoop:
                         expected_outcome_payload["exploration_domain"] = tracked["domain"]
                     except Exception as exc:
                         logger.warning("cycle.exploration_topic_upsert_degraded", error=str(exc))
+
+            # V4.2: Apply multi-hop investigation action or link explicit inv:<key>
+            if self.investigation_manager is not None:
+                if isinstance(goal_proposal.investigation_action, dict):
+                    try:
+                        inv_res = await self.investigation_manager.apply_goal_action(
+                            goal_proposal.investigation_action,
+                            origin_drive=decision.selected_drive,
+                            origin_trigger=goal_proposal.description or goal_proposal.title,
+                            cycle_id=cycle_id,
+                        )
+                        if inv_res and inv_res.get("thread_key"):
+                            expected_outcome_payload["investigation_thread_key"] = inv_res["thread_key"]
+                            state_changes["investigation_action"] = {
+                                "thread_key": inv_res["thread_key"],
+                                "stage": inv_res.get("stage"),
+                            }
+                    except Exception as exc:
+                        logger.warning("cycle.investigation_action_degraded", error=str(exc))
+                elif isinstance(goal_proposal.related_key, str) and goal_proposal.related_key.strip().lower().startswith("inv:"):
+                    expected_outcome_payload["investigation_thread_key"] = goal_proposal.related_key.strip().lower()
 
             goal_id = await self.repo.create_goal(
                 self.organism_id,
@@ -1180,7 +1245,19 @@ class AutonomousLoop:
             for t in (env.get("unknown_topics") or [])
         ]
 
-        # Merge environment topics + LLM-identified knowledge gaps (dedup by topic)
+        # Include unresolved active investigation leads as genuine environment unknowns (V4.2)
+        seen_env_topics = {g.topic.lower().strip() for g in env_topics}
+        if self.investigation_manager is not None:
+            try:
+                for g in await self.investigation_manager.pending_leads_as_knowledge_gaps(limit=3):
+                    key = g.topic.lower().strip()
+                    if key and key not in seen_env_topics:
+                        env_topics.append(g)
+                        seen_env_topics.add(key)
+            except Exception as exc:
+                logger.warning("cycle.investigation_gaps_degraded", error=str(exc))
+
+        # Merge environment topics + LLM-identified gaps (dedup by topic)
         gaps_by_topic: dict[str, KnowledgeGap] = {g.topic.lower(): g for g in env_topics}
         if assessment is not None:
             for g in assessment.knowledge_gaps:
@@ -1505,9 +1582,9 @@ class AutonomousLoop:
                 continue
 
             # Sanitize & guard against Prompt Injection before surfacing to external Agent
-            raw_text = str(res.output) if not isinstance(res.output, str) else res.output
-            clean_text = sanitize_external_text(raw_text, max_chars=2400)
-            inj_flags = detect_prompt_injection(clean_text)
+            raw_text = _format_mcp_output_for_prefetch(tool_name, res.output)
+            clean_text = sanitize_external_text(raw_text, max_chars=3600)
+            inj_flags = detect_prompt_injection(raw_text) or detect_prompt_injection(clean_text)
             if inj_flags:
                 audit_records.append(
                     {

@@ -80,12 +80,18 @@ class MCPClientManager(ToolProviderInterface):
         workspace_root: str = "/home/ubuntu/aoc-workspaces",
         allowed_domains: Sequence[str] = (),
         allowed_git_roots: Sequence[str] = (),
+        open_public_https: bool = False,
+        blocked_hosts: Sequence[str] = (),
+        searxng_url: str = "",
     ) -> None:
         self.governance = governance
         self.repo = repo
         self.workspace_root = Path(workspace_root).resolve()
         self.allowed_domains = list(allowed_domains)
         self.allowed_git_roots = list(allowed_git_roots)
+        self.open_public_https = bool(open_public_https)
+        self.blocked_hosts = list(blocked_hosts)
+        self.searxng_url = str(searxng_url or "").strip()
         self._tools: dict[str, ToolSpec] = {}
         self._skill_runtime: Any = None
 
@@ -406,6 +412,9 @@ class MCPClientManager(ToolProviderInterface):
                 "AOC_MCP_ALLOWED_DOMAINS": json.dumps(self.allowed_domains),
                 "AOC_MCP_ALLOWED_GIT_ROOTS": json.dumps(self.allowed_git_roots),
                 "AOC_MCP_WORKSPACE_ROOT": str(self.workspace_root),
+                "AOC_MCP_OPEN_PUBLIC_HTTPS": "true" if self.open_public_https else "false",
+                "AOC_MCP_BLOCKED_HOSTS": json.dumps(self.blocked_hosts),
+                "AOC_MCP_SEARXNG_URL": self.searxng_url,
             }
         )
         proc = await asyncio.create_subprocess_exec(

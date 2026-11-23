@@ -1,0 +1,35 @@
+# Self-hosted general web search backend for AOC V4.2 (`web_search` L0 MCP tool)
+use_default_settings: true
+
+general:
+  instance_name: "AOC Internal Search"
+  debug: false
+
+server:
+  secret_key: "aoc-internal-searxng-v42-key"
+  limiter: false
+  image_proxy: false
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "all"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false
+  - name: wikidata
+    disabled: true
+  - name: arxiv
+    disabled: false

@@ -9,6 +9,7 @@ Built-in MCP servers (each runnable over stdio JSON-RPC 2.0 via `python -m app.t
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -17,12 +18,18 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Sequence
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
+
+import httpx
 
 from app.perception.world.security import (
     ResponseTooLargeError,
     SSRFBlockedError,
+    detect_prompt_injection,
     html_to_clean_text,
+    html_to_clean_text_and_links,
+    is_blocked_ip,
+    is_internal_or_blocked_host,
     safe_http_fetch,
     sanitize_external_text,
 )
@@ -76,29 +83,49 @@ async def execute_web_fetch_readonly(
     allowed_domains: Sequence[str],
     max_fetch_bytes: int = 2 * 1024 * 1024,
     max_output_chars: int = MAX_WEB_OUTPUT_CHARS,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float = 20.0,
     http_client: Any = None,
     resolver: Any = None,
+    open_public_https: bool = False,
+    blocked_hosts: Sequence[str] = (),
 ) -> dict[str, Any]:
     url = str(arguments.get("url") or "").strip()
     if not url:
         raise ValueError("Missing required argument: url")
+    extract_links = bool(arguments.get("extract_links", True))
 
     status, headers, body, final_url = await safe_http_fetch(
         url,
         allowed_domains=allowed_domains,
         max_bytes=max_fetch_bytes,
-        timeout_seconds=min(timeout_seconds, 15.0),
+        timeout_seconds=min(float(timeout_seconds), 20.0),
         max_redirects=3,
         http_client=http_client,
         resolver=resolver,
+        open_public_https=open_public_https,
+        blocked_hosts=blocked_hosts,
     )
     if status >= 400:
         raise RuntimeError(f"web_fetch_readonly received HTTP {status} for {final_url}")
 
     raw_text = body.decode("utf-8", errors="replace")
     ctype = headers.get("content-type", "")
-    clean = html_to_clean_text(raw_text) if ("html" in ctype.lower() or "<html" in raw_text[:500].lower()) else raw_text
+    is_html = "html" in ctype.lower() or "<html" in raw_text[:500].lower()
+    outbound_links: list[dict[str, str]] = []
+    discovered_feeds: list[dict[str, str]] = []
+    if is_html and extract_links:
+        clean, outbound_links, discovered_feeds = html_to_clean_text_and_links(
+            raw_text,
+            base_url=final_url,
+            max_links=10,
+            max_feeds=3,
+            blocked_hosts=blocked_hosts,
+        )
+    elif is_html:
+        clean = html_to_clean_text(raw_text)
+    else:
+        clean = raw_text
+
     clean = sanitize_external_text(clean, max_chars=max_output_chars + 64)
     truncated = len(clean) > max_output_chars
     if truncated:
@@ -109,6 +136,8 @@ async def execute_web_fetch_readonly(
         "status_code": status,
         "content_type": ctype,
         "markdown_excerpt": clean,
+        "outbound_links": outbound_links,
+        "discovered_feeds": discovered_feeds,
         "truncated": truncated,
         "bytes_fetched": len(body),
     }
@@ -326,14 +355,119 @@ async def execute_arxiv_search(
     }
 
 
+async def execute_web_search(
+    arguments: dict[str, Any],
+    *,
+    searxng_url: str,
+    blocked_hosts: Sequence[str] = (),
+    timeout_seconds: float = 20.0,
+    http_client: Any = None,
+) -> dict[str, Any]:
+    """Read-only general web search via configured internal SearXNG backend (V4.2 L0)."""
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise ValueError("Missing required argument: query")
+    base = (searxng_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("web_search backend is not configured (AOC_KERNEL_V3__SEARXNG_URL)")
+
+    try:
+        max_results = max(1, min(int(arguments.get("max_results", 5) or 5), 8))
+    except (TypeError, ValueError):
+        max_results = 5
+    categories = str(arguments.get("categories") or "general").strip().lower()
+    if categories not in {"general", "it", "science"}:
+        categories = "general"
+    time_range = str(arguments.get("time_range") or "").strip().lower()
+    if time_range not in {"", "day", "month", "year"}:
+        time_range = ""
+
+    params: dict[str, str] = {"q": query, "format": "json", "categories": categories}
+    if time_range:
+        params["time_range"] = time_range
+
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=min(float(timeout_seconds), 20.0), follow_redirects=False)
+    try:
+        resp = await client.get(
+            f"{base}/search",
+            params=params,
+            headers={"Accept": "application/json", "User-Agent": "AOC-WebSearch/4.2"},
+            timeout=min(float(timeout_seconds), 20.0),
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"web_search received HTTP {resp.status_code} from SearXNG")
+    payload = resp.json()
+    raw_items = payload.get("results") or []
+
+    results: list[dict[str, Any]] = []
+    filtered_injections = 0
+    seen_urls: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        r_url = str(item.get("url") or "").strip()
+        parsed = urlparse(r_url)
+        if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+            continue
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        if is_internal_or_blocked_host(host, blocked_hosts):
+            continue
+        try:
+            ipaddress.ip_address(host)
+            if is_blocked_ip(host):
+                continue
+            continue  # reject bare IPs from web search results
+        except ValueError:
+            pass
+        if r_url in seen_urls:
+            continue
+
+        title = sanitize_external_text(str(item.get("title") or host), max_chars=200)
+        snippet = sanitize_external_text(str(item.get("content") or item.get("snippet") or ""), max_chars=420)
+        if detect_prompt_injection(f"{title}\n{snippet}\n{r_url}"):
+            filtered_injections += 1
+            continue
+
+        seen_urls.add(r_url)
+        engines = [str(e) for e in (item.get("engines") or [])[:4] if e]
+        results.append(
+            {
+                "title": title or host,
+                "url": r_url,
+                "domain": host,
+                "snippet": snippet,
+                "engines": engines,
+            }
+        )
+        if len(results) >= max_results:
+            break
+
+    return {
+        "query": query,
+        "categories": categories,
+        "count": len(results),
+        "filtered_injections": filtered_injections,
+        "results": results,
+    }
+
+
 async def _serve_stdio_mcp(server_name: str) -> None:
     """Minimal MCP JSON-RPC 2.0 stdio server loop supporting initialize, tools/list, and tools/call."""
     allowed_domains = json.loads(os.environ.get("AOC_MCP_ALLOWED_DOMAINS", "[]"))
     allowed_git_roots = json.loads(os.environ.get("AOC_MCP_ALLOWED_GIT_ROOTS", "[]"))
     workspace_root = Path(os.environ.get("AOC_MCP_WORKSPACE_ROOT", "/home/ubuntu/aoc-workspaces")).resolve()
+    open_public_https = os.environ.get("AOC_MCP_OPEN_PUBLIC_HTTPS", "false").lower() in {"1", "true", "yes"}
+    blocked_hosts = json.loads(os.environ.get("AOC_MCP_BLOCKED_HOSTS", "[]"))
+    searxng_url = os.environ.get("AOC_MCP_SEARXNG_URL", "")
 
     tool_catalog: dict[str, dict[str, Any]] = {
-        "aoc-mcp-web": {"name": "web_fetch_readonly", "description": "Read-only allowlisted web fetch (L0)"},
+        "aoc-mcp-web": {"name": "web_fetch_readonly", "description": "Read-only public web fetch with outbound link extraction (L0)"},
+        "aoc-mcp-search": {"name": "web_search", "description": "Read-only general web search via SearXNG (L0)"},
         "aoc-mcp-fs": {"name": "workspace_filesystem", "description": "Workspace-locked filesystem operations (L0/L1)"},
         "aoc-mcp-gitdocs": {"name": "git_docs_search", "description": "Read-only Git log/grep/docs search (L0)"},
         "aoc-mcp-arxiv": {"name": "arxiv_search", "description": "Read-only arXiv paper search (L0)"},
@@ -364,7 +498,18 @@ async def _serve_stdio_mcp(server_name: str) -> None:
                 args = dict(params.get("arguments") or {})
                 ws = str(params.get("workspace") or workspace_root)
                 if server_name == "aoc-mcp-web" and tname == "web_fetch_readonly":
-                    data = await execute_web_fetch_readonly(args, allowed_domains=allowed_domains)
+                    data = await execute_web_fetch_readonly(
+                        args,
+                        allowed_domains=allowed_domains,
+                        open_public_https=open_public_https,
+                        blocked_hosts=blocked_hosts,
+                    )
+                elif server_name == "aoc-mcp-search" and tname == "web_search":
+                    data = await execute_web_search(
+                        args,
+                        searxng_url=searxng_url,
+                        blocked_hosts=blocked_hosts,
+                    )
                 elif server_name == "aoc-mcp-fs" and tname == "workspace_filesystem":
                     data = await execute_workspace_filesystem(args, workspace_root=workspace_root, workspace=ws)
                 elif server_name == "aoc-mcp-gitdocs" and tname == "git_docs_search":

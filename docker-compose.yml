@@ -51,6 +51,8 @@ services:
       AOC_KERNEL_V3__PLAYBOOKS_ENABLED: ${AOC_KERNEL_V3__PLAYBOOKS_ENABLED:-true}
       AOC_KERNEL_V3__OPEN_PUBLIC_PERCEPTION_ENABLED: ${AOC_KERNEL_V3__OPEN_PUBLIC_PERCEPTION_ENABLED:-true}
       AOC_KERNEL_V3__HUMAN_OUTREACH_ENABLED: ${AOC_KERNEL_V3__HUMAN_OUTREACH_ENABLED:-true}
+      AOC_KERNEL_V3__SEARXNG_URL: ${AOC_KERNEL_V3__SEARXNG_URL:-http://aoc-searxng:8080}
+      AOC_KERNEL_V3__INVESTIGATIONS_ENABLED: ${AOC_KERNEL_V3__INVESTIGATIONS_ENABLED:-true}
       AOC_TELEGRAM__ENABLED: ${AOC_TELEGRAM__ENABLED:-true}
       AOC_TELEGRAM__POLLING_ENABLED: ${AOC_TELEGRAM__POLLING_ENABLED:-true}
     ports:
@@ -89,6 +91,22 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+
+  aoc-searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: aoc-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:8080"
+    volumes:
+      - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
 
 volumes:
   aoc_pg_data_pgvector:

@@ -222,6 +222,12 @@ class KernelV3Settings(BaseModel):
     human_outreach_enabled: bool = True
     human_outreach_cooldown_minutes: int = 120
     human_outreach_topic_dedup_hours: float = 24.0
+    # V4.2: Emergent epistemic foraging (general SearXNG web_search + multi-hop InvestigationManager)
+    searxng_url: str = ""
+    investigations_enabled: bool = True
+    max_active_investigations: int = 2
+    investigation_max_hops: int = 6
+    investigation_low_ig_stall_streak: int = 2
 
 
 class _YamlSource(PydanticBaseSettingsSource):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.affect.modulator import AffectModulator
 from app.agents.registry import AgentRegistry
@@ -54,6 +55,7 @@ from app.perception.manager import SensorManager
 from app.perception.system_sensor import SystemSensor
 from app.perception.world.exploration import ExplorationManager
 from app.perception.world.git_sensor import GitWorldSensor
+from app.perception.world.investigation import InvestigationManager
 from app.perception.world.pipeline import WorldEventPipeline
 from app.perception.world.rss_sensor import RSSWorldSensor
 from app.perception.world.web_sensor import WebChangeWorldSensor
@@ -300,12 +302,17 @@ class OrganismRuntime:
         self.system_sensor._runner_health_fn = self.orchestrator.sync_runner_heartbeat
 
         # Guarded MCP ToolProvider (V2.0 P1-6: second controlled tool path, strictly distinct from AgentProvider)
+        llm_host = (urlparse(self.settings.llm.base_url).hostname or "").strip().lower()
+        blocked_hosts = [llm_host] if llm_host else []
         self.mcp_manager = MCPClientManager(
             governance=self.governance,
             repo=self.repo,
             workspace_root=self.settings.governance.workspace_root,
             allowed_domains=allowed_domains,
             allowed_git_roots=allowed_git_roots,
+            open_public_https=self.settings.kernel_v3.open_public_perception_enabled,
+            blocked_hosts=blocked_hosts,
+            searxng_url=self.settings.kernel_v3.searxng_url,
         )
         self.mcp_manager.load_from_config(get_agent_config())
 
@@ -317,6 +324,7 @@ class OrganismRuntime:
         self.skill_evolution: SkillEvolutionEngine | None = None
         self.playbook_manager: PlaybookManager | None = None
         self.exploration_manager: ExplorationManager | None = None
+        self.investigation_manager: InvestigationManager | None = None
         self.affect: AffectModulator | None = None
 
         self.loop: AutonomousLoop | None = None
@@ -384,6 +392,14 @@ class OrganismRuntime:
             repo=self.repo,
             max_internal_curiosity_ratio=self.settings.kernel_v3.max_internal_curiosity_ratio,
         )
+        if self.settings.kernel_v3.investigations_enabled:
+            self.investigation_manager = InvestigationManager(
+                repo=self.repo,
+                max_active=self.settings.kernel_v3.max_active_investigations,
+                max_hops=self.settings.kernel_v3.investigation_max_hops,
+                low_ig_stall_streak=self.settings.kernel_v3.investigation_low_ig_stall_streak,
+                low_ig_threshold=self.settings.kernel_v3.goal_low_ig_threshold,
+            )
 
         # Optional bounded Affect modulation layer (V2.0 P1-9 / V3.0 M2)
         eff_affect_cfg = dict(self._affect_cfg or {})
@@ -413,6 +429,8 @@ class OrganismRuntime:
             playbook_manager=self.playbook_manager,
             exploration_manager=self.exploration_manager,
             human_bridge=self.human_bridge,
+            investigation_manager=self.investigation_manager,
+            world_pipeline=self.world_pipeline,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -479,6 +497,7 @@ class OrganismRuntime:
             playbook_manager=self.playbook_manager,
             exploration_manager=self.exploration_manager,
             human_bridge=self.human_bridge,
+            investigation_manager=self.investigation_manager,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error
@@ -501,10 +520,23 @@ class OrganismRuntime:
                     dr_line = " | ".join(
                         f"{d['drive_type']}: sat={d['satisfaction']:.2f}" for d in sorted(dr, key=lambda x: x["drive_type"])
                     )
+                    inv_block = ""
+                    if self.investigation_manager is not None:
+                        inv_threads = await self.investigation_manager.list_threads(active_only=True, limit=3)
+                        inv_channels = await self.investigation_manager.list_discovered_channels(limit=10)
+                        inv_lines = [
+                            f"  - [{t.get('stage')}] {t.get('hops_taken', 0)}/{t.get('max_hops', 6)}跳: {str(t.get('core_question') or '')[:60]}"
+                            for t in inv_threads
+                        ]
+                        inv_block = (
+                            f"\n探索主线({len(inv_threads)}条活跃) | 已发现渠道: {len(inv_channels)}"
+                            + (("\n" + "\n".join(inv_lines)) if inv_lines else "")
+                        )
                     return (
                         f"AOC-001 ({self.lifecycle.state.value if self.lifecycle else 'UNKNOWN'})\n"
                         f"周期: #{(st or {}).get('cycle_count', 0)}\n"
                         f"内驱力: {dr_line or '暂无数据'}"
+                        f"{inv_block}"
                     )
 
                 self.telegram_poller = TelegramPoller(

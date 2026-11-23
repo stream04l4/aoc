@@ -21,7 +21,7 @@ allowed_domains:
 allowed_git_roots:
   - "/home/ubuntu/aoc"
 
-# Relevance keywords boosting importance scoring
+# Relevance keywords boosting importance scoring (kept general; emergent topics come from self-driven investigation)
 interest_keywords:
   - "postgresql"
   - "pgvector"
@@ -40,18 +40,6 @@ interest_keywords:
   - "linux"
   - "database"
   - "llm"
-  - "recursive"
-  - "self-improvement"
-  - "rsi"
-  - "self-evolution"
-  - "meta-learning"
-  - "skill"
-  - "continual"
-  - "autonomous"
-  - "reasoning"
-  - "tool-use"
-  - "memory"
-  - "letta"
 
 # Default configured sources (can be toggled via POST /v2/world/sources/{id}/enable|disable)
 sources:
@@ -82,11 +70,11 @@ sources:
     poll_interval_seconds: 3600
     config:
       url: "https://docs.python.org/3.12/whatsnew/3.12.html"
-  # V3.0 M3: AI/Agent engineering & core dependency external feeds (curiosity fuel)
+  # Preset external feeds disabled by default in V4.2 so AOC discovers and registers channels organically
   - source_id: "rss-arxiv-cs-ai"
     sensor_type: "rss"
     name: "arXiv cs.AI Research Feed"
-    enabled: true
+    enabled: false
     reliability_score: 0.85
     poll_interval_seconds: 3600
     config:
@@ -95,7 +83,7 @@ sources:
   - source_id: "rss-arxiv-cs-lg"
     sensor_type: "rss"
     name: "arXiv cs.LG Machine Learning Feed"
-    enabled: true
+    enabled: false
     reliability_score: 0.85
     poll_interval_seconds: 3600
     config:
@@ -104,7 +92,7 @@ sources:
   - source_id: "rss-github-pgvector-releases"
     sensor_type: "rss"
     name: "GitHub pgvector Releases"
-    enabled: true
+    enabled: false
     reliability_score: 0.92
     poll_interval_seconds: 7200
     config:
@@ -113,7 +101,7 @@ sources:
   - source_id: "rss-github-letta-releases"
     sensor_type: "rss"
     name: "GitHub Letta Releases"
-    enabled: true
+    enabled: false
     reliability_score: 0.90
     poll_interval_seconds: 7200
     config:

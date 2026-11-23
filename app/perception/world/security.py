@@ -84,6 +84,30 @@ def is_blocked_ip(ip_str: str) -> bool:
     return any(addr in net for net in _BLOCKED_V4_NETS)
 
 
+_INTERNAL_HOST_SUFFIXES = (".local", ".internal", ".lan", ".onion")
+
+
+def _normalize_blocked_hosts(blocked_hosts: Sequence[str] | None) -> set[str]:
+    out: set[str] = set()
+    for raw in blocked_hosts or ():
+        item = str(raw or "").strip().lower().rstrip(".")
+        if item:
+            out.add(item)
+    return out
+
+
+def is_internal_or_blocked_host(host: str, blocked_hosts: Sequence[str] | None = None) -> bool:
+    """Return True if host is internal (.local/.internal/.lan/.onion), localhost, bare IP, or explicitly blocked."""
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return True
+    if h in {"localhost", "localhost.localdomain"} or h.endswith(_INTERNAL_HOST_SUFFIXES):
+        return True
+    if h in _normalize_blocked_hosts(blocked_hosts):
+        return True
+    return False
+
+
 def is_domain_allowed(hostname: str, allowed_domains: Sequence[str]) -> bool:
     host = (hostname or "").strip().lower().rstrip(".")
     if not host:
@@ -114,10 +138,12 @@ async def validate_and_resolve_url(
     *,
     resolver: ResolverFn | None = None,
     allow_http: bool = False,
+    open_public_https: bool = False,
+    blocked_hosts: Sequence[str] = (),
 ) -> tuple[str, list[str]]:
-    """Validate scheme, domain allowlist, and EVERY resolved DNS IP against SSRF/DNS-Rebinding rules."""
+    """Validate scheme, domain/public-HTTPS policy, and EVERY resolved DNS IP against SSRF rules."""
     parsed = urlparse((url or "").strip())
-    allowed_schemes = {"https", "http"} if allow_http else {"https"}
+    allowed_schemes = {"https"} if open_public_https else ({"https", "http"} if allow_http else {"https"})
     if parsed.scheme.lower() not in allowed_schemes:
         raise SSRFBlockedError(f"Disallowed URL scheme '{parsed.scheme}' (allowed: {sorted(allowed_schemes)})")
     if parsed.username or parsed.password:
@@ -127,15 +153,19 @@ async def validate_and_resolve_url(
     if not host:
         raise SSRFBlockedError("URL missing hostname")
 
-    # Immediately reject bare private/loopback IP literals before even checking allowlist
-    try:
-        ipaddress.ip_address(host)
-        if is_blocked_ip(host):
-            raise SSRFBlockedError(f"Blocked direct private/loopback/metadata IP literal: {host}")
-    except ValueError:
-        pass
+    blocked_set = _normalize_blocked_hosts(blocked_hosts)
+    if host in blocked_set or host in {"localhost", "localhost.localdomain"} or host.endswith(_INTERNAL_HOST_SUFFIXES):
+        raise SSRFBlockedError(f"Blocked internal or restricted hostname: {host}")
 
-    if not is_domain_allowed(host, allowed_domains):
+    # Immediately reject bare IP literals in open_public_https mode, and block private/loopback IPs always
+    try:
+        parsed_ip = ipaddress.ip_address(host)
+    except ValueError:
+        parsed_ip = None
+    if parsed_ip is not None and (open_public_https or is_blocked_ip(host)):
+        raise SSRFBlockedError(f"Blocked bare or private/loopback/metadata IP literal: {host}")
+
+    if not open_public_https and not is_domain_allowed(host, allowed_domains):
         raise SSRFBlockedError(f"Domain '{host}' is not in sensors allowed_domains allowlist")
 
     port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
@@ -151,8 +181,11 @@ async def validate_and_resolve_url(
         raise SSRFBlockedError(f"DNS resolution returned no addresses for '{host}'")
 
     for ip in resolved_ips:
+        norm_ip = str(ip).strip().lower()
         if is_blocked_ip(ip):
             raise SSRFBlockedError(f"SSRF blocked: host '{host}' resolved to private/internal IP {ip}")
+        if norm_ip in blocked_set:
+            raise SSRFBlockedError(f"SSRF blocked: host '{host}' resolved to restricted host IP {ip}")
 
     return host, resolved_ips
 
@@ -168,6 +201,8 @@ async def safe_http_fetch(
     http_client: httpx.AsyncClient | None = None,
     resolver: ResolverFn | None = None,
     allow_http: bool = False,
+    open_public_https: bool = False,
+    blocked_hosts: Sequence[str] = (),
 ) -> tuple[int, dict[str, str], bytes, str]:
     """Perform an SSRF-safe, redirect-validated, size-bounded HTTP GET.
 
@@ -188,6 +223,8 @@ async def safe_http_fetch(
                 allowed_domains,
                 resolver=resolver,
                 allow_http=allow_http,
+                open_public_https=open_public_https,
+                blocked_hosts=blocked_hosts,
             )
 
             async with client.stream(
@@ -235,17 +272,41 @@ async def safe_http_fetch(
 
 
 class _TextExtractor(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, base_url: str = "") -> None:
         super().__init__()
+        self._base_url = (base_url or "").strip()
         self._skip_depth = 0
         self._parts: list[str] = []
+        self._cur_href: str | None = None
+        self._cur_anchor: list[str] = []
+        self.raw_links: list[tuple[str, str]] = []
+        self.raw_feeds: list[tuple[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() in {"script", "style", "noscript", "svg", "nav", "footer"}:
+        t = tag.lower()
+        attr_map = {str(k).lower(): (v or "") for k, v in attrs}
+        if t == "link":
+            rel = attr_map.get("rel", "").lower().split()
+            ltype = attr_map.get("type", "").lower()
+            href = attr_map.get("href", "").strip()
+            if href and "alternate" in rel and ("rss+xml" in ltype or "atom+xml" in ltype):
+                self.raw_feeds.append((attr_map.get("title", "").strip(), href))
+        if t in {"script", "style", "noscript", "svg", "nav", "footer"}:
             self._skip_depth += 1
+        elif t == "a" and self._skip_depth == 0:
+            href = attr_map.get("href", "").strip()
+            if href:
+                self._cur_href = href
+                self._cur_anchor = []
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in {"script", "style", "noscript", "svg", "nav", "footer"} and self._skip_depth > 0:
+        t = tag.lower()
+        if t == "a" and self._cur_href is not None:
+            anchor = " ".join(self._cur_anchor).strip()
+            self.raw_links.append((anchor, self._cur_href))
+            self._cur_href = None
+            self._cur_anchor = []
+        if t in {"script", "style", "noscript", "svg", "nav", "footer"} and self._skip_depth > 0:
             self._skip_depth -= 1
 
     def handle_data(self, data: str) -> None:
@@ -253,9 +314,17 @@ class _TextExtractor(HTMLParser):
             txt = data.strip()
             if txt:
                 self._parts.append(txt)
+                if self._cur_href is not None:
+                    self._cur_anchor.append(txt)
 
     def text(self) -> str:
         return " ".join(self._parts)
+
+
+_STATIC_EXT_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|svg|webp|ico|css|js|mjs|woff2?|ttf|eot|mp[34]|webm|wav|pdf\.sig)(?:$|\?)",
+    re.I,
+)
 
 
 def html_to_clean_text(raw_html: str) -> str:
@@ -266,6 +335,86 @@ def html_to_clean_text(raw_html: str) -> str:
         return parser.text()
     except Exception:
         return re.sub(r"<[^>]+>", " ", raw_html or "")
+
+
+def _safe_public_https_url(raw_href: str, base_url: str, blocked_hosts: Sequence[str] = ()) -> tuple[str, str] | None:
+    href = (raw_href or "").strip()
+    if not href or href.startswith("#"):
+        return None
+    full = urljoin(base_url, href) if base_url else href
+    parsed = urlparse(full)
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return None
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if is_internal_or_blocked_host(host, blocked_hosts):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    clean_url = f"https://{parsed.netloc}{parsed.path or '/'}"
+    if parsed.query:
+        clean_url += f"?{parsed.query}"
+    return clean_url, host
+
+
+def html_to_clean_text_and_links(
+    raw_html: str,
+    base_url: str = "",
+    *,
+    max_links: int = 10,
+    max_feeds: int = 3,
+    blocked_hosts: Sequence[str] = (),
+) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
+    """Extract clean body text, safe high-signal outbound HTTPS links, and RSS/Atom alternate feeds."""
+    parser = _TextExtractor(base_url=base_url)
+    try:
+        parser.feed(raw_html or "")
+        parser.close()
+        clean_text = parser.text()
+    except Exception:
+        clean_text = re.sub(r"<[^>]+>", " ", raw_html or "")
+
+    base_host = (urlparse(base_url).hostname or "").strip().lower().rstrip(".")
+    seen_feeds: set[str] = set()
+    feeds: list[dict[str, str]] = []
+    for title_raw, href in parser.raw_feeds:
+        norm = _safe_public_https_url(href, base_url, blocked_hosts)
+        if not norm:
+            continue
+        furl, _ = norm
+        if furl in seen_feeds:
+            continue
+        seen_feeds.add(furl)
+        ftitle = sanitize_external_text(title_raw or furl, max_chars=120)
+        if not detect_prompt_injection(ftitle):
+            feeds.append({"title": ftitle or "feed", "url": furl})
+        if len(feeds) >= max(1, int(max_feeds)):
+            break
+
+    seen_urls: set[str] = set()
+    scored_links: list[tuple[int, int, dict[str, str]]] = []
+    for idx, (anchor_raw, href) in enumerate(parser.raw_links):
+        if _STATIC_EXT_RE.search(href):
+            continue
+        norm = _safe_public_https_url(href, base_url, blocked_hosts)
+        if not norm:
+            continue
+        lurl, domain = norm
+        if lurl in seen_urls or lurl == base_url:
+            continue
+        anchor = sanitize_external_text(anchor_raw, max_chars=140)
+        if not anchor or detect_prompt_injection(anchor) or detect_prompt_injection(lurl):
+            continue
+        seen_urls.add(lurl)
+        # Prioritize cross-domain informative links over navigational short words
+        score = (3 if base_host and domain != base_host else 1) + (2 if len(anchor) >= 12 else 0)
+        scored_links.append((score, -idx, {"text": anchor, "url": lurl, "domain": domain}))
+
+    scored_links.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    outbound_links = [item[2] for item in scored_links[: max(1, int(max_links))]]
+    return clean_text, outbound_links, feeds
 
 
 def detect_prompt_injection(text: str) -> list[str]:

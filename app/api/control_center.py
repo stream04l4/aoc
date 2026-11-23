@@ -2747,4 +2747,33 @@ def create_control_center_router(get_runtime) -> APIRouter:
             "items": entries[offset : offset + limit],
         }
 
+    @router.get("/v3/investigations")
+    async def list_investigations_v3(
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = get_runtime()
+        if rt.investigation_manager is None:
+            return {
+                "enabled": False,
+                "active_threads": [],
+                "recent_threads": [],
+                "discovered_channels": [],
+                "stats": {"active_count": 0, "resolved_count": 0, "stalled_count": 0, "channel_count": 0},
+            }
+        all_threads = await rt.investigation_manager.list_threads(active_only=False, limit=40)
+        active_threads = [t for t in all_threads if t.get("stage") not in {"resolved", "closed"}]
+        channels = await rt.investigation_manager.list_discovered_channels(limit=30)
+        return {
+            "enabled": True,
+            "active_threads": active_threads,
+            "recent_threads": all_threads[:20],
+            "discovered_channels": channels,
+            "stats": {
+                "active_count": len(active_threads),
+                "resolved_count": sum(1 for t in all_threads if t.get("stage") == "resolved"),
+                "stalled_count": sum(1 for t in all_threads if t.get("stage") == "stalled"),
+                "channel_count": len(channels),
+            },
+        }
+
     return router

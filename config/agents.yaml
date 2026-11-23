@@ -58,9 +58,9 @@ mcp_servers:
     command: ["${PYTHON}", "-m", "app.tools.builtin_servers", "aoc-mcp-web"]
     tools:
       - tool_name: "web_fetch_readonly"
-        description: "Read-only allowlisted HTTPS web fetch returning clean Markdown excerpt (SSRF/metadata blocked)"
+        description: "Read-only public HTTPS web fetch returning clean Markdown excerpt, outbound_links, and discovered RSS/Atom feeds (SSRF/internal/LLM-host blocked)"
         permission_level: "L0"
-        timeout_seconds: 15.0
+        timeout_seconds: 20.0
         max_output_bytes: 16384
         enabled: true
         input_schema:
@@ -70,6 +70,34 @@ mcp_servers:
           properties:
             url:
               type: string
+            extract_links:
+              type: boolean
+
+  - server_name: "aoc-mcp-search"
+    enabled: true
+    command: ["${PYTHON}", "-m", "app.tools.builtin_servers", "aoc-mcp-search"]
+    tools:
+      - tool_name: "web_search"
+        description: "Read-only general web search returning public HTTPS URLs, titles, and snippets (L0, prompt-injection filtered)"
+        permission_level: "L0"
+        timeout_seconds: 20.0
+        max_output_bytes: 16384
+        enabled: true
+        input_schema:
+          type: object
+          required: ["query"]
+          additionalProperties: false
+          properties:
+            query:
+              type: string
+            max_results:
+              type: integer
+            categories:
+              type: string
+              enum: ["general", "it", "science"]
+            time_range:
+              type: string
+              enum: ["", "day", "month", "year"]
 
   - server_name: "aoc-mcp-fs"
     enabled: true
@@ -125,8 +153,9 @@ mcp_servers:
             limit:
               type: integer
 
+  # V4.2: Disabled in favor of emergent discovery via general web_search + web_fetch_readonly
   - server_name: "aoc-mcp-arxiv"
-    enabled: true
+    enabled: false
     command: ["${PYTHON}", "-m", "app.tools.builtin_servers", "aoc-mcp-arxiv"]
     tools:
       - tool_name: "arxiv_search"

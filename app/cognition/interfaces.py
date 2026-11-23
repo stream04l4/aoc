@@ -69,6 +69,8 @@ class GoalProposal(BaseModel):
     exploration_topic: dict[str, Any] | None = None
     # V4.1: optional proactive outreach to creator Joel ({kind, topic_key, title, message, reason, expected_benefit})
     message_to_human: dict[str, Any] | None = None
+    # V4.2: optional emergent multi-hop investigation action ({action, thread_key?, core_question?, initial_leads?})
+    investigation_action: dict[str, Any] | None = None
     usage: LLMUsage = Field(default_factory=LLMUsage)
 
     @field_validator("predicted_ig")
@@ -145,6 +147,9 @@ class CognitiveContext(BaseModel):
     # V4.1: Pending creator instructions/replies from Telegram + outreach availability flag
     human_guidance: list[dict[str, Any]] = Field(default_factory=list)
     human_outreach_available: bool = False
+    # V4.2: Active multi-hop investigation threads & organically discovered external channels
+    active_investigations: list[dict[str, Any]] = Field(default_factory=list)
+    discovered_channels: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -174,6 +179,8 @@ class EvaluationResult(BaseModel):
     playbook_update: dict[str, Any] | None = None
     # V4.1: Optional milestone report or blocker outreach to creator Joel
     message_to_human: dict[str, Any] | None = None
+    # V4.2: Optional multi-hop investigation progression & emergent channel/feed update
+    investigation_update: dict[str, Any] | None = None
     should_persist_memory: bool = False
     memory_type: str = MemoryType.EPISODIC.value
     memory_importance: float = 0.5

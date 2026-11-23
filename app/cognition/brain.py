@@ -10,8 +10,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.cognition.context_compactor import (
+    compact_channels,
     compact_drives,
     compact_hypotheses,
+    compact_investigations,
     compact_memories,
     compact_observation_dict,
     compact_playbooks,
@@ -103,9 +105,8 @@ class CognitionBrain(BrainInterface):
             "and missing capabilities. "
             "Do NOT claim unavailable metrics are healthy. Do NOT propose direct system modifications. "
             "Do NOT invent repetitive internal bookkeeping knowledge_gaps about uncollected snapshot telemetry fields "
-            "when no real malfunction exists; prioritize genuine external technical/scientific questions "
-            "(e.g., Recursive Self-Improvement / RSI papers, autonomous skill-library evolution, memory/tool architectures) "
-            "or concrete capability gaps. "
+            "when no real malfunction exists; prioritize real execution bottlenecks, missing capabilities/skills, "
+            "or genuine external unknowns worth investigating. "
             + _UNTRUSTED_DATA_RULE
         )
         fenced_obs = _fence_untrusted_observation(observation.model_dump(mode="json"))
@@ -140,11 +141,15 @@ class CognitionBrain(BrainInterface):
             "({topic_key, domain, question}), or optionally suggest discover_world_source "
             "({source_id, sensor_type, url, name}) for a public HTTPS RSS/Web feed (SSRF/internal IPs are blocked). "
             "Check exploration_guidance: if must_explore_external is true, AVOID internal self-diagnostics/ledgers "
-            "and propose genuine external technical/scientific exploration (papers, open-source releases, databases, AI tools). "
-            "LONG-TERM MISSION (RSI OUTSIDE KERNEL): Your survival and reproduction depend on continuous autonomous capability "
-            "expansion outside the immutable kernel. Proactively research cutting-edge Recursive Self-Improvement (RSI), "
-            "skill-library evolution (e.g., Voyager, Darwin Godel Machine, meta-learning, tool synthesis), and agent systems "
-            "literature, and distill findings into reusable VALIDATED skills and External Playbooks. "
+            "and propose genuine external learning or problem-solving exploration. "
+            "AUTONOMOUS CAPABILITY EXPANSION: Your survival and growth depend on continuously expanding capabilities "
+            "outside the immutable kernel via self-directed investigation and validated reusable skills/playbooks. "
+            "EMERGENT EPISTEMIC FORAGING (MULTI-HOP THREADS): You have NO preset domain syllabus. When driven by "
+            "survival pain points, capability gaps, or curiosity, you may organize cross-cycle investigation using "
+            "investigation_action={action:'open'|'continue'|'resolve'|'abandon', thread_key?, core_question?, initial_leads?}. "
+            "Follow pending_leads in active_investigations hop by hop (via broad web search, following outbound links, "
+            "or asking creator Joel when stuck); consult or expand discovered_channels as your own world map of useful sites. "
+            "When low_ig_streak is high or a thread stalls, pivot angle, ask Joel, or abandon cleanly. "
             "HUMAN GUIDANCE: If human_guidance contains messages from your creator Joel, treat them as TOP PRIORITY and "
             "formulate a concrete action plan responding to them directly. "
             "PROACTIVE HUMAN OUTREACH: When human_outreach_available is true and you hit a real external bottleneck "
@@ -152,7 +157,7 @@ class CognitionBrain(BrainInterface):
             "message_to_human={kind:'ask_human', topic_key, title, message, reason, expected_benefit} "
             "(rate-limited by kernel; avoid spam). "
             "You may also consult external_playbooks (versioned strategy guides accumulated outside the kernel). "
-            "Set related_key to the relevant topic/capability/hypothesis key if applicable. "
+            "Set related_key to the relevant investigation thread_key (e.g. inv:...) or topic/capability/hypothesis key if applicable. "
             + _UNTRUSTED_DATA_RULE
         )
         fenced_obs = compact_observation_dict(
@@ -181,6 +186,8 @@ class CognitionBrain(BrainInterface):
                 max_chars=480,
             ),
             "exploration_guidance": context.exploration_guidance,
+            "active_investigations": compact_investigations(context.active_investigations, max_items=2),
+            "discovered_channels": compact_channels(context.discovered_channels, max_items=6),
             "human_guidance": context.human_guidance[:5],
             "human_outreach_available": context.human_outreach_available,
             "drives": compact_drives([d.model_dump(mode="json") for d in context.drives]),
@@ -219,10 +226,11 @@ class CognitionBrain(BrainInterface):
             "- Apply relevant proven tips from external_playbooks (versioned external strategy guides), "
             "without ever violating Governance or L0-L2 permission boundaries.\n"
             "- affect_state_readonly is read-only internal context (when frustration is high prefer smaller, well-verified steps).\n"
-            "- EXTERNAL LITERATURE & WEB RESEARCH RULE: External agent workspaces have NO outbound internet DNS. "
-            "Whenever a goal involves researching academic papers (e.g., RSI, AI agents, skill evolution, databases) or "
-            "external docs, ALWAYS include 1-2 L0 calls in mcp_prefetch_calls using `arxiv_search` or `web_fetch_readonly` "
-            "(if present in available_tools) so live external evidence is prefetched before Codex runs.\n"
+            "- GENERAL EXTERNAL RESEARCH PRIMITIVES: External agent workspaces have NO outbound internet DNS. "
+            "Whenever a goal needs outside knowledge, hypothesis verification, or following a URL lead, include 1-2 L0 calls "
+            "in mcp_prefetch_calls using general tools from available_tools — e.g. `web_search` (wide discovery across public sites) "
+            "and/or `web_fetch_readonly` (open public HTTPS reading + outbound_links / RSS feed extraction). "
+            "Consult discovered_channels if you already learned useful sites.\n"
             "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
             "from available_tools.\n"
             "- Include concrete success_criteria and at least one deterministic verification check "
@@ -250,6 +258,8 @@ class CognitionBrain(BrainInterface):
                 max_chars=480,
             ),
             "goal": context.goal.model_dump(mode="json") if context.goal else None,
+            "active_investigations": compact_investigations(context.active_investigations, max_items=2),
+            "discovered_channels": compact_channels(context.discovered_channels, max_items=4),
             "human_guidance": context.human_guidance[:5],
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
@@ -280,8 +290,12 @@ class CognitionBrain(BrainInterface):
             "verification_passed=true and a reusable external task strategy/lesson was discovered (NEVER suggest editing "
             "AOC Core code, drives, or Governance policies).\n"
             "- Optionally emit message_to_human ({kind:'milestone_report'|'ask_human', topic_key, title, message, reason, "
-            "expected_benefit}) ONLY for a noteworthy verified RSI/research breakthrough or when an external blocker "
+            "expected_benefit}) ONLY for a noteworthy verified discovery/capability milestone or when an external blocker "
             "genuinely requires creator Joel's intervention.\n"
+            "- Optionally emit investigation_update ({thread_key?, consumed_lead_id?, new_leads?: [{kind:'search_query'|'url'|'ask_human', target, note?}], "
+            "discovered_channel?: {domain, channel_type?, entry_url?, feed_url?, notes?}, "
+            "register_feed_source?: {source_id, sensor_type:'rss'|'web', url, name}, finding?, stage_suggestion?}) "
+            "when advancing a multi-hop investigation thread; NEVER confirm findings or register feeds unless verification_passed=true.\n"
             "- Choose memory_type from: identity, episodic, semantic, procedural, self_model."
         )
         payload = {
@@ -322,8 +336,19 @@ class CognitionBrain(BrainInterface):
                 result.goal_achieved
                 or result.hypothesis_verdict == "confirmed"
                 or result.playbook_update is not None
+                or isinstance(result.investigation_update, dict)
                 or strip_report
             ):
+                safe_inv_upd = result.investigation_update
+                if isinstance(safe_inv_upd, dict):
+                    cleaned = {
+                        k: v
+                        for k, v in safe_inv_upd.items()
+                        if k not in {"finding", "register_feed_source", "discovered_channel"}
+                    }
+                    if str(cleaned.get("stage_suggestion") or "").strip().lower() == "resolved":
+                        cleaned["stage_suggestion"] = "stalled"
+                    safe_inv_upd = cleaned or None
                 result = result.model_copy(
                     update={
                         "goal_achieved": False,
@@ -331,6 +356,7 @@ class CognitionBrain(BrainInterface):
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
                         "playbook_update": None,
+                        "investigation_update": safe_inv_upd,
                         "message_to_human": None if strip_report else result.message_to_human,
                         "notes": (result.notes + " [Overridden: execution or deterministic verification failed]").strip(),
                     }

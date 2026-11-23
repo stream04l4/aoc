@@ -89,6 +89,8 @@ class TaskFinalizer:
         playbook_manager: Any = None,
         exploration_manager: Any = None,
         human_bridge: Any = None,
+        investigation_manager: Any = None,
+        world_pipeline: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -109,6 +111,8 @@ class TaskFinalizer:
         self.playbook_manager = playbook_manager
         self.exploration_manager = exploration_manager
         self.human_bridge = human_bridge
+        self.investigation_manager = investigation_manager
+        self.world_pipeline = world_pipeline
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -295,7 +299,18 @@ class TaskFinalizer:
                 eval_res.goal_achieved
                 or eval_res.hypothesis_verdict == "confirmed"
                 or eval_res.playbook_update is not None
+                or isinstance(eval_res.investigation_update, dict)
             ):
+                safe_inv_upd = eval_res.investigation_update
+                if isinstance(safe_inv_upd, dict):
+                    cleaned_inv = {
+                        k: v
+                        for k, v in safe_inv_upd.items()
+                        if k not in {"finding", "register_feed_source", "discovered_channel"}
+                    }
+                    if str(cleaned_inv.get("stage_suggestion") or "").strip().lower() == "resolved":
+                        cleaned_inv["stage_suggestion"] = "stalled"
+                    safe_inv_upd = cleaned_inv or None
                 eval_res = eval_res.model_copy(
                     update={
                         "goal_achieved": False,
@@ -303,6 +318,7 @@ class TaskFinalizer:
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
                         "playbook_update": None,
+                        "investigation_update": safe_inv_upd,
                     }
                 )
 
@@ -692,6 +708,77 @@ class TaskFinalizer:
                 updated_outcome["playbook_evolution"] = playbook_evolution
                 await self.repo.update_task(task_uuid, outcome=updated_outcome)
 
+            # V4.2: Emergent multi-hop investigation progression, feed subscription & stall bounds
+            investigation_outcome: dict[str, Any] | None = None
+            inv_upd = eval_res.investigation_update if isinstance(eval_res.investigation_update, dict) else {}
+            exp_out_inv = goal_dict.get("expected_outcome") or {}
+            rel_key_str = str(goal_dict.get("related_key") or "").strip()
+            inv_thread_key = str(
+                exp_out_inv.get("investigation_thread_key")
+                or inv_upd.get("thread_key")
+                or (rel_key_str if rel_key_str.lower().startswith("inv:") else "")
+            ).strip()
+
+            registered_source_id: str | None = None
+            if (
+                eval_res.goal_achieved
+                and verification_passed
+                and isinstance(inv_upd.get("register_feed_source"), dict)
+                and self.world_pipeline is not None
+            ):
+                req = inv_upd["register_feed_source"]
+                req_sid = str(req.get("source_id") or "").strip()[:80]
+                req_type = str(req.get("sensor_type") or "rss").strip().lower()
+                req_url = str(req.get("url") or "").strip()
+                req_name = str(req.get("name") or req_sid).strip()[:160]
+                if req_sid and req_url:
+                    try:
+                        reg_src = await self.world_pipeline.register_dynamic_source(
+                            source_id=req_sid,
+                            sensor_type=req_type,
+                            name=req_name,
+                            config={"url": req_url, "max_items": 8},
+                            enabled=True,
+                            reliability_score=0.75,
+                            poll_interval_seconds=3600,
+                        )
+                        registered_source_id = reg_src["source_id"]
+                        await self.repo.log_event(
+                            "world.source_registered_emergent",
+                            message=f"Investigation registered public feed source '{registered_source_id}'",
+                            payload={"source_id": registered_source_id, "url": req_url, "thread_key": inv_thread_key},
+                            cycle_id=cycle_uuid,
+                            task_id=task_uuid,
+                        )
+                    except Exception as exc:
+                        logger.warning("finalizer.emergent_feed_register_rejected", source_id=req_sid, error=str(exc))
+
+            if self.investigation_manager is not None and inv_thread_key:
+                try:
+                    cryst_skey = skill_crystallized.get("skill_key") if isinstance(skill_crystallized, dict) else None
+                    pb_dom = (playbook_evolution.get("revision") or {}).get("domain") if isinstance(playbook_evolution, dict) else None
+                    investigation_outcome = await self.investigation_manager.record_hop_outcome(
+                        thread_key=inv_thread_key,
+                        verification_passed=verification_passed,
+                        goal_achieved=eval_res.goal_achieved,
+                        measured_ig=measured_info_gain,
+                        update_spec=inv_upd or None,
+                        registered_source_id=registered_source_id,
+                        skill_key=cryst_skey,
+                        playbook_domain=pb_dom,
+                        cycle_id=cycle_uuid,
+                    )
+                    if investigation_outcome is not None:
+                        updated_outcome["investigation_outcome"] = {
+                            "thread_key": investigation_outcome.get("thread_key"),
+                            "stage": investigation_outcome.get("stage"),
+                            "hops_taken": investigation_outcome.get("hops_taken"),
+                            "stop_reason": investigation_outcome.get("stop_reason"),
+                        }
+                        await self.repo.update_task(task_uuid, outcome=updated_outcome)
+                except Exception as exc:
+                    logger.warning("finalizer.investigation_update_degraded", execution_id=exec_key, error=str(exc))
+
             # V4.1: Rate-limited proactive human outreach after evaluation (blocker ask or verified milestone)
             if self.human_bridge is not None and isinstance(eval_res.message_to_human, dict):
                 try:
@@ -805,6 +892,7 @@ class TaskFinalizer:
                 "memory_writes": memory_writes,
                 "skill_crystallized": skill_crystallized,
                 "playbook_evolution": playbook_evolution or None,
+                "investigation_outcome": updated_outcome.get("investigation_outcome"),
                 "prediction_calibration": prediction_calibration,
                 "finalized_at": now.isoformat(),
             }
@@ -870,6 +958,15 @@ class TaskFinalizer:
             )
             for t in (env.get("unknown_topics") or [])
         ]
+        if self.investigation_manager is not None:
+            try:
+                seen_topics = {g.topic.lower() for g in env_topics}
+                for g in await self.investigation_manager.pending_leads_as_knowledge_gaps(limit=3):
+                    if g.topic.lower() not in seen_topics:
+                        env_topics.append(g)
+                        seen_topics.add(g.topic.lower())
+            except Exception as exc:
+                logger.warning("finalizer.investigation_post_gaps_degraded", error=str(exc))
         since_7d = now - timedelta(days=7)
         proc_count = await self.repo.count_memories(MemoryType.PROCEDURAL.value)
         sem_recent = await self.repo.count_memories(MemoryType.SEMANTIC.value, since=since_7d)
