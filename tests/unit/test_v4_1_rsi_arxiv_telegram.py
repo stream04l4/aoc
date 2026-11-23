@@ -564,3 +564,77 @@ async def test_v4_1_end_to_end_loop_injects_human_guidance_and_enqueues_outreach
     finally:
         await rt.stop()
         await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v4_1_chinese_telegram_formatting_and_brain_language_rule():
+    """Verify all AOC-to-human Telegram alerts render in Chinese and CognitionBrain mandates Simplified Chinese outreach."""
+    from app.cognition.brain import CognitionBrain
+    from app.drives.interfaces import DriveDecision, DriveState
+    from app.notifications.telegram import format_notification_message
+
+    ap_text, ap_kb = format_notification_message(
+        {
+            "kind": "approval_requested",
+            "approval_id": "ap-1",
+            "task_id": "t-1",
+            "permission_level": "L2",
+            "assigned_agent": "codex",
+            "objective": "部署外部技能",
+            "expires_at": "2026-11-23T12:00:00Z",
+            "nonce": "nonce123",
+        }
+    )
+    assert "[AOC L2 审批请求]" in ap_text and "任务目标：部署外部技能" in ap_text
+    assert ap_kb["inline_keyboard"][0][0] == {"text": "同意", "callback_data": "approve:nonce123"}
+    assert ap_kb["inline_keyboard"][0][1] == {"text": "拒绝", "callback_data": "reject:nonce123"}
+
+    assert format_notification_message({"kind": "critical_alert", "message": "磁盘不足", "reason": "low disk"})[0].startswith("[AOC 紧急告警]")
+    assert "[AOC 额度已恢复]" in format_notification_message({"kind": "quota_recovered"})[0]
+    assert "每日额度已刷新" in format_notification_message({"kind": "quota_recovered"})[0]
+    assert format_notification_message({"kind": "lifecycle_paused", "reason": "维护"})[0].startswith("[AOC 已暂停]")
+    tt_text, _ = format_notification_message({"kind": "task_terminal", "status": "SUCCEEDED", "task_id": "t-2", "goal_achieved": True, "summary": "完成"})
+    assert "[AOC 任务结束：SUCCEEDED]" in tt_text and "达成目标：True" in tt_text
+    assert format_notification_message({"message": "普通消息"})[0].startswith("[AOC 通知]")
+
+    seen_prompts: list[tuple[str, str]] = []
+
+    class _SpyGateway:
+        async def complete_structured(self, *, operation: str, system_prompt: str, user_payload: Any, schema_cls: Any):
+            seen_prompts.append((operation, system_prompt))
+            if schema_cls is GoalProposal:
+                return GoalProposal(should_act=False)
+            return EvaluationResult(goal_achieved=True, summary="ok")
+
+    brain = CognitionBrain(_SpyGateway())
+    now = utcnow()
+    obs = Observation(timestamp=now, confidence=1.0)
+    dec = DriveDecision(
+        selected_drive=DriveType.CURIOSITY.value,
+        priority_score=0.5,
+        alternative_drives=[],
+        reason="curiosity",
+        constraints={},
+        timestamp=now,
+        scores={},
+    )
+    await brain.generate_goal(
+        CognitiveContext(
+            observation=obs,
+            drives=[DriveState(drive_type="curiosity", satisfaction=0.5, urgency=0.5, confidence=1.0)],
+            decision=dec,
+            human_outreach_available=True,
+        )
+    )
+    await brain.evaluate(
+        EvaluationContext(
+            goal={"title": "test"},
+            plan={"objective": "test"},
+            execution={"status": "SUCCEEDED"},
+            verification_passed=True,
+            pre_observation=obs,
+            post_observation=obs,
+        )
+    )
+    assert any(op == "generate_goal" and "Simplified Chinese" in sp and "简体中文" in sp for op, sp in seen_prompts)
+    assert any(op == "evaluate" and "Simplified Chinese" in sp and "简体中文" in sp for op, sp in seen_prompts)

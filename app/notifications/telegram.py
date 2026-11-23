@@ -36,24 +36,24 @@ class TelegramAuthError(PermissionError):
 
 
 def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
-    """Render structured notification payload into concise operator text + optional inline keyboard."""
+    """Render structured notification payload into concise Chinese operator text + optional inline keyboard."""
     kind = str(payload.get("kind") or "info")
     if kind == "approval_requested":
         nonce = str(payload.get("nonce") or "")
         text = (
-            f"[AOC L2 Approval Required]\n"
-            f"Approval ID: {payload.get('approval_id')}\n"
-            f"Task ID: {payload.get('task_id')}\n"
-            f"Level: {payload.get('permission_level')} | Agent: {payload.get('assigned_agent')}\n"
-            f"Objective: {payload.get('objective', '')}\n"
-            f"Expires: {payload.get('expires_at', '')}"
+            f"[AOC L2 审批请求]\n"
+            f"审批 ID：{payload.get('approval_id')}\n"
+            f"任务 ID：{payload.get('task_id')}\n"
+            f"权限级别：{payload.get('permission_level')} | 执行体：{payload.get('assigned_agent')}\n"
+            f"任务目标：{payload.get('objective', '')}\n"
+            f"过期时间：{payload.get('expires_at', '')}"
         )
         reply_markup = (
             {
                 "inline_keyboard": [
                     [
-                        {"text": "Approve", "callback_data": f"approve:{nonce}"},
-                        {"text": "Reject", "callback_data": f"reject:{nonce}"},
+                        {"text": "同意", "callback_data": f"approve:{nonce}"},
+                        {"text": "拒绝", "callback_data": f"reject:{nonce}"},
                     ]
                 ]
             }
@@ -84,18 +84,20 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
             parts.append(f"价值：{payload['expected_benefit']}")
         return "\n".join(parts), None
     if kind == "critical_alert":
-        return f"[AOC CRITICAL ALERT]\n{payload.get('message', '')}\nReason: {payload.get('reason', '')}", None
+        return f"[AOC 紧急告警]\n{payload.get('message', '')}\n原因：{payload.get('reason', '')}", None
     if kind == "quota_recovered":
-        return f"[AOC Quota Recovered]\n{payload.get('message', 'Daily quota refreshed; organism resumed.')}", None
+        msg = payload.get("message")
+        body = "每日额度已刷新，系统已恢复运行。" if (not msg or msg == "Daily quota refreshed; organism resumed.") else msg
+        return f"[AOC 额度已恢复]\n{body}", None
     if kind == "lifecycle_paused":
-        return f"[AOC Paused]\nReason: {payload.get('reason', 'operator paused')}", None
+        return f"[AOC 已暂停]\n原因：{payload.get('reason', '管理员暂停')}", None
     if kind == "task_terminal":
         return (
-            f"[AOC Task {payload.get('status', 'DONE')}]\n"
-            f"Task: {payload.get('task_id')} | Achieved: {payload.get('goal_achieved')}\n"
-            f"Summary: {str(payload.get('summary', ''))[:300]}"
+            f"[AOC 任务结束：{payload.get('status', 'DONE')}]\n"
+            f"任务：{payload.get('task_id')} | 达成目标：{payload.get('goal_achieved')}\n"
+            f"摘要：{str(payload.get('summary', ''))[:300]}"
         ), None
-    return f"[AOC Notification] {payload.get('message') or payload}", None
+    return f"[AOC 通知] {payload.get('message') or payload}", None
 
 
 class TelegramNotifier:
@@ -266,7 +268,7 @@ class TelegramWebhookHandler:
             channel="telegram",
         )
         if self.notifier is not None and callback_id:
-            await self.notifier.answer_callback_query(callback_id, f"AOC task {result.get('status')}")
+            await self.notifier.answer_callback_query(callback_id, f"AOC 审批已处理，当前状态：{result.get('status')}")
         return {"ok": True, "action": action, "result": result}
 
 
@@ -357,7 +359,7 @@ class TelegramPoller:
                     )
                     cb_id = str(cb.get("id") or "")
                     if cb_id:
-                        await self.notifier.answer_callback_query(cb_id, f"AOC task {result.get('status')}")
+                        await self.notifier.answer_callback_query(cb_id, f"AOC 审批已处理，当前状态：{result.get('status')}")
                     return {"ok": True, "kind": "approval", "action": action, "result": result}
             return {"ok": True, "ignored": True, "reason": "unsupported_callback"}
 
