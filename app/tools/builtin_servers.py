@@ -25,6 +25,7 @@ import httpx
 from app.perception.world.security import (
     ResponseTooLargeError,
     SSRFBlockedError,
+    _safe_public_https_url,
     detect_prompt_injection,
     html_to_clean_text,
     html_to_clean_text_and_links,
@@ -77,6 +78,78 @@ def _validate_workspace_path(workspace_root: Path, workspace: str, rel_path: str
     return final_target
 
 
+def _parse_rss_or_atom_feed(
+    raw_xml: str,
+    base_url: str,
+    *,
+    blocked_hosts: Sequence[str] = (),
+    max_entries: int = 12,
+) -> tuple[str, list[dict[str, str]]] | None:
+    """Parse Atom or RSS 2.0 XML into a compact multi-entry summary and safe outbound links."""
+    if _XXE_RE.search(raw_xml):
+        raise ValueError("Rejected XML feed containing DOCTYPE/ENTITY declarations")
+
+    root = ET.fromstring(raw_xml)
+    atom_ns = "{http://www.w3.org/2005/Atom}"
+    feed_title = "Feed"
+    raw_entries: list[tuple[str, str, str, str]] = []
+
+    atom_entries = root.findall(f"{atom_ns}entry") or root.findall("entry")
+    if atom_entries:
+        ns = atom_ns if root.find(f"{atom_ns}entry") is not None else ""
+        feed_title = sanitize_external_text(root.findtext(f"{ns}title") or "Atom Feed", max_chars=120) or "Atom Feed"
+        for entry in atom_entries[: max(1, int(max_entries))]:
+            etitle = entry.findtext(f"{ns}title") or ""
+            edate = (entry.findtext(f"{ns}updated") or entry.findtext(f"{ns}published") or "").strip()[:32]
+            elink = ""
+            for lnk in entry.findall(f"{ns}link"):
+                href = (lnk.attrib.get("href") or "").strip()
+                rel = (lnk.attrib.get("rel") or "alternate").strip().lower()
+                if href and rel in {"alternate", ""}:
+                    elink = href
+                    break
+            if not elink:
+                elink = (entry.findtext(f"{ns}link") or entry.findtext(f"{ns}id") or "").strip()
+            esum = entry.findtext(f"{ns}summary") or entry.findtext(f"{ns}content") or ""
+            raw_entries.append((etitle, edate, elink, esum))
+    else:
+        channel = root.find("channel")
+        rss_items = (channel.findall("item") if channel is not None else []) or root.findall("item")
+        if not rss_items:
+            return None
+        ft_raw = (channel.findtext("title") if channel is not None else None) or root.findtext("title") or "RSS Feed"
+        feed_title = sanitize_external_text(ft_raw, max_chars=120) or "RSS Feed"
+        for item in rss_items[: max(1, int(max_entries))]:
+            ititle = item.findtext("title") or ""
+            idate = (item.findtext("pubDate") or "").strip()[:32]
+            ilink = (item.findtext("link") or "").strip()
+            isum = item.findtext("description") or ""
+            raw_entries.append((ititle, idate, ilink, isum))
+
+    lines: list[str] = []
+    outbound_links: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for idx, (r_title, r_date, r_link, r_sum) in enumerate(raw_entries, start=1):
+        etitle = sanitize_external_text(r_title, max_chars=140)
+        esum = sanitize_external_text(r_sum, max_chars=220)
+        if detect_prompt_injection(etitle) or detect_prompt_injection(esum) or detect_prompt_injection(r_link):
+            continue
+        safe_url = ""
+        if r_link:
+            norm = _safe_public_https_url(r_link, base_url, blocked_hosts)
+            if norm:
+                safe_url, domain = norm
+                if len(outbound_links) < 10 and safe_url not in seen_urls:
+                    seen_urls.add(safe_url)
+                    outbound_links.append({"text": etitle or safe_url, "url": safe_url, "domain": domain})
+        lines.append(f"{idx}. {etitle or '(untitled)'} | date={r_date or 'unknown'} | url={safe_url or 'none'} | {esum}")
+
+    if not lines:
+        return None
+    header = f"Feed: {feed_title} (showing {len(lines)} entries)"
+    return header + "\n" + "\n".join(lines), outbound_links
+
+
 async def execute_web_fetch_readonly(
     arguments: dict[str, Any],
     *,
@@ -110,10 +183,34 @@ async def execute_web_fetch_readonly(
 
     raw_text = body.decode("utf-8", errors="replace")
     ctype = headers.get("content-type", "")
-    is_html = "html" in ctype.lower() or "<html" in raw_text[:500].lower()
+    head_snip = raw_text.lstrip()[:200].lower()
+    is_xml_feed = (
+        "xml" in ctype.lower()
+        or "atom" in ctype.lower()
+        or "rss" in ctype.lower()
+        or head_snip.startswith(("<?xml", "<feed", "<rss"))
+    )
+    is_html = (not is_xml_feed) and ("html" in ctype.lower() or "<html" in raw_text[:500].lower())
     outbound_links: list[dict[str, str]] = []
     discovered_feeds: list[dict[str, str]] = []
-    if is_html and extract_links:
+
+    if is_xml_feed:
+        try:
+            parsed_feed = _parse_rss_or_atom_feed(
+                raw_text,
+                final_url,
+                blocked_hosts=blocked_hosts,
+                max_entries=12,
+            )
+        except ET.ParseError:
+            parsed_feed = None
+        if parsed_feed is not None:
+            clean, feed_links = parsed_feed
+            if extract_links:
+                outbound_links = feed_links
+        else:
+            clean = raw_text
+    elif is_html and extract_links:
         clean, outbound_links, discovered_feeds = html_to_clean_text_and_links(
             raw_text,
             base_url=final_url,

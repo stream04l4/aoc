@@ -96,7 +96,7 @@ def _format_mcp_output_for_prefetch(tool_name: str, output: Any) -> str:
     if tool_name == "web_fetch_readonly":
         lines = [
             f"Fetched URL: {output.get('url', '')} (status={output.get('status_code', '')})",
-            f"Excerpt: {str(output.get('markdown_excerpt') or '')[:2200]}",
+            f"Excerpt: {str(output.get('markdown_excerpt') or '')[:5500]}",
         ]
         feeds = list(output.get("discovered_feeds") or [])
         if feeds:
@@ -1613,7 +1613,7 @@ class AutonomousLoop:
 
             # Sanitize & guard against Prompt Injection before surfacing to external Agent
             raw_text = _format_mcp_output_for_prefetch(tool_name, res.output)
-            clean_text = sanitize_external_text(raw_text, max_chars=3600)
+            clean_text = sanitize_external_text(raw_text, max_chars=6500)
             inj_flags = detect_prompt_injection(raw_text) or detect_prompt_injection(clean_text)
             if inj_flags:
                 audit_records.append(

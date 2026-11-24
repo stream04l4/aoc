@@ -87,6 +87,17 @@ class VerificationSpec(BaseModel):
     min_value: int = 1
     keywords: list[str] = Field(default_factory=list)
 
+    @field_validator("kind")
+    @classmethod
+    def _normalize_kind(cls, v: str) -> str:
+        raw = str(v or "").strip().lower()
+        alias_map = {
+            "keywords": "contains_keywords",
+            "contains_keyword": "contains_keywords",
+            "file_contains": "contains_keywords",
+        }
+        return alias_map.get(raw, str(v or "").strip())
+
 
 class ActionPlan(BaseModel):
     should_execute: bool = True
@@ -96,7 +107,7 @@ class ActionPlan(BaseModel):
     assigned_agent: str = "codex"
     required_capability: str = "general_task"
     expected_output: str = ""
-    timeout_seconds: int = 300
+    timeout_seconds: int = 480
     permission_level: str = PermissionLevel.L0.value
     success_criteria: list[str] = Field(default_factory=list)
     verification: list[VerificationSpec] = Field(default_factory=list)
@@ -172,6 +183,7 @@ class EvaluationResult(BaseModel):
     learned_facts: list[str] = Field(default_factory=list)
     acquired_skill: str | None = None
     resolved_topic: str | None = None
+    resolved_topics: list[str] = Field(default_factory=list)
     # V3.1: Lightweight hypothesis verification outcome (confirmed ONLY when verification_passed=True)
     hypothesis_key: str | None = None
     hypothesis_verdict: str | None = None  # confirmed | refuted | inconclusive

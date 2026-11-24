@@ -14,6 +14,7 @@ requiring ZERO in-memory state from the originating cycle.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timedelta
@@ -51,6 +52,60 @@ logger = get_logger("aoc.finalizer")
 
 CONSUMER_NAME = "task_finalizer"
 FinalizedHook = Callable[["FinalizationResult"], Awaitable[None]]
+
+_UNRESOLVED_SUMMARY_RE = re.compile(
+    r"\b(remains_open|keep_open|evidence_missing|missing_evidence|unverifiable|insufficient|channel_absent|not_verified)\b",
+    re.I,
+)
+_GENERIC_TOPIC_TOKENS = frozenset(
+    {
+        "world",
+        "sensor",
+        "rss",
+        "web",
+        "git",
+        "github",
+        "releases",
+        "aoc",
+        "local",
+        "repo",
+        "repository",
+        "read",
+        "only",
+        "feat",
+        "items",
+    }
+)
+
+
+def _match_resolved_world_topics(pre_obs: Observation, goal_title: str, summary: str) -> list[str]:
+    """Match verified research/triage outcomes back to open `world:*` unknown_topics conservatively."""
+    if _UNRESOLVED_SUMMARY_RE.search(summary or ""):
+        return []
+    haystack = f"{goal_title} {summary}".lower()
+    if not haystack.strip():
+        return []
+    unknown = (pre_obs.environment_state or {}).get("unknown_topics") or []
+    matched: list[str] = []
+    for item in unknown:
+        if not isinstance(item, dict):
+            continue
+        tkey = str(item.get("topic") or "").strip()
+        if not tkey.startswith("world:") or tkey in matched:
+            continue
+        title_tok = str(item.get("title") or "").strip().lower()
+        if len(title_tok) < 4 or title_tok not in haystack:
+            continue
+        src_blob = f"{item.get('source') or ''} {tkey}"
+        src_toks = [
+            tok
+            for tok in re.split(r"[^a-z0-9]+", src_blob.lower())
+            if len(tok) >= 3 and tok not in _GENERIC_TOPIC_TOKENS
+        ]
+        if src_toks and not any(tok in haystack for tok in src_toks):
+            continue
+        matched.append(tkey)
+    return matched
 
 
 class FinalizationResult(BaseModel):
@@ -315,6 +370,7 @@ class TaskFinalizer:
                     update={
                         "goal_achieved": False,
                         "resolved_topic": None,
+                        "resolved_topics": [],
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
                         "playbook_update": None,
@@ -356,8 +412,10 @@ class TaskFinalizer:
                         )
                         for r in recent_mems
                     ]
-                resolved_key_preview = eval_res.resolved_topic or (
-                    goal_dict.get("related_key") if selected_drive == DriveType.CURIOSITY.value else None
+                resolved_key_preview = (
+                    eval_res.resolved_topic
+                    or (eval_res.resolved_topics[0] if eval_res.resolved_topics else None)
+                    or (goal_dict.get("related_key") if selected_drive == DriveType.CURIOSITY.value else None)
                 )
                 has_workspace_files = bool(
                     verification_passed and ((exec_row.get("result") or {}).get("workspace_files") or [])
@@ -408,13 +466,23 @@ class TaskFinalizer:
 
                 # Update digital world state ONLY on verified achievement
                 if eval_res.goal_achieved:
-                    resolved_key = eval_res.resolved_topic or (
-                        goal_dict.get("related_key") if selected_drive == DriveType.CURIOSITY.value else None
-                    )
-                    if resolved_key:
+                    keys_to_resolve: list[str] = []
+                    for candidate in [*(eval_res.resolved_topics or []), eval_res.resolved_topic]:
+                        c_str = str(candidate or "").strip()
+                        if c_str and c_str not in keys_to_resolve:
+                            keys_to_resolve.append(c_str)
+                    if verification_passed and selected_drive == DriveType.CURIOSITY.value:
+                        for mk in _match_resolved_world_topics(
+                            pre_obs, str(goal_dict.get("title") or ""), eval_res.summary
+                        ):
+                            if mk not in keys_to_resolve:
+                                keys_to_resolve.append(mk)
+                    if not keys_to_resolve and selected_drive == DriveType.CURIOSITY.value and goal_dict.get("related_key"):
+                        keys_to_resolve.append(str(goal_dict["related_key"]))
+                    for resolved_key in keys_to_resolve:
                         await self.repo.upsert_world_item(
                             kind="knowledge_topic",
-                            key=str(resolved_key),
+                            key=resolved_key,
                             value={"summary": eval_res.summary, "learned_facts": eval_res.learned_facts},
                             status="resolved",
                             source=f"execution:{exec_key}",
@@ -495,10 +563,15 @@ class TaskFinalizer:
                         )
                     )
                 if eval_res.goal_achieved and eval_res.learned_facts:
+                    sem_title = (
+                        eval_res.resolved_topic
+                        or (eval_res.resolved_topics[0] if eval_res.resolved_topics else None)
+                        or goal_dict.get("title", "knowledge")
+                    )
                     items_to_store.append(
                         MemoryItem(
                             memory_type=MemoryType.SEMANTIC.value,
-                            title=eval_res.resolved_topic or goal_dict.get("title", "knowledge"),
+                            title=sem_title,
                             content="\n".join(f"- {f}" for f in eval_res.learned_facts),
                             source=f"execution:{exec_key}",
                             importance=max(eval_res.memory_importance, 0.8),
@@ -790,6 +863,38 @@ class TaskFinalizer:
                         await self.repo.update_task(task_uuid, outcome=updated_outcome)
                 except Exception as exc:
                     logger.warning("finalizer.investigation_update_degraded", execution_id=exec_key, error=str(exc))
+
+            # V4.2.2: Automatically populate discovered_channel map from verified high-IG web_fetch_readonly prefetches
+            if (
+                self.investigation_manager is not None
+                and eval_res.goal_achieved
+                and verification_passed
+                and measured_info_gain >= 0.30
+            ):
+                seen_ch_urls: set[str] = set()
+                for raw_call in plan_dict.get("mcp_prefetch_calls") or []:
+                    if not isinstance(raw_call, dict) or raw_call.get("tool_name") != "web_fetch_readonly":
+                        continue
+                    raw_args = raw_call.get("arguments")
+                    if not isinstance(raw_args, dict):
+                        raw_args = raw_call.get("args")
+                    ch_url = str((raw_args or {}).get("url") or "").strip()
+                    if not ch_url or ch_url in seen_ch_urls:
+                        continue
+                    seen_ch_urls.add(ch_url)
+                    try:
+                        await self.investigation_manager.record_discovered_channel(
+                            {
+                                "entry_url": ch_url,
+                                "notes": (
+                                    f"Verified high-IG ({measured_info_gain:.2f}) source for: "
+                                    f"{str(goal_dict.get('title') or '')[:120]}"
+                                ),
+                            },
+                            source=f"prefetch:{exec_key}",
+                        )
+                    except Exception as exc:
+                        logger.warning("finalizer.discovered_channel_degraded", url=ch_url, error=str(exc))
 
             # V4.1: Rate-limited proactive human outreach after evaluation (blocker ask or verified milestone)
             if self.human_bridge is not None and isinstance(eval_res.message_to_human, dict):

@@ -1032,3 +1032,397 @@ async def test_v4_2_1_world_item_long_key_truncation_and_dedup_drive_rotation(tm
         await rt.stop()
         await db.dispose()
 
+
+@pytest.mark.asyncio
+async def test_v4_2_2_verification_spec_keywords_alias_and_preflight():
+    """Verify VerificationSpec normalizes safe 'keywords' alias to 'contains_keywords' while unknown kinds fail-close."""
+    from app.cognition.preflight import ActionPreflight
+
+    pf = ActionPreflight(max_task_timeout_seconds=600)
+    plan_alias = ActionPlan(
+        should_execute=True,
+        goal_title="Verify alias",
+        objective="Produce report.json with key findings",
+        assigned_agent="codex",
+        permission_level="L1",
+        verification=[
+            VerificationSpec(kind="keywords", target="report.json", keywords=["ssrf", "guardrail"]),
+        ],
+    )
+    assert plan_alias.timeout_seconds == 480
+    assert plan_alias.verification[0].kind == "contains_keywords"
+    assert AgentTask(task_id="t1", objective="op", assigned_agent="codex", workspace="/tmp/ws").timeout_seconds == 480
+    res_ok = pf.validate(plan=plan_alias)
+    assert res_ok.decision == "ACCEPT"
+
+    plan_bad = ActionPlan(
+        should_execute=True,
+        goal_title="Invalid check kind",
+        objective="Run task",
+        assigned_agent="codex",
+        permission_level="L1",
+        verification=[VerificationSpec(kind="run_arbitrary_shell", target="x")],
+    )
+    res_bad = pf.validate(plan=plan_bad)
+    assert res_bad.decision == "REJECT"
+    assert "INVALID_VERIFICATION_SPEC" in res_bad.reason_codes
+
+
+@pytest.mark.asyncio
+async def test_v4_2_2_web_fetch_sidebar_strip_main_priority_and_atom_feed_parsing():
+    """Verify HTML sidebar stripping + <main> priority and Atom/RSS multi-entry XML parsing + XXE guard."""
+    from app.perception.world.security import html_to_clean_text_and_links
+
+    main_body = " ".join(f"Authoritative documentation paragraph sentence {i} about SSRF protection." for i in range(1, 10))
+    noisy_html = f"""
+    <html>
+      <body>
+        <header>Global Top Banner Navigation</header>
+        <div class="sphinxsidebar" role="navigation">
+          <ul><li>Sidebar Toc Link 1</li><li>Sidebar Toc Link 2</li></ul>
+        </div>
+        <aside>Related Ads</aside>
+        <main><article><p>{main_body}</p></article></main>
+        <footer>Copyright Footer Noise</footer>
+      </body>
+    </html>
+    """
+    clean, _links, _feeds = html_to_clean_text_and_links(noisy_html, base_url="https://docs.example.org/page")
+    assert "Authoritative documentation paragraph sentence 1" in clean
+    assert "Sidebar Toc Link 1" not in clean
+    assert "Global Top Banner Navigation" not in clean
+    assert "Related Ads" not in clean
+    assert "Copyright Footer Noise" not in clean
+
+    entries_xml = "\n".join(
+        f"""
+        <entry>
+          <title>v1.110.{i}</title>
+          <updated>2026-11-{i:02d}T10:00:00Z</updated>
+          <link rel="alternate" href="https://github.com/BerriAI/litellm/releases/tag/v1.110.{i}" />
+          <summary>Release notes summary for v1.110.{i}</summary>
+        </entry>"""
+        for i in range(1, 13)
+    )
+    atom_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Release notes from litellm</title>
+      {entries_xml}
+    </feed>
+    """
+
+    def _handler(req: httpx.Request) -> httpx.Response:
+        if "xxe" in str(req.url):
+            return httpx.Response(200, headers={"content-type": "application/atom+xml"}, text='<!DOCTYPE foo [<!ENTITY x "y">]><feed/>')
+        return httpx.Response(200, headers={"content-type": "application/atom+xml; charset=utf-8"}, text=atom_xml)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+        out = await execute_web_fetch_readonly(
+            {"url": "https://github.com/BerriAI/litellm/releases.atom", "extract_links": True},
+            allowed_domains=[],
+            open_public_https=True,
+            blocked_hosts=["80.158.109.51"],
+            http_client=client,
+            resolver=_pub_resolver,
+        )
+        assert "Feed: Release notes from litellm (showing 12 entries)" in out["markdown_excerpt"]
+        for i in range(1, 13):
+            assert f"v1.110.{i}" in out["markdown_excerpt"]
+        assert len(out["outbound_links"]) == 10
+
+        with pytest.raises(ValueError, match="DOCTYPE/ENTITY"):
+            await execute_web_fetch_readonly(
+                {"url": "https://github.com/BerriAI/litellm/xxe.atom"},
+                allowed_domains=[],
+                open_public_https=True,
+                blocked_hosts=[],
+                http_client=client,
+                resolver=_pub_resolver,
+            )
+
+
+@pytest.mark.asyncio
+async def test_v4_2_2_finalizer_closes_matched_world_topics_and_records_discovered_channels(tmp_path: Path):
+    """Verify TaskFinalizer resolves matched open world:* topics, handles unresolved negative guards, and records high-IG channels."""
+    from app.core.enums import TaskStatus
+    from app.drives.engine import DriveEngine
+    from app.governance.policy import GovernanceManager
+    from app.memory.experience_manager import ExperienceManager
+    from app.orchestration.finalizer import TaskFinalizer
+    from app.perception.interfaces import Observation
+    from app.perception.manager import SensorManager
+
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'v422_fin.db'}")
+    await _init_db(db)
+    try:
+        repo = StateRepository(db)
+        ident = await repo.get_or_create_identity("AOC-001", "1.0.0", {})
+        org_id = ident["id"]
+        gov = GovernanceManager(GovernanceSettings(workspace_root=str(tmp_path / "ws")), repo)
+        inv_mgr = InvestigationManager(repo=repo)
+        sensor_mgr = SensorManager(repo=repo)
+
+        # Seed open world:* topics
+        await repo.upsert_world_item(
+            kind="knowledge_topic",
+            key="world:rss-github-litellm-releases-v1-110-3:6859d819",
+            value={"title": "v1.110.3", "source_id": "rss-github-litellm-releases"},
+            status="open",
+            source="world_sensor:rss-github-litellm-releases",
+        )
+        await repo.upsert_world_item(
+            kind="knowledge_topic",
+            key="world:rss-github-mcp-releases-v2-0-0:11111111",
+            value={"title": "v2.0.0", "source_id": "rss-github-mcp-releases"},
+            status="open",
+            source="world_sensor:rss-github-mcp-releases",
+        )
+        await repo.upsert_world_item(
+            kind="knowledge_topic",
+            key="world:rss-github-litellm-releases-v1-109-4:0c130915",
+            value={"title": "v1.109.4", "source_id": "rss-github-litellm-releases"},
+            status="open",
+            source="world_sensor:rss-github-litellm-releases",
+        )
+
+        pre_obs = Observation(
+            timestamp=utcnow(),
+            confidence=1.0,
+            environment_state={
+                "unknown_topics": [
+                    {
+                        "topic": "world:rss-github-litellm-releases-v1-110-3:6859d819",
+                        "title": "v1.110.3",
+                        "source": "world_sensor:rss-github-litellm-releases",
+                    },
+                    {
+                        "topic": "world:rss-github-mcp-releases-v2-0-0:11111111",
+                        "title": "v2.0.0",
+                        "source": "world_sensor:rss-github-mcp-releases",
+                    },
+                    {
+                        "topic": "world:rss-github-litellm-releases-v1-109-4:0c130915",
+                        "title": "v1.109.4",
+                        "source": "world_sensor:rss-github-litellm-releases",
+                    },
+                ]
+            },
+        )
+
+        eval_queue: list[EvaluationResult] = [
+            EvaluationResult(
+                goal_achieved=True,
+                summary="Verified LiteLLM v1.110.3 release notes and classified as relevant to gateway.",
+                information_gain=0.52,
+                learned_facts=["LiteLLM v1.110.3 includes MCP gateway DCR opt-in backport."],
+                resolved_topics=["world:explicit-extra-topic"],
+                should_persist_memory=True,
+            ),
+            EvaluationResult(
+                goal_achieved=True,
+                summary="Checked LiteLLM v1.109.4 metadata; status remains_open due to missing_evidence.",
+                information_gain=0.45,
+                learned_facts=["LiteLLM v1.109.4 requires further evidence."],
+                should_persist_memory=True,
+            ),
+        ]
+
+        class _FakeEvalBrain(BrainInterface):
+            async def assess(self, observation, memories, drives):
+                return AssessmentResult(summary="ok")
+
+            async def generate_goal(self, context):
+                return GoalProposal(should_act=False)
+
+            async def plan(self, context):
+                return ActionPlan(should_execute=False)
+
+            async def evaluate(self, context):
+                return eval_queue.pop(0)
+
+        finalizer = TaskFinalizer(
+            organism_id=org_id,
+            repo=repo,
+            perception=sensor_mgr,
+            drives=DriveEngine(get_drive_config()),
+            brain=_FakeEvalBrain(),
+            governance=gov,
+            memory=ExperienceManager(repo=repo, backend=None),
+            investigation_manager=inv_mgr,
+        )
+
+        # Case 1: Positive verified triage closes matched v1.110.3 + explicit topic, leaves MCP untouched, records channel
+        cid1, _ = await repo.start_cycle(org_id, "ACTIVE")
+        gid1 = await repo.create_goal(
+            org_id,
+            cid1,
+            drive_type="curiosity",
+            title="Triage LiteLLM v1.110.3 release",
+            related_key="inv:litellm_triage",
+            status="ACTIVE",
+        )
+        plan1 = ActionPlan(
+            should_execute=True,
+            goal_title="Triage LiteLLM v1.110.3",
+            objective="Analyze LiteLLM v1.110.3",
+            assigned_agent="codex",
+            permission_level="L1",
+            mcp_prefetch_calls=[
+                {
+                    "tool_name": "web_fetch_readonly",
+                    "arguments": {"url": "https://github.com/BerriAI/litellm/releases/tag/v1.110.3"},
+                }
+            ],
+        )
+        ver1 = await gov.validate_plan(plan1, "curiosity")
+        pid1 = await repo.create_plan(goal_id=gid1, cycle_id=cid1, plan=plan1, permission_level="L1", verdict=ver1, status="APPROVED")
+        ws1 = gov.prepare_workspace("v422-case1")
+        tid1 = await repo.create_task(
+            plan_id=pid1,
+            goal_id=gid1,
+            cycle_id=cid1,
+            objective="Analyze LiteLLM v1.110.3",
+            assigned_agent="codex",
+            workspace=ws1,
+            timeout_seconds=480,
+            resource_budget={},
+            permission_level="L1",
+            success_criteria=["done"],
+            verification=[{"kind": "non_empty_output"}],
+            status=TaskStatus.SUCCEEDED.value,
+        )
+        eid1 = await repo.create_execution(tid1, "codex", "SUCCEEDED")
+        await repo.update_execution(eid1, stdout="LiteLLM v1.110.3 analysis complete", result={"summary": "ok"})
+
+        res1 = await finalizer.finalize_execution(eid1, pre_obs_override=pre_obs, llm_available_override=True)
+        assert res1.goal_achieved is True
+
+        topics = {x["key"]: x["status"] for x in await repo.list_world_items(kind="knowledge_topic")}
+        assert topics["world:explicit-extra-topic"] == "resolved"
+        assert topics["world:rss-github-litellm-releases-v1-110-3:6859d819"] == "resolved"
+        assert topics["world:rss-github-mcp-releases-v2-0-0:11111111"] == "open"
+        channels = await inv_mgr.list_discovered_channels()
+        assert len(channels) == 1 and channels[0]["domain"] == "github.com"
+
+        # Case 2: Negative guard prevents closing v1.109.4 when summary says remains_open / missing_evidence
+        cid2, _ = await repo.start_cycle(org_id, "ACTIVE")
+        gid2 = await repo.create_goal(
+            org_id,
+            cid2,
+            drive_type="curiosity",
+            title="Check LiteLLM v1.109.4",
+            related_key="inv:litellm_1094",
+            status="ACTIVE",
+        )
+        ver2 = await gov.validate_plan(ActionPlan(objective="Check", permission_level="L0"), "curiosity")
+        pid2 = await repo.create_plan(goal_id=gid2, cycle_id=cid2, plan=ActionPlan(objective="Check"), permission_level="L0", verdict=ver2, status="APPROVED")
+        tid2 = await repo.create_task(
+            plan_id=pid2,
+            goal_id=gid2,
+            cycle_id=cid2,
+            objective="Check",
+            assigned_agent="codex",
+            workspace=ws1,
+            timeout_seconds=480,
+            resource_budget={},
+            permission_level="L0",
+            success_criteria=["done"],
+            verification=[{"kind": "non_empty_output"}],
+            status=TaskStatus.SUCCEEDED.value,
+        )
+        eid2 = await repo.create_execution(tid2, "codex", "SUCCEEDED")
+        await repo.update_execution(eid2, stdout="Checked LiteLLM v1.109.4 missing evidence", result={"summary": "missing_evidence"})
+        await finalizer.finalize_execution(eid2, pre_obs_override=pre_obs, llm_available_override=True)
+
+        topics2 = {x["key"]: x["status"] for x in await repo.list_world_items(kind="knowledge_topic")}
+        assert topics2["world:rss-github-litellm-releases-v1-109-4:0c130915"] == "open"
+    finally:
+        await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v4_2_2_orchestrator_timeout_single_retry_and_500s_boost(tmp_path: Path):
+    """Verify timeout retries are capped at 1 retry (2 attempts total) and boost timeout_seconds up to 500s."""
+    from app.core.config import BudgetSettings
+    from app.core.enums import ExecutionStatus, TaskStatus
+    from app.governance.policy import GovernanceManager
+    from app.orchestration.orchestrator import AgentOrchestrator
+
+    class _SlowTimeoutAgent(AgentInterface):
+        def __init__(self) -> None:
+            self._cap = AgentCapability(
+                agent_id="codex-slow",
+                name="Slow Codex",
+                agent_type="cli",
+                capabilities=["coding"],
+                supported_modes=["read-only", "workspace-write"],
+                enabled=True,
+            )
+            self.calls = 0
+            self.seen_timeouts: list[int] = []
+
+        @property
+        def capability(self) -> AgentCapability:
+            return self._cap
+
+        async def probe(self) -> AgentProbeResult:
+            return AgentProbeResult(ok=True, binary="codex-slow", version="test")
+
+        async def execute(self, task: AgentTask) -> AgentExecution:
+            self.calls += 1
+            self.seen_timeouts.append(task.timeout_seconds)
+            return AgentExecution(
+                execution_id=task.execution_id or f"ex-{self.calls}",
+                task_id=task.task_id,
+                agent_id=self._cap.agent_id,
+                status=ExecutionStatus.TIMEOUT.value,
+                completed_at=utcnow(),
+                error=f"Execution timed out after {task.timeout_seconds}s",
+            )
+
+        async def get_status(self, execution_id: str) -> AgentStatus:
+            return AgentStatus(execution_id=execution_id, agent_id=self._cap.agent_id, status=ExecutionStatus.TIMEOUT.value)
+
+        async def cancel(self, execution_id: str) -> bool:
+            return True
+
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'v422_orch.db'}")
+    await _init_db(db)
+    try:
+        repo = StateRepository(db)
+        reg = AgentRegistry(repo=repo)
+        slow_agent = _SlowTimeoutAgent()
+        reg.register(slow_agent)
+        await reg.probe_all()
+
+        gov = GovernanceManager(
+            GovernanceSettings(
+                workspace_root=str(tmp_path / "ws"),
+                budget=BudgetSettings(max_task_timeout_seconds=600),
+            ),
+            repo,
+        )
+        orch = AgentOrchestrator(reg, gov, repo, max_retries=2)
+
+        plan = ActionPlan(
+            should_execute=True,
+            goal_title="Slow coding task",
+            objective="Run coding work",
+            assigned_agent="codex-slow",
+            required_capability="coding",
+            timeout_seconds=240,
+            permission_level="L1",
+        )
+        verdict = await gov.validate_plan(plan, "curiosity")
+        submitted = await orch.submit_plan(plan, verdict)
+        final = await orch.wait_for_task(submitted["task_id"], max_wait_seconds=5.0, poll_interval=0.05)
+
+        assert final["status"] == TaskStatus.FAILED.value
+        assert slow_agent.calls == 2  # Capped at 1 retry (2 total) even though max_retries=2
+        assert slow_agent.seen_timeouts == [240, 500]
+        retry_logs = [d for d in await repo.list_decisions(limit=20) if d["decision_type"] == "agent_fallback_retry"]
+        assert retry_logs and retry_logs[0]["payload"]["boosted_timeout_seconds"] == 500
+    finally:
+        await db.dispose()
+
+

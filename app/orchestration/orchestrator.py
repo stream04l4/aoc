@@ -729,6 +729,8 @@ class AgentOrchestrator:
         fail_reason = execution.error or verification.summary
         attempt = int(task_row["attempt"])
         max_attempts = int(task_row["max_attempts"])
+        is_timeout = execution.status == ExecutionStatus.TIMEOUT.value
+        effective_max_attempts = min(max_attempts, 2) if is_timeout else max_attempts
         tried = set(task_row.get("tried_agents") or [])
         sandbox_mode = (task_row.get("resource_budget") or {}).get("sandbox_mode", "read-only")
 
@@ -738,11 +740,11 @@ class AgentOrchestrator:
             agent=execution.agent_id,
             status=execution.status,
             attempt=attempt,
-            max_attempts=max_attempts,
+            max_attempts=effective_max_attempts,
             reason=fail_reason,
         )
 
-        if attempt < max_attempts:
+        if attempt < effective_max_attempts:
             # Prefer switching to an untried healthy agent via explainable AgentRouter; otherwise retry same healthy agent
             cycle_uuid = uuid.UUID(task_row["cycle_id"]) if task_row.get("cycle_id") else None
             alt, _ = await self.router.select(
@@ -763,6 +765,22 @@ class AgentOrchestrator:
                     log_decision=True,
                 )
             if next_adapter is not None:
+                boosted_timeout: int | None = None
+                if is_timeout:
+                    max_budget_t = int(
+                        getattr(
+                            getattr(getattr(self.governance, "settings", None), "budget", None),
+                            "max_task_timeout_seconds",
+                            600,
+                        )
+                        or 600
+                    )
+                    cur_t = int(task_row.get("timeout_seconds") or 300)
+                    target_t = min(max_budget_t, max(cur_t, 500))
+                    if target_t > cur_t:
+                        boosted_timeout = target_t
+                        await self.repo.update_task(task_uuid, timeout_seconds=boosted_timeout)
+
                 # V2.1 P0-1: explicitly finalize superseded retry attempt at execution level
                 superseded_ver = dict(verification.model_dump(mode="json"))
                 superseded_ver["superseded_by_retry"] = True
@@ -794,17 +812,20 @@ class AgentOrchestrator:
                     reason=f"re-queued for attempt {attempt + 1} on '{next_adapter.capability.agent_id}'",
                     idempotency_key=f"requeue:{execution.execution_id}",
                 )
+                retry_payload: dict[str, Any] = {
+                    "task_id": str(task_uuid),
+                    "attempt": attempt + 1,
+                    "retry_backoff_multiplier": round(backoff_mult, 4),
+                    "backoff_seconds": backoff_seconds,
+                }
+                if boosted_timeout is not None:
+                    retry_payload["boosted_timeout_seconds"] = boosted_timeout
                 await self.repo.log_decision(
                     decision_type="agent_fallback_retry",
                     selected=next_adapter.capability.agent_id,
                     alternatives=sorted(tried),
                     reason=f"Previous attempt {attempt} on '{execution.agent_id}' failed ({fail_reason}); retrying on '{next_adapter.capability.agent_id}'",
-                    payload={
-                        "task_id": str(task_uuid),
-                        "attempt": attempt + 1,
-                        "retry_backoff_multiplier": round(backoff_mult, 4),
-                        "backoff_seconds": backoff_seconds,
-                    },
+                    payload=retry_payload,
                     cycle_id=cycle_uuid,
                 )
                 await self._launch_attempt(task_uuid, next_adapter.capability.agent_id, sandbox_mode, cycle_id=cycle_uuid)

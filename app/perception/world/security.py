@@ -271,12 +271,26 @@ async def safe_http_fetch(
             await client.aclose()
 
 
+_SKIP_TAGS = frozenset({"script", "style", "noscript", "svg", "nav", "footer", "header", "aside"})
+_VOID_TAGS = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+)
+_NOISE_ROLES = frozenset({"navigation", "banner", "complementary", "contentinfo"})
+_NOISE_CLASS_RE = re.compile(
+    r"(?:^|[\s_-])(sidebar|sphinxsidebar|toctree|toc|navbar|breadcrumb|breadcrumbs|menu|nav-links|bd-sidebar)(?:$|[\s_-])",
+    re.I,
+)
+
+
 class _TextExtractor(HTMLParser):
     def __init__(self, base_url: str = "") -> None:
         super().__init__()
         self._base_url = (base_url or "").strip()
         self._skip_depth = 0
+        self._main_depth = 0
+        self._tag_stack: list[tuple[str, bool, bool]] = []
         self._parts: list[str] = []
+        self._main_parts: list[str] = []
         self._cur_href: str | None = None
         self._cur_anchor: list[str] = []
         self.raw_links: list[tuple[str, str]] = []
@@ -291,9 +305,20 @@ class _TextExtractor(HTMLParser):
             href = attr_map.get("href", "").strip()
             if href and "alternate" in rel and ("rss+xml" in ltype or "atom+xml" in ltype):
                 self.raw_feeds.append((attr_map.get("title", "").strip(), href))
-        if t in {"script", "style", "noscript", "svg", "nav", "footer"}:
+        if t in _VOID_TAGS:
+            return
+
+        role = attr_map.get("role", "").strip().lower()
+        cls_id = f"{attr_map.get('class', '')} {attr_map.get('id', '')}".strip()
+        added_skip = (t in _SKIP_TAGS) or (role in _NOISE_ROLES) or bool(cls_id and _NOISE_CLASS_RE.search(cls_id))
+        added_main = t in {"main", "article"}
+        self._tag_stack.append((t, added_skip, added_main))
+        if added_skip:
             self._skip_depth += 1
-        elif t == "a" and self._skip_depth == 0:
+        if added_main:
+            self._main_depth += 1
+
+        if t == "a" and self._skip_depth == 0:
             href = attr_map.get("href", "").strip()
             if href:
                 self._cur_href = href
@@ -306,18 +331,32 @@ class _TextExtractor(HTMLParser):
             self.raw_links.append((anchor, self._cur_href))
             self._cur_href = None
             self._cur_anchor = []
-        if t in {"script", "style", "noscript", "svg", "nav", "footer"} and self._skip_depth > 0:
-            self._skip_depth -= 1
+        if t in _VOID_TAGS or not self._tag_stack:
+            return
+        for idx in range(len(self._tag_stack) - 1, -1, -1):
+            if self._tag_stack[idx][0] == t:
+                for _, was_skip, was_main in reversed(self._tag_stack[idx:]):
+                    if was_skip and self._skip_depth > 0:
+                        self._skip_depth -= 1
+                    if was_main and self._main_depth > 0:
+                        self._main_depth -= 1
+                del self._tag_stack[idx:]
+                break
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth == 0:
             txt = data.strip()
             if txt:
                 self._parts.append(txt)
+                if self._main_depth > 0:
+                    self._main_parts.append(txt)
                 if self._cur_href is not None:
                     self._cur_anchor.append(txt)
 
     def text(self) -> str:
+        main_txt = " ".join(self._main_parts)
+        if len(main_txt) >= 200:
+            return main_txt
         return " ".join(self._parts)
 
 

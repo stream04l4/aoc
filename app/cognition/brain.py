@@ -152,8 +152,11 @@ class CognitionBrain(BrainInterface):
             "When low_ig_streak is high or a thread stalls, pivot angle, ask Joel, or abandon cleanly. "
             "HUMAN GUIDANCE: If human_guidance contains messages from your creator Joel, treat them as TOP PRIORITY and "
             "formulate a concrete action plan responding to them directly. "
-            "AVAILABLE MCP TOOLS: `available_tools` lists the kernel-guarded L0/L1 MCP tools (such as `web_search` and "
-            "`web_fetch_readonly`) usable during `plan` prefetch even though external agent sandboxes have no direct outbound DNS. "
+            "AVAILABLE MCP TOOLS: `available_tools` lists the kernel-guarded L0/L1 MCP tools (`web_search`, "
+            "`web_fetch_readonly`, `git_docs_search`, `workspace_filesystem`). IMPORTANT: they are executed BY THE AOC KERNEL "
+            "via `ActionPlan.mcp_prefetch_calls` BEFORE dispatching Codex (injected into Codex's prompt as "
+            "`[Read-Only MCP Prefetched Context]`) — they are NOT CLI binaries on Codex's shell PATH. Never create goals "
+            "asking Codex to probe PATH for `git_docs_search`. "
             "PROACTIVE HUMAN OUTREACH: When human_outreach_available is true and you hit a real external bottleneck "
             "(e.g., needing outbound access, credentials, a new tool, or strategic clarification), you may optionally set "
             "message_to_human={kind:'ask_human', topic_key, title, message, reason, expected_benefit} "
@@ -232,17 +235,18 @@ class CognitionBrain(BrainInterface):
             "- Apply relevant proven tips from external_playbooks (versioned external strategy guides), "
             "without ever violating Governance or L0-L2 permission boundaries.\n"
             "- affect_state_readonly is read-only internal context (when frustration is high prefer smaller, well-verified steps).\n"
-            "- GENERAL EXTERNAL RESEARCH PRIMITIVES: External agent workspaces have NO outbound internet DNS. "
-            "Whenever a goal needs outside knowledge, hypothesis verification, or following a URL lead, include 1-2 L0 calls "
-            "in mcp_prefetch_calls using exact shape `[{\"tool_name\": \"<name>\", \"arguments\": {<params>}}]` (use key "
-            "\"arguments\", NOT \"args\") from available_tools — e.g. `web_search` (wide discovery across public sites) "
-            "and/or `web_fetch_readonly` (open public HTTPS reading + outbound_links / RSS feed extraction). "
-            "Consult discovered_channels if you already learned useful sites.\n"
-            "- For read-only pre-inspection you may optionally include up to 2 L0 calls in mcp_prefetch_calls "
-            "(`[{\"tool_name\": \"<name>\", \"arguments\": {<params>}}]`) from available_tools.\n"
-            "- Include concrete success_criteria and at least one deterministic verification check "
-            "(e.g. kind='non_empty_output' or kind='file_exists' with target='result.md' or kind='min_output_chars').\n"
-            "- Keep timeout_seconds realistic (60-300s) and within budget.\n"
+            "- GENERAL EXTERNAL & REPO PREFETCH PRIMITIVES: External agent workspaces have NO outbound internet DNS and do NOT "
+            "have MCP tools on PATH. Whenever a goal needs outside knowledge, URL reading, or local allowlisted AOC repo evidence, "
+            "include 1-2 L0 calls in `mcp_prefetch_calls` (`[{\"tool_name\": \"<name>\", \"arguments\": {<params>}}]`, use key "
+            "\"arguments\", NOT \"args\") from `available_tools` — e.g. `web_search`, `web_fetch_readonly`, or `git_docs_search` "
+            "(action=`git_log`|`grep`|`read_doc`) so the kernel injects `[Read-Only MCP Prefetched Context]` before Codex runs. "
+            "Consult `discovered_channels` if you already learned useful sites.\n"
+            "- LEAN DELIVERABLE RULE: Keep each Codex task focused and lean so it completes reliably without hitting timeout: "
+            "for research, triage, or verification hops, request 1-2 small files (e.g. `report.json` or `result.md`) rather than "
+            "multi-file boilerplate + large test suites; reserve `skill.py` + concise `test_skill.py` for genuine reusable skill creation.\n"
+            "- Include concrete success_criteria and deterministic verification check(s) using ONLY exact allowed kinds: "
+            "`non_empty_output`, `file_exists`, `min_output_chars`, `contains_keywords` (NEVER emit `kind='keywords'`).\n"
+            "- Keep timeout_seconds realistic (180-500s; use 420-500s for coding/test or multi-source synthesis tasks) and within budget.\n"
             "- Never delegate open-ended infinite exploration."
         )
         plan_query = " ".join(
@@ -290,7 +294,8 @@ class CognitionBrain(BrainInterface):
             "- If execution failed/timed out OR verification_passed is false, you MUST set goal_achieved=false.\n"
             "- Estimate information_gain (0..1) honestly based on actual new knowledge produced.\n"
             "- Extract concise learned_facts (semantic knowledge) and acquired_skill (if a reusable skill/procedure was created).\n"
-            "- Set resolved_topic ONLY if the topic was genuinely researched and verified.\n"
+            "- Set `resolved_topic` (and/or `resolved_topics` list if multiple open topics in `pre_observation_summary.environment_state.unknown_topics` "
+            "were researched/triaged, using their exact `topic` keys like `world:rss-...` or `world:git-...`) ONLY when genuinely verified.\n"
             "- If the task tested a hypothesis, set hypothesis_key and hypothesis_verdict ('confirmed'|'refuted'|'inconclusive') "
             "ONLY when backed by observed execution evidence (NEVER mark confirmed if verification_passed is false).\n"
             "- Optionally emit playbook_update ({domain, content, change_summary}) ONLY when goal_achieved=true and "
@@ -361,6 +366,7 @@ class CognitionBrain(BrainInterface):
                     update={
                         "goal_achieved": False,
                         "resolved_topic": None,
+                        "resolved_topics": [],
                         "acquired_skill": None,
                         "hypothesis_verdict": None,
                         "playbook_update": None,

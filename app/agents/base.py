@@ -41,7 +41,7 @@ class AgentTask(BaseModel):
     assigned_agent: str
     expected_output: str = ""
     workspace: str
-    timeout_seconds: int = 300
+    timeout_seconds: int = 480
     resource_budget: dict[str, Any] = Field(default_factory=dict)
     permission_level: str = "L0"
     success_criteria: list[str] = Field(default_factory=list)
@@ -174,6 +174,7 @@ def build_agent_prompt(task: AgentTask) -> str:
         f"- Work ONLY inside the current workspace directory ({task.workspace}).\n"
         f"- Permission level: {task.permission_level} (sandbox: {task.sandbox_mode}).\n"
         f"- Do NOT access or modify files outside this workspace, system configs, credentials, or databases.\n"
+        f"- Work concisely and directly: avoid redundant exploratory shell commands, write required deliverables in 1-2 clean steps, and finish well within the timeout.\n"
         f"- Complete within {task.timeout_seconds} seconds."
     )
 
