@@ -100,6 +100,7 @@ class DriveContext(BaseModel):
     # survival
     recent_execution_statuses: list[str] = Field(default_factory=list)
     budget: dict[str, Any] = Field(default_factory=dict)  # tasks_used, tasks_limit, tokens_used, tokens_limit
+    entropy_metrics: dict[str, float] = Field(default_factory=dict)  # objective runtime entropy metrics (V5 M2)
 
     # reproduction (V2.0 P1-7: evidence-driven capabilities & validated skills only)
     capabilities_acquired: list[str] = Field(default_factory=list)

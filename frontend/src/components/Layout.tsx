@@ -7,6 +7,7 @@ import {
   Database,
   Globe,
   Fingerprint,
+  GitBranch,
   Shield,
   SlidersHorizontal,
   ScrollText,
@@ -28,6 +29,7 @@ export type NavPage =
   | 'memory'
   | 'world'
   | 'self-model'
+  | 'evolution'
   | 'governance'
   | 'config'
   | 'logs';
@@ -52,6 +54,7 @@ export const NAV_ITEMS: {
   { id: 'overview', group: 'hub', label: '生命体总览', en: 'Overview', icon: Activity },
   { id: 'drives', group: 'kernel', label: '欲望系统', en: 'Drives · Affect', icon: Flame },
   { id: 'self-model', group: 'kernel', label: '自我认知', en: 'Self · RSI', icon: Fingerprint },
+  { id: 'evolution', group: 'kernel', label: '演化谱系', en: 'Evolution · V5', icon: GitBranch },
   { id: 'governance', group: 'kernel', label: '安全与审批', en: 'Governance', icon: Shield },
   { id: 'mind', group: 'organs', label: '认知与决策', en: 'Brain · LLM', icon: Brain },
   { id: 'world', group: 'organs', label: '环境感知', en: 'Perception · MCP', icon: Globe },
@@ -109,7 +112,7 @@ export function Layout({
               Control Center
             </div>
             <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-              {organismName || 'AOC-001'} · V3.2 类人内核
+              {organismName || 'AOC-001'} · V5.0 演化内核
             </div>
           </div>
         </div>

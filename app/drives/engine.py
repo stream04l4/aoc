@@ -10,6 +10,7 @@ from app.core.enums import DriveType
 from app.drives.arbitration import DriveArbitrator
 from app.drives.calculator import SatisfactionCalculator
 from app.drives.curiosity import CuriosityDriveEvaluator
+from app.drives.instinct_guard import guard_decision, guard_evaluators, guard_states
 from app.drives.interfaces import (
     DriveContext,
     DriveDecision,
@@ -31,6 +32,7 @@ class DriveEngine(DriveEngineInterface):
             DriveType.REPRODUCTION.value: ReproductionDriveEvaluator(drives_cfg.get("reproduction", {})),
             DriveType.CURIOSITY.value: CuriosityDriveEvaluator(drives_cfg.get("curiosity", {})),
         }
+        guard_evaluators(self.evaluators)
         self.calculator = SatisfactionCalculator(self.config.get("dynamics", {}), drives_cfg)
         self.arbitrator = DriveArbitrator(self.config.get("arbitration", {}), drives_cfg)
 
@@ -43,7 +45,7 @@ class DriveEngine(DriveEngineInterface):
             st = self.calculator.compute(ev, previous.get(dtype), ctx.now)
             result[dtype] = st
             DRIVE_SATISFACTION.labels(drive=dtype).set(st.satisfaction)
-        return result
+        return guard_states(result)
 
     def arbitrate(
         self,
@@ -55,6 +57,7 @@ class DriveEngine(DriveEngineInterface):
         decision = self.arbitrator.arbitrate(
             states, now=now, constraints=constraints, affect_modulation=affect_modulation
         )
+        decision = guard_decision(states, decision, self.config.get("arbitration", {}))
         for dtype, info in decision.scores.items():
             DRIVE_PRIORITY.labels(drive=dtype).set(info["priority"])
         return decision

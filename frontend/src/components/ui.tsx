@@ -159,6 +159,19 @@ const BADGE_STYLES: Record<string, string> = {
   verified_failure: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
   down: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
   offline: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
+  // V5 Evolution statuses
+  PROMOTED: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
+  STAGE2_APPROVED: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
+  STAGE4_PENDING_PROMOTION: 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border-cyan-500/30',
+  TESTING: 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border-cyan-500/30',
+  INCUBATING: 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border-cyan-500/30',
+  STAGE3_ARENA_RUNNING: 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border-cyan-500/30',
+  STAGE2_PENDING_APPROVAL: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
+  RETIRED: 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border-slate-500/30',
+  ROLLED_BACK: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30',
+  CULLED: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
+  STAGE1_FAILED: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
+  STAGE2_REJECTED: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
   L3: 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30',
 };
 

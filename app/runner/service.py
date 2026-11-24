@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -64,6 +65,7 @@ _TERMINAL_STATUSES = {
     ExecutionStatus.TIMEOUT.value,
     ExecutionStatus.CANCELLED.value,
 }
+_VALID_INSTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,63}$")
 
 
 class _PersistedExecution(BaseModel):
@@ -119,6 +121,7 @@ class RunnerManager:
         socket_path: str = "/run/aoc-runner/runner.sock",
         state_dir: str = "/var/lib/aoc-runner",
         workspace_root: str = "/home/ubuntu/aoc-workspaces",
+        instances_root: str = "/home/ubuntu/aoc-instances",
         cgroup_memory_max: str = "2G",
         cgroup_pids_max: int = 128,
         systemd_unit: str | None = None,
@@ -133,6 +136,7 @@ class RunnerManager:
         self.executions_dir.mkdir(parents=True, exist_ok=True)
         self.workspace_root = Path(workspace_root).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.instances_root = Path(instances_root).resolve()
         self.systemd_unit = systemd_unit
         self.auth_token = auth_token or ""
         self.poll_interval = max(0.05, float(poll_interval_seconds))
@@ -170,14 +174,40 @@ class RunnerManager:
     def _persist(self, rec: _PersistedExecution) -> None:
         _atomic_write_json(self._state_path(rec.execution_id), rec.model_dump(mode="json"))
 
-    def _validate_workspace(self, workspace: str, task_id: str) -> Path:
+    def _validate_workspace(self, workspace: str, task_id: str, instance_id: str | None = None) -> Path:
         raw = workspace.strip() if workspace else ""
+        safe_tid = "".join(ch for ch in task_id if ch.isalnum() or ch in {"-", "_"})[:64] or "task"
+
+        if instance_id is not None:
+            inst_key = instance_id.strip()
+            if not _VALID_INSTANCE_ID_RE.fullmatch(inst_key):
+                raise HTTPException(status_code=403, detail=f"Invalid instance_id '{instance_id}'")
+            inst_ws_root = (self.instances_root / inst_key / "workspace").resolve()
+            if raw:
+                candidate = Path(raw).resolve()
+                if candidate == inst_ws_root or inst_ws_root in candidate.parents:
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    return candidate
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Workspace '{workspace}' is outside isolated sandbox for instance '{inst_key}'",
+                )
+            fallback = (inst_ws_root / safe_tid).resolve()
+            if inst_ws_root not in fallback.parents:
+                raise HTTPException(status_code=403, detail="Invalid fallback workspace path")
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+
         if raw:
             candidate = Path(raw).resolve()
+            if candidate == self.instances_root or self.instances_root in candidate.parents:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Primary runner request cannot access isolated multi-instance workspace directory",
+                )
             if candidate == self.workspace_root or self.workspace_root in candidate.parents:
                 candidate.mkdir(parents=True, exist_ok=True)
                 return candidate
-        safe_tid = "".join(ch for ch in task_id if ch.isalnum() or ch in {"-", "_"})[:64] or "task"
         fallback = (self.workspace_root / safe_tid).resolve()
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
@@ -297,7 +327,7 @@ class RunnerManager:
             if not req.command:
                 raise HTTPException(status_code=400, detail="command must be non-empty")
 
-            workspace = self._validate_workspace(req.workspace, req.task_id)
+            workspace = self._validate_workspace(req.workspace, req.task_id, instance_id=req.instance_id)
             rec = _PersistedExecution(
                 execution_id=req.execution_id,
                 task_id=req.task_id,
@@ -749,6 +779,9 @@ def main() -> None:
     workspace_root = os.environ.get("AOC_RUNNER__WORKSPACE_ROOT") or str(
         rcfg.get("workspace_root", "/home/ubuntu/aoc-workspaces")
     )
+    instances_root = os.environ.get("AOC_RUNNER__INSTANCES_ROOT") or str(
+        rcfg.get("instances_root", "/home/ubuntu/aoc-instances")
+    )
     mem_max = os.environ.get("AOC_RUNNER__CGROUP_MEMORY_MAX") or str(rcfg.get("cgroup_memory_max", "2G"))
     pids_max = int(os.environ.get("AOC_RUNNER__CGROUP_PIDS_MAX") or rcfg.get("cgroup_pids_max", 128))
     systemd_unit = os.environ.get("AOC_RUNNER__SYSTEMD_UNIT") or None
@@ -772,6 +805,7 @@ def main() -> None:
         socket_path=socket_path,
         state_dir=state_dir,
         workspace_root=workspace_root,
+        instances_root=instances_root,
         cgroup_memory_max=mem_max,
         cgroup_pids_max=pids_max,
         systemd_unit=systemd_unit,

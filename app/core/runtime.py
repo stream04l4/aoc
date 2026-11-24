@@ -33,6 +33,14 @@ from app.core.lifecycle import LifecycleManager
 from app.core.loop import AutonomousLoop
 from app.core.scheduler import OrganismScheduler
 from app.drives.engine import DriveEngine
+from app.evolution.arena import FitnessArena
+from app.evolution.constitution_guard import ConstitutionGuard
+from app.evolution.entropy_sensor import EntropySensor
+from app.evolution.gc import CullingGC
+from app.evolution.proposal_manager import ProposalManager
+from app.evolution.repository import EvolutionRepository
+from app.evolution.spawner import InstanceSpawner
+from app.evolution.succession import SuccessionManager
 from app.governance.approval import ApprovalService
 from app.governance.policy import GovernanceManager
 from app.governance.semantic_policy import SemanticRiskClassifier
@@ -105,7 +113,11 @@ class OrganismRuntime:
                 emb_cfg = emb_cfg.model_copy(update={"provider": "hash_fallback"})
             self.settings = self.settings.model_copy(update={"embedding": emb_cfg})
         self._owns_db = db is None
-        self.db = db or Database(self.settings.database.url, echo=self.settings.database.echo)
+        self.db = db or Database(
+            self.settings.database.url,
+            echo=self.settings.database.echo,
+            schema_name=self.settings.database.schema_name,
+        )
         self.repo = StateRepository(self.db)
 
         self.organism_id: uuid.UUID | None = None
@@ -180,7 +192,11 @@ class OrganismRuntime:
                 ),
                 timeout_seconds=self.settings.runner.request_timeout_seconds,
             )
-            self.execution_backend = UnixSocketRunnerBackend(rc, runner_id=self.settings.runner.runner_id)
+            self.execution_backend = UnixSocketRunnerBackend(
+                rc,
+                runner_id=self.settings.runner.runner_id,
+                instance_id=self.settings.runner.instance_id,
+            )
             self.registry.runner_client = rc
         else:
             self.execution_backend = LocalSubprocessBackend()
@@ -202,11 +218,59 @@ class OrganismRuntime:
             cooldown_minutes=self.settings.kernel_v3.human_outreach_cooldown_minutes,
             topic_dedup_hours=self.settings.kernel_v3.human_outreach_topic_dedup_hours,
         )
+        self.evolution_repo = EvolutionRepository(self.repo.db)
+        self.entropy_sensor = EntropySensor(self.repo.db)
+        self.constitution_guard = ConstitutionGuard(repo_root=self.settings.evolution.repo_root)
+        self.proposal_manager = ProposalManager(
+            evo_repo=self.evolution_repo,
+            state_repo=self.repo,
+            constitution_guard=self.constitution_guard,
+            entropy_sensor=self.entropy_sensor,
+        )
+        self.culling_gc = CullingGC(
+            repo=self.evolution_repo,
+            pg_admin_db=self.repo.db,
+            repo_root=self.settings.evolution.repo_root,
+            instances_root=self.settings.evolution.instances_root,
+        )
+        self.instance_spawner = InstanceSpawner(
+            settings=self.settings.evolution,
+            repo=self.evolution_repo,
+            gc=self.culling_gc,
+            require_stage2_approval=True,
+        )
+        self.fitness_arena = FitnessArena(
+            evo_repo=self.evolution_repo,
+            state_repo=self.repo,
+            proposal_manager=self.proposal_manager,
+            spawner=self.instance_spawner,
+            gc=self.culling_gc,
+            constitution_guard=self.constitution_guard,
+        )
+
+        async def _retire_active_parent(_parent: dict[str, Any]) -> None:
+            if self.lifecycle is not None:
+                try:
+                    await self.lifecycle.pause(reason="V5 generational succession retirement")
+                except Exception:
+                    pass
+
+        self.succession_manager = SuccessionManager(
+            evo_repo=self.evolution_repo,
+            state_repo=self.repo,
+            proposal_manager=self.proposal_manager,
+            constitution_guard=self.constitution_guard,
+            repo_root=self.settings.evolution.repo_root,
+            snapshots_dir=Path(self.settings.evolution.instances_root) / "snapshots",
+            parent_sleep_fn=_retire_active_parent,
+        )
         self.telegram_webhook = TelegramWebhookHandler(
             self.settings.telegram,
             self.approval_service,
             self.repo,
             notifier=self.telegram_notifier,
+            proposal_manager=self.proposal_manager,
+            succession_manager=self.succession_manager,
         )
         self.telegram_poller: TelegramPoller | None = None
         self.outbox = OutboxDispatcher(
@@ -252,6 +316,8 @@ class OrganismRuntime:
             )
         else:
             backend = None
+        if isinstance(backend, LettaAdapter) and self.culling_gc is not None:
+            self.culling_gc.letta_adapter = backend
         async_sync = bool((mem_yaml or {}).get("async_outbox_sync", True))
         embed_on_write = bool((mem_yaml or {}).get("embed_on_write", True))
         self.memory = ExperienceManager(
@@ -498,6 +564,8 @@ class OrganismRuntime:
             exploration_manager=self.exploration_manager,
             human_bridge=self.human_bridge,
             investigation_manager=self.investigation_manager,
+            entropy_sensor=self.entropy_sensor,
+            culling_gc=self.culling_gc,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error
@@ -547,6 +615,8 @@ class OrganismRuntime:
                     repo=self.repo,
                     lifecycle=self.lifecycle,
                     status_fn=_status_summary,
+                    proposal_manager=self.proposal_manager,
+                    succession_manager=self.succession_manager,
                 )
                 self.telegram_poller.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))

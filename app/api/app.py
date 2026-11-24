@@ -86,6 +86,26 @@ class ToolInvokeRequest(BaseModel):
     approved_l2: bool = False
 
 
+class EvolutionProposalCreateRequest(BaseModel):
+    proposal_key: str | None = None
+    parent_instance_id: str | None = None
+    target_generation: int = 1
+    trigger_type: str = "OPERATOR_INITIATED"
+    trigger_reason: str
+    hypothesis: str
+    genome_delta: dict[str, Any]
+    auto_screen: bool = True
+
+
+class EvolutionDecisionRequest(BaseModel):
+    reason: str = ""
+
+
+class EvolutionRollbackRequest(BaseModel):
+    target_instance_id: str | None = None
+    reason: str = "operator initiated rollback"
+
+
 def create_app(
     settings: Settings | None = None,
     db: Database | None = None,
@@ -661,12 +681,18 @@ def create_app(
             )
         except TelegramAuthError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ApprovalNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ApprovalConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ApprovalDeniedError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/v2/lifecycle")
     async def get_lifecycle_v2(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
@@ -787,6 +813,179 @@ def create_app(
     @app.get("/metrics")
     async def metrics(_: Principal = Depends(require_scope(SCOPE_INTERNAL))) -> Response:
         return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+
+    # ── V5.0 Evolutionary Reproduction Control Plane (M2) ────────────────────
+    @app.get("/v5/evolution/entropy")
+    async def get_evolution_entropy_v5(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
+        snap = await _rt().entropy_sensor.measure()
+        return snap.model_dump(mode="json")
+
+    @app.get("/v5/evolution/constitution")
+    async def get_evolution_constitution_v5(_: Principal = Depends(require_scope(SCOPE_READ))) -> dict[str, Any]:
+        return _rt().constitution_guard.constitutional_manifest()
+
+    @app.get("/v5/evolution/proposals")
+    async def list_evolution_proposals_v5(
+        stage: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().evolution_repo.list_proposals(stage=stage, limit=min(max(limit, 1), 200))
+
+    @app.post("/v5/evolution/proposals")
+    async def create_evolution_proposal_v5(
+        req: EvolutionProposalCreateRequest,
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        rt = _rt()
+        parent_id: str | uuid.UUID | None = req.parent_instance_id
+        if not parent_id:
+            prim = await rt.evolution_repo.ensure_primary_instance(
+                db_schema=rt.settings.database.schema_name,
+                workspace_root=rt.settings.governance.workspace_root,
+                letta_agent_name=rt.settings.memory.agent_name,
+            )
+            parent_id = prim["id"]
+        try:
+            prop = await rt.proposal_manager.create_proposal(
+                parent_instance_id=parent_id,
+                target_generation=req.target_generation,
+                trigger_type=req.trigger_type,
+                trigger_reason=req.trigger_reason,
+                hypothesis=req.hypothesis,
+                genome_delta=req.genome_delta,
+                proposal_key=req.proposal_key,
+            )
+            if req.auto_screen:
+                prop = await rt.proposal_manager.screen_proposal(prop["id"])
+            return prop
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/proposals/{proposal_id}/screen")
+    async def screen_evolution_proposal_v5(
+        proposal_id: str,
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        try:
+            return await _rt().proposal_manager.screen_proposal(proposal_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/proposals/{proposal_id}/approve")
+    async def approve_evolution_proposal_v5(
+        proposal_id: str,
+        req: EvolutionDecisionRequest = EvolutionDecisionRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        try:
+            return await _rt().proposal_manager.approve_proposal(
+                proposal_id,
+                approver=principal.name,
+                note=req.reason,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/proposals/{proposal_id}/reject")
+    async def reject_evolution_proposal_v5(
+        proposal_id: str,
+        req: EvolutionDecisionRequest = EvolutionDecisionRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        try:
+            return await _rt().proposal_manager.reject_proposal(
+                proposal_id,
+                approver=principal.name,
+                note=req.reason,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/proposals/{proposal_id}/arena")
+    async def run_evolution_arena_v5(
+        proposal_id: str,
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        try:
+            rep = await _rt().fitness_arena.run_arena(proposal_id)
+            return rep.model_dump(mode="json")
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/proposals/{proposal_id}/promote")
+    async def promote_evolution_proposal_v5(
+        proposal_id: str,
+        req: EvolutionDecisionRequest = EvolutionDecisionRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        try:
+            res = await _rt().succession_manager.promote_candidate(
+                proposal_id,
+                promoter=principal.name,
+                note=req.reason,
+            )
+            return res.model_dump(mode="json")
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/rollback")
+    async def rollback_evolution_v5(
+        req: EvolutionRollbackRequest = EvolutionRollbackRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        try:
+            res = await _rt().succession_manager.rollback_generation(
+                operator=principal.name,
+                reason=req.reason,
+                target_instance_id_or_key=req.target_instance_id,
+            )
+            return res.model_dump(mode="json")
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v5/evolution/lineage")
+    async def list_evolution_lineage_v5(
+        outcome: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().evolution_repo.list_lineage(outcome=outcome, limit=min(max(limit, 1), 200))
+
+    @app.get("/v5/evolution/instances")
+    async def list_evolution_instances_v5(
+        status: str | None = None,
+        role: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().evolution_repo.list_instances(
+            status=status, role=role, limit=min(max(limit, 1), 200)
+        )
+
+    @app.post("/v5/evolution/gc/recover")
+    async def recover_evolution_orphans_v5(
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        return await _rt().culling_gc.recover_orphan_candidates()
 
     # V2.1 AOC Control Center read-only API router (enforces Bearer Token + SCOPE_READ)
     app.include_router(create_control_center_router(_rt))

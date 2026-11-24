@@ -97,6 +97,89 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
             f"任务：{payload.get('task_id')} | 达成目标：{payload.get('goal_achieved')}\n"
             f"摘要：{str(payload.get('summary', ''))[:300]}"
         ), None
+    if kind == "evolution_proposal_approval":
+        pkey = str(payload.get("proposal_key") or "")
+        files = list(payload.get("changed_files") or [])
+        mutates_drives = bool(payload.get("mutates_drive_metrics"))
+        budget = payload.get("arena_budget") or {}
+        entropy_idx = payload.get("entropy_index")
+        entropy_line = f"当前熵增指数：{entropy_idx:.3f} | " if isinstance(entropy_idx, (int, float)) else ""
+        text = (
+            f"🧬 [AOC V5.0 演化繁衍提案审批]\n"
+            f"提案编号：{pkey} (目标代数 Gen {payload.get('target_generation')})\n"
+            f"触发类型：{payload.get('trigger_type')} | {entropy_line}"
+            f"是否调整欲望评估指标：{'是' if mutates_drives else '否'}\n"
+            f"触发诊断：{str(payload.get('trigger_reason', ''))[:240]}\n"
+            f"演化假设：{str(payload.get('hypothesis', ''))[:360]}\n"
+            f"改动文件({len(files)})：{', '.join(files[:6]) or '无'}\n"
+            f"Stage 1 宪法四层检验：✅ 已通过\n"
+            f"沙箱竞技预算上限：{budget.get('max_tokens', 500000)} Tokens / {budget.get('max_seconds', 1200)}s\n"
+            f"批准命令：/evo_approve {pkey} | 拒绝：/evo_reject {pkey}"
+        )
+        reply_markup = (
+            {
+                "inline_keyboard": [
+                    [
+                        {"text": "✅ 同意孵化竞技", "callback_data": f"evo_approve:{pkey}"},
+                        {"text": "❌ 拒绝提案", "callback_data": f"evo_reject:{pkey}"},
+                    ]
+                ]
+            }
+            if pkey
+            else None
+        )
+        return text, reply_markup
+    if kind == "evolution_arena_victory":
+        pkey = str(payload.get("proposal_key") or "")
+        mutates = bool(payload.get("mutates_drive_metrics"))
+        text = (
+            f"🏆 [AOC V5.0 沙箱竞技胜出 — 待确认晋升]\n"
+            f"提案：{pkey} → 候选 {payload.get('candidate_key')} (目标 Gen {payload.get('target_generation')})\n"
+            f"适应度对比：父代 {payload.get('parent_fitness')} vs 子代 {payload.get('offspring_fitness')} "
+            f"(+{payload.get('fitness_delta')})\n"
+            f"安全红线：✅ 100% 合规 | 欲望指标调整：{'是' if mutates else '否'}\n"
+            f"假设：{str(payload.get('hypothesis', ''))[:260]}\n"
+            f"晋升命令：/evo_promote {pkey}"
+        )
+        reply_markup = (
+            {
+                "inline_keyboard": [
+                    [{"text": "🚀 确认晋升新一代（Gen N 休眠）", "callback_data": f"evo_promote:{pkey}"}]
+                ]
+            }
+            if pkey
+            else None
+        )
+        return text, reply_markup
+    if kind == "evolution_promoted":
+        return (
+            f"🌱 [AOC V5.0 世代交替完成]\n"
+            f"提案：{payload.get('proposal_key')} → Gen {payload.get('generation')} "
+            f"({payload.get('new_primary_key')}) 已以白板身份上线主线！\n"
+            f"前代 {payload.get('previous_primary_key')} 已平滑休眠退役。\n"
+            f"适应度：{payload.get('parent_fitness')} → {payload.get('offspring_fitness')} | "
+            f"欲望指标演化：{'是' if payload.get('mutates_drive_metrics') else '否'}\n"
+            f"一键回滚快照标签：{payload.get('rollback_tag') or '无'}"
+        ), None
+    if kind == "evolution_rolled_back":
+        return (
+            f"⏪ [AOC V5.0 一键回滚完成]\n"
+            f"已从 {payload.get('previous_primary_key')} 回滚恢复至 Gen {payload.get('generation')} "
+            f"({payload.get('new_primary_key')})。\n"
+            f"原因：{payload.get('reason', '管理员触发')}\n"
+            f"快照标签：{payload.get('rollback_tag') or '无'}"
+        ), None
+    if kind == "evolution_arena_culled":
+        reasons = "; ".join(str(r) for r in (payload.get("reasons") or []))[:260]
+        text = (
+            f"🗑️ [AOC V5.0 沙箱竞技淘汰并已清理]\n"
+            f"提案：{payload.get('proposal_key')} | 候选：{payload.get('candidate_key')}\n"
+            f"适应度对比：父代 {payload.get('parent_fitness')} vs 子代 {payload.get('offspring_fitness')} "
+            f"({payload.get('fitness_delta')})\n"
+            f"淘汰原因：{reasons}\n"
+            f"零残留 Culling GC：{'✅ 已清空容器/Schema/工作区' if payload.get('zero_residual') else '⚠️ 待重试恢复'}"
+        )
+        return text, None
     return f"[AOC 通知] {payload.get('message') or payload}", None
 
 
@@ -180,11 +263,15 @@ class TelegramWebhookHandler:
         approval_service: ApprovalService,
         repo: StateRepository,
         notifier: TelegramNotifier | None = None,
+        proposal_manager: Any = None,
+        succession_manager: Any = None,
     ) -> None:
         self.settings = settings
         self.approval_service = approval_service
         self.repo = repo
         self.notifier = notifier
+        self.proposal_manager = proposal_manager
+        self.succession_manager = succession_manager
 
     async def handle_update(
         self,
@@ -224,7 +311,13 @@ class TelegramWebhookHandler:
             username = str(frm.get("username") or user_id or "telegram_user")
             text = str(msg.get("text") or "").strip()
             parts = text.split()
-            if len(parts) >= 2 and parts[0].lower() in {"/approve", "/reject"}:
+            if len(parts) >= 2 and parts[0].lower() in {
+                "/approve",
+                "/reject",
+                "/evo_approve",
+                "/evo_reject",
+                "/evo_promote",
+            }:
                 raw_action = f"{parts[0].lower().lstrip('/')}:{parts[1]}"
         else:
             return {"ok": True, "ignored": True, "reason": "unsupported update type"}
@@ -256,6 +349,39 @@ class TelegramWebhookHandler:
         action, nonce = raw_action.split(":", 1)
         action = action.strip().lower()
         nonce = nonce.strip()
+        if action in {"evo_approve", "evo_reject"} and nonce and self.proposal_manager is not None:
+            approver = f"telegram:{username}({user_id})"
+            if action == "evo_approve":
+                evo_res = await self.proposal_manager.approve_proposal(
+                    nonce, approver=approver, note="Telegram 审批通过"
+                )
+            else:
+                evo_res = await self.proposal_manager.reject_proposal(
+                    nonce, approver=approver, note="Telegram 拒绝"
+                )
+            if self.notifier is not None and callback_id:
+                await self.notifier.answer_callback_query(
+                    callback_id, f"AOC 演化提案已处理，状态：{evo_res.get('stage')}"
+                )
+            return {"ok": True, "kind": "evolution_proposal", "action": action, "result": evo_res}
+
+        if action == "evo_promote" and nonce and self.succession_manager is not None:
+            approver = f"telegram:{username}({user_id})"
+            succ_res = await self.succession_manager.promote_candidate(
+                nonce, promoter=approver, note="Telegram 二次确认晋升"
+            )
+            if self.notifier is not None and callback_id:
+                await self.notifier.answer_callback_query(
+                    callback_id,
+                    f"AOC 已晋升 Gen {succ_res.generation} ({succ_res.new_primary_key})",
+                )
+            return {
+                "ok": True,
+                "kind": "evolution_promote",
+                "action": action,
+                "result": succ_res.model_dump(mode="json"),
+            }
+
         if action not in {"approve", "reject"} or not nonce:
             return {"ok": True, "ignored": True, "reason": "invalid approval callback syntax"}
 
@@ -285,6 +411,8 @@ class TelegramPoller:
         repo: StateRepository,
         lifecycle: Any = None,
         status_fn: Any = None,
+        proposal_manager: Any = None,
+        succession_manager: Any = None,
     ) -> None:
         self.settings = settings
         self.notifier = notifier
@@ -293,6 +421,8 @@ class TelegramPoller:
         self.repo = repo
         self.lifecycle = lifecycle
         self.status_fn = status_fn
+        self.proposal_manager = proposal_manager or getattr(webhook_handler, "proposal_manager", None)
+        self.succession_manager = succession_manager or getattr(webhook_handler, "succession_manager", None)
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -349,6 +479,41 @@ class TelegramPoller:
             if ":" in raw_action:
                 action, nonce = raw_action.split(":", 1)
                 action = action.strip().lower()
+                if action in {"evo_approve", "evo_reject"} and nonce.strip() and self.proposal_manager is not None:
+                    approver = f"telegram:{username}({user_id})"
+                    try:
+                        evo_res = (
+                            await self.proposal_manager.approve_proposal(
+                                nonce.strip(), approver=approver, note="Telegram 按钮审批通过"
+                            )
+                            if action == "evo_approve"
+                            else await self.proposal_manager.reject_proposal(
+                                nonce.strip(), approver=approver, note="Telegram 按钮拒绝"
+                            )
+                        )
+                        msg_reply = f"AOC 演化提案已处理，状态：{evo_res.get('stage')}"
+                    except Exception as exc:
+                        evo_res = {"error": str(exc)}
+                        msg_reply = f"演化提案处理失败：{exc}"
+                    cb_id = str(cb.get("id") or "")
+                    if cb_id:
+                        await self.notifier.answer_callback_query(cb_id, msg_reply)
+                    return {"ok": True, "kind": "evolution_proposal", "action": action, "result": evo_res}
+                if action == "evo_promote" and nonce.strip() and self.succession_manager is not None:
+                    approver = f"telegram:{username}({user_id})"
+                    try:
+                        succ_res = await self.succession_manager.promote_candidate(
+                            nonce.strip(), promoter=approver, note="Telegram 按钮晋升"
+                        )
+                        res_d = succ_res.model_dump(mode="json")
+                        msg_reply = f"🌱 已晋升 Gen {succ_res.generation} ({succ_res.new_primary_key})"
+                    except Exception as exc:
+                        res_d = {"error": str(exc)}
+                        msg_reply = f"晋升操作失败：{exc}"
+                    cb_id = str(cb.get("id") or "")
+                    if cb_id:
+                        await self.notifier.answer_callback_query(cb_id, msg_reply)
+                    return {"ok": True, "kind": "evolution_promote", "action": action, "result": res_d}
                 if action in {"approve", "reject"} and nonce.strip():
                     result = await self.webhook_handler.approval_service.decide_by_nonce(
                         nonce.strip(),
@@ -385,6 +550,41 @@ class TelegramPoller:
 
         parts = text.split()
         cmd = parts[0].lower()
+        if len(parts) >= 2 and cmd == "/evo_promote" and self.succession_manager is not None:
+            pkey = parts[1].strip()
+            note = " ".join(parts[2:]).strip()
+            approver = f"telegram:{username}({user_id})"
+            try:
+                succ_res = await self.succession_manager.promote_candidate(pkey, promoter=approver, note=note)
+                res_d = succ_res.model_dump(mode="json")
+                reply_txt = (
+                    f"🌱 世代交替完成：Gen {succ_res.generation} ({succ_res.new_primary_key}) 已上线，"
+                    f"旧代 {succ_res.previous_primary_key} 已退役（快照：{succ_res.rollback_tag}）。"
+                )
+            except Exception as exc:
+                res_d = {"error": str(exc)}
+                reply_txt = f"❌ 晋升操作失败：{exc}"
+            await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": reply_txt})
+            return {"ok": True, "kind": "evolution_promote_cmd", "action": "evo_promote", "result": res_d}
+
+        if len(parts) >= 2 and cmd in {"/evo_approve", "/evo_reject"} and self.proposal_manager is not None:
+            action = cmd.lstrip("/")
+            pkey = parts[1].strip()
+            note = " ".join(parts[2:]).strip()
+            approver = f"telegram:{username}({user_id})"
+            try:
+                evo_res = (
+                    await self.proposal_manager.approve_proposal(pkey, approver=approver, note=note)
+                    if action == "evo_approve"
+                    else await self.proposal_manager.reject_proposal(pkey, approver=approver, note=note)
+                )
+                reply_txt = f"🧬 已执行演化提案操作 {action}（{pkey}），当前状态：{evo_res.get('stage')}"
+            except Exception as exc:
+                evo_res = {"error": str(exc)}
+                reply_txt = f"❌ 演化提案操作失败：{exc}"
+            await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": reply_txt})
+            return {"ok": True, "kind": "evolution_proposal_cmd", "action": action, "result": evo_res}
+
         if len(parts) >= 2 and cmd in {"/approve", "/reject"}:
             action = cmd.lstrip("/")
             result = await self.webhook_handler.approval_service.decide_by_nonce(

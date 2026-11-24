@@ -2776,4 +2776,43 @@ def create_control_center_router(get_runtime) -> APIRouter:
             },
         }
 
+    @router.get("/v2/control-center/evolution")
+    async def get_evolution_overview_v2(
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = get_runtime()
+        snap = await rt.entropy_sensor.measure() if rt.entropy_sensor is not None else None
+        manifest = rt.constitution_guard.constitutional_manifest() if rt.constitution_guard is not None else {}
+        instances = await rt.evolution_repo.list_instances(limit=50)
+        proposals = await rt.evolution_repo.list_proposals(limit=50)
+        lineage = await rt.evolution_repo.list_lineage(limit=50)
+        live_count = await rt.evolution_repo.count_live_instances()
+
+        active_primary = next(
+            (i for i in instances if i.get("role") == "PRIMARY" and i.get("status") == "ACTIVE"),
+            instances[0] if instances else None,
+        )
+        promoted_cnt = sum(1 for l in lineage if l.get("outcome") == "PROMOTED")
+        culled_cnt = sum(1 for l in lineage if l.get("outcome") == "CULLED")
+        rolled_back_cnt = sum(1 for l in lineage if l.get("outcome") == "ROLLED_BACK")
+        retired_parents = [i for i in instances if i.get("status") == "RETIRED"]
+
+        return {
+            "summary": {
+                "active_generation": active_primary.get("generation", 0) if active_primary else 0,
+                "active_instance_key": active_primary.get("instance_key", "gen0-001") if active_primary else "gen0-001",
+                "live_instances": live_count,
+                "max_concurrent_instances": rt.settings.evolution.max_concurrent_instances,
+                "promoted_count": promoted_cnt,
+                "culled_count": culled_cnt,
+                "rolled_back_count": rolled_back_cnt,
+                "can_rollback": bool(active_primaries := [i for i in instances if i.get("role") == "PRIMARY" and i.get("status") == "ACTIVE"]) and len(retired_parents) > 0,
+            },
+            "entropy": snap.model_dump(mode="json") if snap is not None else {"entropy_index": 0.0, "metrics": {}, "raw_counts": {}},
+            "constitution": manifest,
+            "instances": instances,
+            "proposals": proposals,
+            "lineage": lineage,
+        }
+
     return router

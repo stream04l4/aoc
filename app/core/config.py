@@ -55,6 +55,7 @@ class ApiSettings(BaseModel):
 class DatabaseSettings(BaseModel):
     url: str = "postgresql+asyncpg://aoc:aoc@127.0.0.1:5433/aoc"
     echo: bool = False
+    schema_name: str = "public"
 
 
 class LLMSettings(BaseModel):
@@ -130,6 +131,8 @@ class RunnerSettings(BaseModel):
     socket_path: str = "/run/aoc-runner/runner.sock"
     state_dir: str = "/var/lib/aoc-runner"
     workspace_root: str = "/home/ubuntu/aoc-workspaces"
+    instances_root: str = "/home/ubuntu/aoc-instances"
+    instance_id: str | None = None
     cgroup_memory_max: str = "2G"
     cgroup_pids_max: int = 128
     heartbeat_interval_seconds: float = 15.0
@@ -230,6 +233,22 @@ class KernelV3Settings(BaseModel):
     investigation_low_ig_stall_streak: int = 2
 
 
+class EvolutionSettings(BaseModel):
+    """V5.0 bounded evolutionary reproduction & isolated spawner settings."""
+
+    enabled: bool = False
+    instances_root: str = "/home/ubuntu/aoc-instances"
+    repo_root: str = str(PROJECT_ROOT)
+    docker_image: str = "aoc-aoc:latest"
+    docker_network: str = "aoc_default"
+    max_concurrent_instances: int = 2
+    min_free_disk_ratio: float = 0.20
+    candidate_memory_limit: str = "1024m"
+    candidate_port_start: int = 9201
+    candidate_port_end: int = 9210
+    health_timeout_seconds: float = 60.0
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -263,6 +282,7 @@ class Settings(BaseSettings):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
     kernel_v3: KernelV3Settings = Field(default_factory=KernelV3Settings)
+    evolution: EvolutionSettings = Field(default_factory=EvolutionSettings)
 
     @classmethod
     def settings_customise_sources(
