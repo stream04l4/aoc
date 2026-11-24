@@ -151,9 +151,11 @@ class UnixSocketRunnerBackend(ExecutionBackendInterface):
         self,
         client: RunnerClient,
         runner_id: str = "host-runner-1",
+        instance_id: str | None = None,
     ) -> None:
         self.client = client
         self.runner_id = runner_id
+        self.instance_id = instance_id
         self._tracked: dict[str, _TrackedRunnerTask] = {}
 
     async def launch(self, adapter: AgentInterface, task: AgentTask) -> str:
@@ -174,6 +176,7 @@ class UnixSocketRunnerBackend(ExecutionBackendInterface):
             workspace=task.workspace,
             sandbox_mode=task.sandbox_mode,
             timeout_seconds=int(task.timeout_seconds),
+            instance_id=self.instance_id,
             extra_env=spec.get("extra_env", {}),
             metadata={"objective": task.objective[:200]},
         )

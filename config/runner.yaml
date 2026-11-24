@@ -4,6 +4,7 @@ runner_id: host-runner-1
 socket_path: /run/aoc-runner/runner.sock
 state_dir: /var/lib/aoc-runner
 workspace_root: /home/ubuntu/aoc-workspaces
+instances_root: /home/ubuntu/aoc-instances
 cgroup_memory_max: "2G"
 cgroup_pids_max: 128
 heartbeat_interval_seconds: 15

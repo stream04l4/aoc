@@ -36,6 +36,7 @@ class LaunchExecutionRequest(BaseModel):
     workspace: str
     sandbox_mode: str = "read-only"
     timeout_seconds: int = 300
+    instance_id: str | None = None
     extra_env: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

@@ -105,7 +105,11 @@ class OrganismRuntime:
                 emb_cfg = emb_cfg.model_copy(update={"provider": "hash_fallback"})
             self.settings = self.settings.model_copy(update={"embedding": emb_cfg})
         self._owns_db = db is None
-        self.db = db or Database(self.settings.database.url, echo=self.settings.database.echo)
+        self.db = db or Database(
+            self.settings.database.url,
+            echo=self.settings.database.echo,
+            schema_name=self.settings.database.schema_name,
+        )
         self.repo = StateRepository(self.db)
 
         self.organism_id: uuid.UUID | None = None
@@ -180,7 +184,11 @@ class OrganismRuntime:
                 ),
                 timeout_seconds=self.settings.runner.request_timeout_seconds,
             )
-            self.execution_backend = UnixSocketRunnerBackend(rc, runner_id=self.settings.runner.runner_id)
+            self.execution_backend = UnixSocketRunnerBackend(
+                rc,
+                runner_id=self.settings.runner.runner_id,
+                instance_id=self.settings.runner.instance_id,
+            )
             self.registry.runner_client = rc
         else:
             self.execution_backend = LocalSubprocessBackend()

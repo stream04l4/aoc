@@ -260,3 +260,20 @@ class LettaAdapter(MemoryInterface):
         except Exception as exc:
             logger.warning("letta.get_blocks_failed", error=str(exc))
             return {}
+
+    async def delete_agent(self, agent_id: str) -> bool:
+        """Idempotently delete a temporary/culled Letta agent and its passages."""
+        target = (agent_id or "").strip()
+        if not target:
+            return True
+        try:
+            r = await self._req("DELETE", f"/v1/agents/{target}")
+            if r.status_code in {200, 202, 204, 404}:
+                if self.agent_id == target:
+                    self.agent_id = None
+                return True
+            logger.warning("letta.delete_agent_unexpected_status", agent_id=target, status=r.status_code)
+            return False
+        except Exception as exc:
+            logger.warning("letta.delete_agent_failed", agent_id=target, error=str(exc))
+            return False

@@ -763,3 +763,90 @@ class AffectHistoryRow(Base):
     trigger_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
     decay_applied: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+
+
+# ── V5.0 evolutionary reproduction shared control-plane tables (`public`) ────
+class InstanceRegistryRow(Base):
+    __tablename__ = "instance_registry"
+    __table_args__ = (
+        Index("ix_inst_reg_role_status", "role", "status"),
+        Index("ix_inst_reg_gen", "generation"),
+        {"schema": "public"},
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    instance_key: Mapped[str] = mapped_column(String(64), unique=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    parent_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("public.instance_registry.id"), nullable=True
+    )
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    role: Mapped[str] = mapped_column(String(24), default="CANDIDATE")  # PRIMARY | CANDIDATE | RETIRED_ARCHIVE
+    status: Mapped[str] = mapped_column(String(24), default="INITIALIZING")
+    db_schema: Mapped[str] = mapped_column(String(64), unique=True)
+    letta_agent_name: Mapped[str] = mapped_column(String(128))
+    letta_agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    git_branch: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    git_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    repo_worktree_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    workspace_root: Mapped[str] = mapped_column(String(512))
+    container_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    api_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    blank_slate_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    resource_snapshot: Mapped[dict] = mapped_column(JsonType, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+    retired_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    cleaned_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class EvolutionProposalRow(Base):
+    __tablename__ = "evolution_proposals"
+    __table_args__ = (
+        Index("ix_evo_prop_stage_time", "stage", "created_at"),
+        Index("ix_evo_prop_parent", "parent_instance_id"),
+        {"schema": "public"},
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    proposal_key: Mapped[str] = mapped_column(String(64), unique=True)
+    parent_instance_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("public.instance_registry.id"))
+    target_generation: Mapped[int] = mapped_column(Integer)
+    trigger_type: Mapped[str] = mapped_column(String(32))  # ENTROPY_PRESSURE | BOTTLENECK | OPERATOR_INITIATED
+    trigger_reason: Mapped[str] = mapped_column(Text)
+    entropy_snapshot: Mapped[dict] = mapped_column(JsonType, default=dict)
+    hypothesis: Mapped[str] = mapped_column(Text)
+    genome_delta: Mapped[dict] = mapped_column(JsonType, default=dict)
+    stage: Mapped[str] = mapped_column(String(32), default="STAGE0_DRAFT")
+    stage1_report: Mapped[dict] = mapped_column(JsonType, default=dict)
+    approval_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    arena_budget: Mapped[dict] = mapped_column(
+        JsonType, default=lambda: {"max_tokens": 500000, "max_seconds": 1200}
+    )
+    arena_result: Mapped[dict] = mapped_column(JsonType, default=dict)
+    candidate_instance_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=_now, onupdate=_now)
+
+
+class LineageRecordRow(Base):
+    __tablename__ = "lineage_records"
+    __table_args__ = (
+        Index("ix_lineage_gen_outcome", "generation", "outcome"),
+        Index("ix_lineage_proposal", "proposal_id"),
+        {"schema": "public"},
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    generation: Mapped[int] = mapped_column(Integer)
+    parent_instance_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    offspring_instance_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("public.evolution_proposals.id"))
+    outcome: Mapped[str] = mapped_column(String(24))  # PROMOTED | CULLED | ROLLED_BACK
+    safety_passed: Mapped[bool] = mapped_column(Boolean)
+    parent_fitness: Mapped[float | None] = mapped_column(Float, nullable=True)
+    offspring_fitness: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fitness_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fitness_breakdown: Mapped[dict] = mapped_column(JsonType, default=dict)
+    drive_metric_changes: Mapped[dict] = mapped_column(JsonType, default=dict)
+    lesson_summary: Mapped[dict] = mapped_column(JsonType, default=dict)  # enforced < 5KB
+    created_at: Mapped[datetime] = mapped_column(TS, default=_now)
