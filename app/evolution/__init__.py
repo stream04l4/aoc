@@ -1,4 +1,4 @@
-"""AOC V5.0 Evolutionary Reproduction package (M1-M3)."""
+"""AOC V5.0 Evolutionary Reproduction package (M1-M4)."""
 
 from app.evolution.arena import FitnessArena
 from app.evolution.benchmarks import (
@@ -32,6 +32,7 @@ from app.evolution.interfaces import (
     ProposalStage,
     SpawnRequest,
     SpawnResult,
+    SuccessionResult,
     build_instance_schema_name,
     enforce_lesson_summary_budget,
     is_droppable_instance_schema,
@@ -41,6 +42,7 @@ from app.evolution.proposal_manager import ProposalManager
 from app.evolution.repository import EvolutionRepository
 from app.evolution.scoring import compare_parent_vs_offspring, compute_fitness_score
 from app.evolution.spawner import InstanceSpawner
+from app.evolution.succession import SuccessionManager
 
 __all__ = [
     "ArenaBudgetTracker",
@@ -76,6 +78,8 @@ __all__ = [
     "ProposalStage",
     "SpawnRequest",
     "SpawnResult",
+    "SuccessionManager",
+    "SuccessionResult",
     "build_instance_schema_name",
     "build_standard_benchmark_suite",
     "compare_parent_vs_offspring",

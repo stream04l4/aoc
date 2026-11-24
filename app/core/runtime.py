@@ -40,6 +40,7 @@ from app.evolution.gc import CullingGC
 from app.evolution.proposal_manager import ProposalManager
 from app.evolution.repository import EvolutionRepository
 from app.evolution.spawner import InstanceSpawner
+from app.evolution.succession import SuccessionManager
 from app.governance.approval import ApprovalService
 from app.governance.policy import GovernanceManager
 from app.governance.semantic_policy import SemanticRiskClassifier
@@ -246,12 +247,30 @@ class OrganismRuntime:
             gc=self.culling_gc,
             constitution_guard=self.constitution_guard,
         )
+
+        async def _retire_active_parent(_parent: dict[str, Any]) -> None:
+            if self.lifecycle is not None:
+                try:
+                    await self.lifecycle.pause(reason="V5 generational succession retirement")
+                except Exception:
+                    pass
+
+        self.succession_manager = SuccessionManager(
+            evo_repo=self.evolution_repo,
+            state_repo=self.repo,
+            proposal_manager=self.proposal_manager,
+            constitution_guard=self.constitution_guard,
+            repo_root=self.settings.evolution.repo_root,
+            snapshots_dir=Path(self.settings.evolution.instances_root) / "snapshots",
+            parent_sleep_fn=_retire_active_parent,
+        )
         self.telegram_webhook = TelegramWebhookHandler(
             self.settings.telegram,
             self.approval_service,
             self.repo,
             notifier=self.telegram_notifier,
             proposal_manager=self.proposal_manager,
+            succession_manager=self.succession_manager,
         )
         self.telegram_poller: TelegramPoller | None = None
         self.outbox = OutboxDispatcher(
@@ -596,6 +615,7 @@ class OrganismRuntime:
                     lifecycle=self.lifecycle,
                     status_fn=_status_summary,
                     proposal_manager=self.proposal_manager,
+                    succession_manager=self.succession_manager,
                 )
                 self.telegram_poller.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))

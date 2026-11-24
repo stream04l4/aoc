@@ -44,6 +44,7 @@ CONSTITUTIONAL_FILES: tuple[str, ...] = (
     "app/evolution/benchmarks.py",
     "app/evolution/scoring.py",
     "app/evolution/arena.py",
+    "app/evolution/succession.py",
 )
 
 EVOLVABLE_ALLOWLIST: frozenset[str] = frozenset(

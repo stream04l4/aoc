@@ -15,6 +15,7 @@ import { TasksPage } from './pages/TasksPage';
 import { MemoryPage } from './pages/MemoryPage';
 import { WorldPage } from './pages/WorldPage';
 import { SelfModelPage } from './pages/SelfModelPage';
+import { EvolutionPage } from './pages/EvolutionPage';
 import { GovernancePage } from './pages/GovernancePage';
 import { ConfigPage } from './pages/ConfigPage';
 import { LogsPage } from './pages/LogsPage';
@@ -207,6 +208,9 @@ export function App() {
       {activePage === 'memory' && <MemoryPage refreshTick={refreshTick} />}
       {activePage === 'world' && <WorldPage refreshTick={refreshTick} />}
       {activePage === 'self-model' && <SelfModelPage refreshTick={refreshTick} />}
+      {activePage === 'evolution' && (
+        <EvolutionPage refreshTick={refreshTick} principal={principal} />
+      )}
       {activePage === 'governance' && (
         <GovernancePage
           windowHours={windowHours}

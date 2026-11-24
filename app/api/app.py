@@ -101,6 +101,11 @@ class EvolutionDecisionRequest(BaseModel):
     reason: str = ""
 
 
+class EvolutionRollbackRequest(BaseModel):
+    target_instance_id: str | None = None
+    reason: str = "operator initiated rollback"
+
+
 def create_app(
     settings: Settings | None = None,
     db: Database | None = None,
@@ -676,6 +681,8 @@ def create_app(
             )
         except TelegramAuthError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ApprovalNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ApprovalConflictError as exc:
@@ -913,6 +920,43 @@ def create_app(
             return rep.model_dump(mode="json")
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/proposals/{proposal_id}/promote")
+    async def promote_evolution_proposal_v5(
+        proposal_id: str,
+        req: EvolutionDecisionRequest = EvolutionDecisionRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        try:
+            res = await _rt().succession_manager.promote_candidate(
+                proposal_id,
+                promoter=principal.name,
+                note=req.reason,
+            )
+            return res.model_dump(mode="json")
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v5/evolution/rollback")
+    async def rollback_evolution_v5(
+        req: EvolutionRollbackRequest = EvolutionRollbackRequest(),
+        principal: Principal = Depends(require_scope(SCOPE_APPROVE)),
+    ) -> dict[str, Any]:
+        try:
+            res = await _rt().succession_manager.rollback_generation(
+                operator=principal.name,
+                reason=req.reason,
+                target_instance_id_or_key=req.target_instance_id,
+            )
+            return res.model_dump(mode="json")
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

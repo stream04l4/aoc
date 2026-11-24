@@ -312,3 +312,20 @@ class ArenaReport(BaseModel):
     comparison: ArenaComparisonVerdict | None = None
     culling_report: CullingReport | None = None
     completed_at: datetime = Field(default_factory=utcnow)
+
+
+class SuccessionResult(BaseModel):
+    success: bool
+    action: str  # PROMOTED | ROLLED_BACK
+    proposal_id: uuid.UUID | None = None
+    proposal_key: str = ""
+    previous_primary_id: uuid.UUID | None = None
+    previous_primary_key: str = ""
+    new_primary_id: uuid.UUID | None = None
+    new_primary_key: str = ""
+    generation: int = 0
+    merged_commit: str | None = None
+    rollback_tag: str | None = None
+    rollback_snapshot: str | None = None
+    lineage_record_id: uuid.UUID | None = None
+    error: str | None = None
