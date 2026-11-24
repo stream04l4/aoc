@@ -1,0 +1,246 @@
+"""Read-only V5.0 steady-state & resource-conservation monitor (M5).
+
+Performs zero LLM calls and emits machine-readable JSON (`--output <path>`) checking:
+  1. Host disk headroom >= configured safety floor (default 20%)
+  2. Immutable ConstitutionGuard manifest integrity (all constitutional files present & hashed)
+  3. Zero orphan candidate directories under `instances_root` (excluding `snapshots/`)
+  4. Optional PostgreSQL/SQLite V5 control-plane invariants (live cap <= 2, 0 stuck CULLING, <5KB tombstones)
+  5. Optional HTTP `/health` endpoint check
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+from sqlalchemy import inspect, select
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.evolution.constitution_guard import CONSTITUTIONAL_FILES, ConstitutionGuard
+from app.evolution.interfaces import LIVE_INSTANCE_STATUSES, InstanceRole, InstanceStatus
+from app.storage.database import Database
+from app.storage.models import InstanceRegistryRow, LineageRecordRow
+
+_ACTIVE_CANDIDATE_STATUSES = (
+    InstanceStatus.INITIALIZING.value,
+    InstanceStatus.INCUBATING.value,
+    InstanceStatus.TESTING.value,
+)
+
+
+def _disk_free_ratio(path: Path) -> tuple[str, float, int, int]:
+    probe = path.resolve()
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    ratio = float(usage.free) / float(max(1, usage.total))
+    return str(probe), round(ratio, 4), int(usage.free), int(usage.total)
+
+
+async def run_v5_soak_check(
+    *,
+    repo_root: str | Path = PROJECT_ROOT,
+    instances_root: str | Path = "/home/ubuntu/aoc-instances",
+    min_free_disk_ratio: float = 0.20,
+    max_concurrent_instances: int = 2,
+    db_url: str = "",
+    api_base: str = "",
+) -> dict[str, Any]:
+    """Run read-only V5 resource, constitution, orphan hygiene, and optional DB/API health checks."""
+    failures: list[str] = []
+    checks: dict[str, Any] = {}
+
+    repo_path = Path(repo_root).resolve()
+    inst_path = Path(instances_root).resolve()
+
+    # 1. Disk headroom
+    probe_path, free_ratio, free_bytes, total_bytes = _disk_free_ratio(inst_path)
+    disk_ok = free_ratio >= float(min_free_disk_ratio)
+    checks["disk"] = {
+        "ok": disk_ok,
+        "probe_path": probe_path,
+        "free_ratio": free_ratio,
+        "min_required_ratio": float(min_free_disk_ratio),
+        "free_gb": round(free_bytes / (1024**3), 2),
+        "total_gb": round(total_bytes / (1024**3), 2),
+    }
+    if not disk_ok:
+        failures.append(
+            f"Free disk ratio {free_ratio:.1%} below minimum {float(min_free_disk_ratio):.0%}"
+        )
+
+    # 2. Constitutional manifest integrity
+    guard = ConstitutionGuard(repo_root=repo_path)
+    manifest = guard.constitutional_manifest()
+    present_const = manifest.get("constitutional_files") or {}
+    missing_const = [rel for rel in CONSTITUTIONAL_FILES if rel not in present_const]
+    const_ok = (len(missing_const) == 0) and (
+        int(manifest.get("constitutional_file_count", 0)) == len(CONSTITUTIONAL_FILES)
+    )
+    checks["constitution"] = {
+        "ok": const_ok,
+        "expected_count": len(CONSTITUTIONAL_FILES),
+        "present_count": int(manifest.get("constitutional_file_count", 0)),
+        "missing_files": missing_const,
+    }
+    if not const_ok:
+        failures.append(f"Constitutional files missing: {missing_const}")
+
+    # 3. Optional DB control-plane check
+    active_candidate_keys: set[str] = set()
+    db_tables_present = False
+    if (db_url or "").strip():
+        db = Database(db_url.strip())
+        try:
+            async with db.engine.connect() as conn:
+                schema = "public" if conn.dialect.name == "postgresql" else None
+                tbls = set(await conn.run_sync(lambda sc: inspect(sc).get_table_names(schema=schema)))
+            db_tables_present = {"instance_registry", "lineage_records"}.issubset(tbls)
+            if not db_tables_present:
+                checks["database"] = {
+                    "ok": True,
+                    "v5_tables_present": False,
+                    "detail": "V5 evolution tables not present on target DB; skipped control-plane checks",
+                }
+            else:
+                async with db.session() as s:
+                    inst_rows = (await s.execute(select(InstanceRegistryRow))).scalars().all()
+                    lin_rows = (await s.execute(select(LineageRecordRow))).scalars().all()
+
+                live_count = sum(1 for r in inst_rows if r.status in LIVE_INSTANCE_STATUSES)
+                stuck_culling = [r.instance_key for r in inst_rows if r.status == InstanceStatus.CULLING.value]
+                active_candidate_keys = {
+                    r.instance_key
+                    for r in inst_rows
+                    if r.role == InstanceRole.CANDIDATE.value and r.status in _ACTIVE_CANDIDATE_STATUSES
+                }
+                max_lesson_bytes = 0
+                for lr in lin_rows:
+                    sz = len(
+                        json.dumps(lr.lesson_summary or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    )
+                    if sz > max_lesson_bytes:
+                        max_lesson_bytes = sz
+
+                live_ok = live_count <= int(max_concurrent_instances)
+                cull_ok = len(stuck_culling) == 0
+                lesson_ok = max_lesson_bytes < 5120
+                db_ok = live_ok and cull_ok and lesson_ok
+                checks["database"] = {
+                    "ok": db_ok,
+                    "v5_tables_present": True,
+                    "live_instances": live_count,
+                    "max_concurrent_instances": int(max_concurrent_instances),
+                    "active_candidate_keys": sorted(active_candidate_keys),
+                    "stuck_culling_keys": stuck_culling,
+                    "lineage_records_count": len(lin_rows),
+                    "max_lesson_summary_bytes": max_lesson_bytes,
+                }
+                if not live_ok:
+                    failures.append(
+                        f"Live instance count {live_count} exceeds max {max_concurrent_instances}"
+                    )
+                if not cull_ok:
+                    failures.append(f"Stuck CULLING instances detected: {stuck_culling}")
+                if not lesson_ok:
+                    failures.append(f"Lineage lesson_summary exceeded 5KB: {max_lesson_bytes} bytes")
+        finally:
+            await db.dispose()
+    else:
+        checks["database"] = {"ok": True, "skipped": True, "v5_tables_present": False}
+
+    # 4. Orphan directory hygiene under instances_root (excluding `snapshots`)
+    dirs_on_disk: list[str] = []
+    if inst_path.exists():
+        dirs_on_disk = sorted(
+            p.name for p in inst_path.iterdir() if p.is_dir() and p.name != "snapshots"
+        )
+    if db_tables_present and active_candidate_keys:
+        unexpected_dirs = [d for d in dirs_on_disk if d not in active_candidate_keys]
+    else:
+        unexpected_dirs = list(dirs_on_disk)
+    orphan_ok = len(unexpected_dirs) == 0
+    checks["orphan_directories"] = {
+        "ok": orphan_ok,
+        "instances_root": str(inst_path),
+        "instances_root_exists": inst_path.exists(),
+        "candidate_dirs_on_disk": dirs_on_disk,
+        "unexpected_orphan_dirs": unexpected_dirs,
+    }
+    if not orphan_ok:
+        failures.append(f"Orphan candidate directories on disk: {unexpected_dirs}")
+
+    # 5. Optional HTTP /health check
+    if (api_base or "").strip():
+        url = f"{api_base.strip().rstrip('/')}/health"
+        api_ok = False
+        status_code: int | None = None
+        err_msg: str | None = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+                status_code = resp.status_code
+                api_ok = resp.status_code == 200
+        except Exception as exc:
+            err_msg = str(exc)
+        checks["api_health"] = {
+            "ok": api_ok,
+            "url": url,
+            "status_code": status_code,
+            "error": err_msg,
+        }
+        if not api_ok:
+            failures.append(f"API health check failed at {url}: status={status_code}, error={err_msg}")
+    else:
+        checks["api_health"] = {"ok": True, "skipped": True}
+
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "steady_state_ok": len(failures) == 0,
+        "checks": checks,
+        "failures": failures,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run AOC V5.0 read-only steady-state soak check.")
+    parser.add_argument("--repo-root", type=str, default=str(PROJECT_ROOT), help="Path to AOC repository.")
+    parser.add_argument(
+        "--instances-root", type=str, default="/home/ubuntu/aoc-instances", help="Candidate instances directory."
+    )
+    parser.add_argument("--min-free-disk-ratio", type=float, default=0.20, help="Minimum required free disk ratio.")
+    parser.add_argument("--max-concurrent-instances", type=int, default=2, help="Maximum concurrent live instances.")
+    parser.add_argument("--db-url", type=str, default="", help="Optional database URL for control-plane inspection.")
+    parser.add_argument("--api-base", type=str, default="", help="Optional API base URL for /health check.")
+    parser.add_argument("--output", type=str, default="", help="Optional path to write JSON report.")
+    args = parser.parse_args()
+
+    report = asyncio.run(
+        run_v5_soak_check(
+            repo_root=args.repo_root,
+            instances_root=args.instances_root,
+            min_free_disk_ratio=args.min_free_disk_ratio,
+            max_concurrent_instances=args.max_concurrent_instances,
+            db_url=args.db_url,
+            api_base=args.api_base,
+        )
+    )
+    text_out = json.dumps(report, indent=2, ensure_ascii=False)
+    print(text_out)
+    if args.output:
+        Path(args.output).write_text(text_out + "\n", encoding="utf-8")
+    return 0 if report["steady_state_ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

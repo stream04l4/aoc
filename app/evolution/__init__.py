@@ -1,4 +1,4 @@
-"""AOC V5.0 Evolutionary Reproduction package (M1-M4)."""
+"""AOC V5.0 Evolutionary Reproduction package (M1-M5)."""
 
 from app.evolution.arena import FitnessArena
 from app.evolution.benchmarks import (

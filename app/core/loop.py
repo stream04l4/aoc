@@ -137,6 +137,7 @@ class AutonomousLoop:
         human_bridge: Any = None,
         investigation_manager: Any = None,
         entropy_sensor: Any = None,
+        culling_gc: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -163,6 +164,7 @@ class AutonomousLoop:
         self.human_bridge = human_bridge
         self.investigation_manager = investigation_manager
         self.entropy_sensor = entropy_sensor
+        self.culling_gc = culling_gc
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -230,6 +232,13 @@ class AutonomousLoop:
             self.organism_id, note="Interrupted before completion (recovered on startup)"
         )
         orch_rec = await self.orchestrator.recover_on_startup()
+        evo_orphan_rec: dict[str, Any] = {"skipped": True}
+        if self.culling_gc is not None and self.settings.database.schema_name == "public":
+            try:
+                evo_orphan_rec = await self.culling_gc.recover_orphan_candidates()
+            except Exception as exc:
+                logger.warning("loop.evolution_orphan_gc_degraded", error=str(exc))
+                evo_orphan_rec = {"error": str(exc)}
         probes = await self.registry.probe_all()
         # V2.0 P1-7: Register external Agent static capabilities ONLY as DECLARED/AVAILABLE (never ACQUIRED)
         if self.self_model is not None:
@@ -279,6 +288,7 @@ class AutonomousLoop:
         summary = {
             "closed_interrupted_cycles": closed_cycles,
             "orchestrator": orch_rec,
+            "evolution_orphan_gc": evo_orphan_rec,
             "agents_healthy": sum(1 for p in probes.values() if p.ok),
             "memory": mem_info,
         }

@@ -565,6 +565,7 @@ class OrganismRuntime:
             human_bridge=self.human_bridge,
             investigation_manager=self.investigation_manager,
             entropy_sensor=self.entropy_sensor,
+            culling_gc=self.culling_gc,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error

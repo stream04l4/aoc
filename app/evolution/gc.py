@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -15,6 +16,7 @@ from app.evolution.interfaces import (
     InstanceRole,
     InstanceStatus,
     LineageOutcome,
+    ProposalStage,
     is_droppable_instance_schema,
 )
 from app.evolution.repository import EvolutionRepository
@@ -24,6 +26,11 @@ from app.perception.interfaces import utcnow
 from app.storage.database import Database
 
 logger = get_logger("aoc.evolution.gc")
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    """Normalize naive or offset datetimes to UTC for safe age arithmetic."""
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
 class CullingGC:
@@ -310,3 +317,98 @@ class CullingGC:
             lineage_recorded=lineage_recorded,
             errors=errors,
         )
+
+    async def recover_orphan_candidates(
+        self,
+        *,
+        stale_grace_seconds: float = 300.0,
+        default_max_seconds: float = 1200.0,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Resume interrupted CULLING runs and reclaim stale orphan candidate instances on startup."""
+        ref_now = _ensure_utc(now) if now is not None else utcnow()
+        instances = await self.repo.list_instances(limit=200)
+        summary: dict[str, Any] = {
+            "scanned": len(instances),
+            "resumed_culling": [],
+            "culled_stale": [],
+            "skipped_pending_promotion": [],
+            "failed": [],
+        }
+
+        for inst in instances:
+            if (
+                inst.get("role") != InstanceRole.CANDIDATE.value
+                or inst.get("db_schema") == "public"
+                or not is_droppable_instance_schema(inst.get("db_schema"))
+            ):
+                continue
+
+            status = inst.get("status")
+            inst_key = inst["instance_key"]
+
+            if status == InstanceStatus.CULLING.value:
+                rep = await self.cull_instance(
+                    inst["id"],
+                    reason="Resumed interrupted CullingGC on startup recovery",
+                    proposal_id=inst.get("proposal_id"),
+                    anti_pattern_tags=["orphan_recovery", "gc_resume"],
+                    safety_passed=False,
+                )
+                if rep.zero_residual_verified:
+                    summary["resumed_culling"].append(inst_key)
+                else:
+                    summary["failed"].append({"instance_key": inst_key, "errors": rep.errors})
+                continue
+
+            if status in {
+                InstanceStatus.INITIALIZING.value,
+                InstanceStatus.INCUBATING.value,
+                InstanceStatus.TESTING.value,
+            }:
+                prop = (
+                    await self.repo.get_proposal(inst["proposal_id"])
+                    if inst.get("proposal_id") is not None
+                    else None
+                )
+                if prop is not None and prop.get("stage") in {
+                    ProposalStage.STAGE4_PENDING_PROMOTION.value,
+                    ProposalStage.PROMOTED.value,
+                }:
+                    summary["skipped_pending_promotion"].append(inst_key)
+                    continue
+
+                budget_sec = (
+                    float((prop.get("arena_budget") or {}).get("max_seconds", default_max_seconds))
+                    if prop is not None
+                    else float(default_max_seconds)
+                )
+                threshold = max(0.0, budget_sec) + max(0.0, float(stale_grace_seconds))
+                ts = inst.get("updated_at") or inst.get("created_at")
+                age = (ref_now - _ensure_utc(ts)).total_seconds() if isinstance(ts, datetime) else 0.0
+                if age < threshold:
+                    continue
+
+                rep = await self.cull_instance(
+                    inst["id"],
+                    reason=f"Orphan candidate exceeded stale threshold ({age:.0f}s >= {threshold:.0f}s)",
+                    proposal_id=inst.get("proposal_id"),
+                    hypothesis=(prop or {}).get("hypothesis", ""),
+                    anti_pattern_tags=["orphan_recovery", "stale_timeout"],
+                    safety_passed=False,
+                )
+                if rep.zero_residual_verified:
+                    summary["culled_stale"].append(inst_key)
+                    if prop is not None and prop.get("stage") == ProposalStage.STAGE3_ARENA_RUNNING.value:
+                        await self.repo.update_proposal(prop["id"], stage=ProposalStage.CULLED.value)
+                else:
+                    summary["failed"].append({"instance_key": inst_key, "errors": rep.errors})
+
+        if (
+            summary["resumed_culling"]
+            or summary["culled_stale"]
+            or summary["skipped_pending_promotion"]
+            or summary["failed"]
+        ):
+            logger.info("gc.orphan_recovery_completed", **summary)
+        return summary

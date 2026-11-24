@@ -981,6 +981,12 @@ def create_app(
             status=status, role=role, limit=min(max(limit, 1), 200)
         )
 
+    @app.post("/v5/evolution/gc/recover")
+    async def recover_evolution_orphans_v5(
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        return await _rt().culling_gc.recover_orphan_candidates()
+
     # V2.1 AOC Control Center read-only API router (enforces Bearer Token + SCOPE_READ)
     app.include_router(create_control_center_router(_rt))
 
