@@ -136,6 +136,7 @@ class AutonomousLoop:
         exploration_manager: Any = None,
         human_bridge: Any = None,
         investigation_manager: Any = None,
+        entropy_sensor: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -161,6 +162,7 @@ class AutonomousLoop:
         self.exploration_manager = exploration_manager
         self.human_bridge = human_bridge
         self.investigation_manager = investigation_manager
+        self.entropy_sensor = entropy_sensor
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -1311,6 +1313,14 @@ class AutonomousLoop:
         if self.skill_registry is not None:
             validated_skill_count = await self.skill_registry.count_validated_skills(verify_integrity=True)
 
+        entropy_metrics: dict[str, float] = {}
+        if self.entropy_sensor is not None:
+            try:
+                snap = await self.entropy_sensor.measure()
+                entropy_metrics = dict(getattr(snap, "metrics", None) or {})
+            except Exception as exc:
+                logger.warning("cycle.entropy_sensor_degraded", error=str(exc))
+
         return DriveContext(
             now=now,
             observation=obs,
@@ -1321,6 +1331,7 @@ class AutonomousLoop:
                 "tokens_used": budget.tokens_used_today,
                 "tokens_limit": budget.tokens_limit_per_day,
             },
+            entropy_metrics=entropy_metrics,
             capabilities_acquired=acquired_caps,
             validated_capabilities=validated_caps,
             validated_skill_count=validated_skill_count,

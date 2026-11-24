@@ -293,6 +293,15 @@ class EvolutionRepository:
             ).scalar_one_or_none()
             return _proposal_to_dict(row) if row is not None else None
 
+    async def get_proposal_by_key(self, proposal_key: str) -> dict[str, Any] | None:
+        async with self.db.session() as s:
+            row = (
+                await s.execute(
+                    select(EvolutionProposalRow).where(EvolutionProposalRow.proposal_key == proposal_key)
+                )
+            ).scalar_one_or_none()
+            return _proposal_to_dict(row) if row is not None else None
+
     async def update_proposal(self, proposal_id: uuid.UUID | str, **fields: Any) -> dict[str, Any] | None:
         uid = _as_uuid(proposal_id)
         async with self.db.session() as s:

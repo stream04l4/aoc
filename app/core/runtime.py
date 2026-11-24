@@ -33,6 +33,10 @@ from app.core.lifecycle import LifecycleManager
 from app.core.loop import AutonomousLoop
 from app.core.scheduler import OrganismScheduler
 from app.drives.engine import DriveEngine
+from app.evolution.constitution_guard import ConstitutionGuard
+from app.evolution.entropy_sensor import EntropySensor
+from app.evolution.proposal_manager import ProposalManager
+from app.evolution.repository import EvolutionRepository
 from app.governance.approval import ApprovalService
 from app.governance.policy import GovernanceManager
 from app.governance.semantic_policy import SemanticRiskClassifier
@@ -210,11 +214,21 @@ class OrganismRuntime:
             cooldown_minutes=self.settings.kernel_v3.human_outreach_cooldown_minutes,
             topic_dedup_hours=self.settings.kernel_v3.human_outreach_topic_dedup_hours,
         )
+        self.evolution_repo = EvolutionRepository(self.repo.db)
+        self.entropy_sensor = EntropySensor(self.repo.db)
+        self.constitution_guard = ConstitutionGuard(repo_root=self.settings.evolution.repo_root)
+        self.proposal_manager = ProposalManager(
+            evo_repo=self.evolution_repo,
+            state_repo=self.repo,
+            constitution_guard=self.constitution_guard,
+            entropy_sensor=self.entropy_sensor,
+        )
         self.telegram_webhook = TelegramWebhookHandler(
             self.settings.telegram,
             self.approval_service,
             self.repo,
             notifier=self.telegram_notifier,
+            proposal_manager=self.proposal_manager,
         )
         self.telegram_poller: TelegramPoller | None = None
         self.outbox = OutboxDispatcher(
@@ -506,6 +520,7 @@ class OrganismRuntime:
             exploration_manager=self.exploration_manager,
             human_bridge=self.human_bridge,
             investigation_manager=self.investigation_manager,
+            entropy_sensor=self.entropy_sensor,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error
@@ -555,6 +570,7 @@ class OrganismRuntime:
                     repo=self.repo,
                     lifecycle=self.lifecycle,
                     status_fn=_status_summary,
+                    proposal_manager=self.proposal_manager,
                 )
                 self.telegram_poller.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))

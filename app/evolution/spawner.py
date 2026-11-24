@@ -55,6 +55,7 @@ class InstanceSpawner:
         docker_launcher_fn: Callable[[list[str]], Awaitable[None] | None] | None = None,
         health_checker_fn: Callable[[int, float], Awaitable[bool] | bool] | None = None,
         blank_slate_verifier_fn: Callable[[str, str, str | None, str], Awaitable[BlankSlateReport]] | None = None,
+        require_stage2_approval: bool = False,
     ) -> None:
         self.settings = settings
         self.repo = repo
@@ -69,6 +70,7 @@ class InstanceSpawner:
         self._docker_launcher_fn = docker_launcher_fn or self._default_docker_launch
         self._health_checker_fn = health_checker_fn or self._default_health_check
         self._blank_slate_verifier_fn = blank_slate_verifier_fn
+        self.require_stage2_approval = require_stage2_approval
 
     async def _maybe_await(self, res: Any) -> Any:
         if hasattr(res, "__await__"):
@@ -205,6 +207,37 @@ class InstanceSpawner:
         instance_key = validate_instance_key(req.instance_key or f"gen{req.generation}-{short_id}")
         schema_suffix = req.instance_key.replace("-", "_") if req.instance_key else short_id
         schema_name = req.target_schema or build_instance_schema_name(schema_suffix)
+
+        # Gate 0: Require explicit Stage 2 human approval when enforced by funnel
+        if self.require_stage2_approval:
+            if req.proposal_id is None:
+                return SpawnResult(
+                    success=False,
+                    instance_key=instance_key,
+                    generation=req.generation,
+                    db_schema=schema_name,
+                    error="Stage 2 human approval required: missing proposal_id.",
+                )
+            prop = await self.repo.get_proposal(req.proposal_id)
+            if prop is None:
+                return SpawnResult(
+                    success=False,
+                    instance_key=instance_key,
+                    generation=req.generation,
+                    db_schema=schema_name,
+                    error=f"Stage 2 approval check failed: proposal {req.proposal_id} not found.",
+                )
+            if prop.get("stage") != "STAGE2_APPROVED" or not prop.get("approved_by"):
+                return SpawnResult(
+                    success=False,
+                    instance_key=instance_key,
+                    generation=req.generation,
+                    db_schema=schema_name,
+                    error=(
+                        f"Stage 2 human approval required before spawning "
+                        f"(current stage={prop.get('stage')}, approved_by={prop.get('approved_by')!r})."
+                    ),
+                )
 
         # Gate 1: Hard host disk headroom check (>= 20% free required)
         free_ratio = float(self._disk_free_ratio_fn(self.instances_root))

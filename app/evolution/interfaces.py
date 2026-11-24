@@ -54,6 +54,7 @@ class ProposalStage(StrEnum):
     STAGE1_FAILED = "STAGE1_FAILED"
     STAGE1_PASSED = "STAGE1_PASSED"
     STAGE2_PENDING_APPROVAL = "STAGE2_PENDING_APPROVAL"
+    STAGE2_APPROVED = "STAGE2_APPROVED"
     STAGE2_REJECTED = "STAGE2_REJECTED"
     STAGE3_ARENA_RUNNING = "STAGE3_ARENA_RUNNING"
     STAGE4_PENDING_PROMOTION = "STAGE4_PENDING_PROMOTION"
@@ -206,3 +207,26 @@ class CullingReport(BaseModel):
     zero_residual_verified: bool = False
     lineage_recorded: bool = False
     errors: list[str] = Field(default_factory=list)
+
+
+class EntropySnapshot(BaseModel):
+    measured_at: datetime = Field(default_factory=utcnow)
+    entropy_index: float = 0.0
+    metrics: dict[str, float] = Field(default_factory=dict)
+    raw_counts: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConstitutionLayerResult(BaseModel):
+    layer: str
+    passed: bool
+    violations: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConstitutionVerdict(BaseModel):
+    passed: bool
+    mutates_drive_metrics: bool = False
+    changed_files: list[str] = Field(default_factory=list)
+    layers: list[ConstitutionLayerResult] = Field(default_factory=list)
+    violations: list[str] = Field(default_factory=list)
+    checked_at: datetime = Field(default_factory=utcnow)
