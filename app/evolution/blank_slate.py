@@ -16,6 +16,12 @@ _NON_INHERITABLE_WORLD_KINDS = (
     "knowledge_topic",
     "exploration_topic",
     "investigation_thread",
+    "human_inbox",
+    "dialogue_turn",
+    "social_deferred_reply",
+    "social_rhythm_state",
+    "human_outreach_card",
+    "telegram_pending_reply",
 )
 _REQUIRED_BLANK_TABLES = (
     "memory_index",
@@ -126,6 +132,28 @@ class BlankSlateVerifier:
                     observed=ws_cnt,
                     expected=0,
                     detail="" if ws_cnt == 0 else f"found {ws_cnt} inherited world_states artifacts",
+                )
+            )
+
+            social_mem_cnt = int(
+                (
+                    await conn.execute(
+                        text(
+                            f"SELECT count(*) FROM {_tbl('memory_index')} "
+                            "WHERE source = 'dialogue:telegram' OR source LIKE 'dialogue:%'"
+                        )
+                    )
+                ).scalar_one()
+            )
+            checks.append(
+                BlankSlateCheckItem(
+                    name="social_dialogue_memories_zero",
+                    passed=social_mem_cnt == 0,
+                    observed=social_mem_cnt,
+                    expected=0,
+                    detail=""
+                    if social_mem_cnt == 0
+                    else f"found {social_mem_cnt} inherited personal dialogue memories",
                 )
             )
 

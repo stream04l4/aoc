@@ -17,11 +17,12 @@ Key invariants:
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import time
 import uuid
 from contextlib import nullcontext
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.agents.registry import AgentRegistry
@@ -40,6 +41,9 @@ from app.cognition.interfaces import (
     BrainInterface,
     CognitiveContext,
     GoalProposal,
+    SocialContext,
+    SocialInboxMessage,
+    SocialTurnDecision,
     VerificationSpec,
 )
 from app.cognition.preflight import ActionPreflight
@@ -59,7 +63,9 @@ from app.drives.engine import DriveEngine
 from app.drives.interfaces import DriveContext, DriveDecision, DriveState, KnowledgeGap
 from app.governance.interfaces import GovernanceInterface
 from app.memory.experience_manager import ExperienceManager
+from app.memory.interfaces import MemoryItem
 from app.memory.retrieval import build_contextual_query
+from app.notifications.telegram import sanitize_reaction_emoji
 from app.observability.logging import get_logger
 from app.observability.metrics import CYCLE_DURATION, CYCLES_TOTAL
 from app.orchestration.finalizer import TaskFinalizer
@@ -138,6 +144,7 @@ class AutonomousLoop:
         investigation_manager: Any = None,
         entropy_sensor: Any = None,
         culling_gc: Any = None,
+        telegram_notifier: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -165,6 +172,7 @@ class AutonomousLoop:
         self.investigation_manager = investigation_manager
         self.entropy_sensor = entropy_sensor
         self.culling_gc = culling_gc
+        self.telegram_notifier = telegram_notifier
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -212,6 +220,10 @@ class AutonomousLoop:
             investigation_manager=investigation_manager,
             world_pipeline=world_pipeline,
         )
+        if hasattr(self.finalizer, "register_hook"):
+            existing_hooks = getattr(self.finalizer, "_hooks", ())
+            if self._record_social_milestone_from_finalizer not in existing_hooks:
+                self.finalizer.register_hook(self._record_social_milestone_from_finalizer)
 
     def _record_prediction_error(self, error: float) -> None:
         self._last_prediction_error = max(-1.0, min(1.0, float(error)))
@@ -517,6 +529,22 @@ class AutonomousLoop:
                     payload={"kind": "critical_alert", "cycle_id": str(cycle_id), "reason": decision.reason, "message": "Organism entered CRITICAL emergency mode"},
                 )
 
+            # ── 6.5. SOCIAL REFLECTION (V5.1 Unified Consciousness Hook) ────
+            # Executed strictly AFTER Drive Arbitration & Affect update, and BEFORE IDLE / BUDGET_DEFERRED returns.
+            if self.settings.social.enabled:
+                social_res = await self._run_social_reflection(
+                    cycle_id=cycle_id,
+                    now=now,
+                    pre_obs=pre_obs,
+                    pre_drives=pre_drives,
+                    decision=decision,
+                    assessment=assessment,
+                    affect_state_snapshot=affect_state_snapshot,
+                    llm_available_for_brain=llm_available_for_brain,
+                    emergency_llm=emergency_llm,
+                )
+                state_changes["social_reflection"] = social_res
+
             # IDLE check (Scenario D: never force a task when all drives are satisfied)
             if decision.selected_drive == NO_DRIVE:
                 self._consecutive_idle_cycles += 1
@@ -527,7 +555,7 @@ class AutonomousLoop:
                     outcome=outcome,
                     pre_drives=pre_drives,
                     post_drives=pre_drives,
-                    state_changes={"action": "none", "reason": "all drives satisfied or below threshold"},
+                    state_changes={**state_changes, "action": "none", "reason": "all drives satisfied or below threshold"},
                     t0=t0,
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -546,7 +574,7 @@ class AutonomousLoop:
                     outcome=outcome,
                     pre_drives=pre_drives,
                     post_drives=pre_drives,
-                    state_changes={"action": "deferred", "budget": budget.model_dump(mode="json")},
+                    state_changes={**state_changes, "action": "deferred", "budget": budget.model_dump(mode="json")},
                     t0=t0,
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -616,6 +644,26 @@ class AutonomousLoop:
                 except Exception as exc:
                     logger.warning("cycle.investigations_load_degraded", cycle_id=str(cycle_id), error=str(exc))
 
+            pending_social_hints: list[dict[str, Any]] = []
+            if self.settings.social.enabled:
+                try:
+                    rhythm_rows_g = await self.repo.list_world_items(kind="social_rhythm_state")
+                    rhythm_g = next(
+                        (
+                            dict(r.get("value") or {})
+                            for r in rhythm_rows_g
+                            if r.get("key") == "primary" and isinstance(r.get("value"), dict)
+                        ),
+                        {},
+                    )
+                    pending_social_hints = [
+                        h
+                        for h in list(rhythm_g.get("pending_goal_hints") or [])
+                        if isinstance(h, dict) and str(h.get("hint") or "").strip()
+                    ][:3]
+                except Exception as exc:
+                    logger.warning("cycle.social_goal_hints_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -637,11 +685,23 @@ class AutonomousLoop:
                 human_outreach_available=outreach_avail,
                 active_investigations=active_investigations,
                 discovered_channels=discovered_channels,
+                social_goal_hints=pending_social_hints,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
 
             goal_proposal = await self._generate_goal_safe(cog_ctx, llm_available_for_brain, cycle_id)
+            if pending_social_hints:
+                try:
+                    await self.repo.upsert_world_item(
+                        kind="social_rhythm_state",
+                        key="primary",
+                        value={"pending_goal_hints": []},
+                        status="active",
+                        source="telegram:social",
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.social_goal_hints_clear_degraded", cycle_id=str(cycle_id), error=str(exc))
             if self.human_bridge is not None and isinstance(goal_proposal.message_to_human, dict):
                 try:
                     m = goal_proposal.message_to_human
@@ -675,7 +735,7 @@ class AutonomousLoop:
                     outcome=outcome,
                     pre_drives=pre_drives,
                     post_drives=pre_drives,
-                    state_changes={"action": "none", "goal_rationale": goal_proposal.rationale},
+                    state_changes={**state_changes, "action": "none", "goal_rationale": goal_proposal.rationale},
                     t0=t0,
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -785,7 +845,7 @@ class AutonomousLoop:
                         outcome,
                         pre_drives,
                         post_drives_dedup,
-                        {"action": "dedup_skipped", "goal_dedup": dedup_res.model_dump(mode="json")},
+                        {**state_changes, "action": "dedup_skipped", "goal_dedup": dedup_res.model_dump(mode="json")},
                         t0,
                     )
                     return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -948,7 +1008,7 @@ class AutonomousLoop:
                 await self.repo.transition_goal(goal_id, GoalStatus.ABANDONED.value, note="planner chose not to execute")
                 outcome = "IDLE"
                 await self.lifecycle.transition(LifecycleState.IDLE, reason="Planner produced no executable action", cycle_id=cycle_id)
-                await self._finalize_cycle(cycle_id, outcome, pre_drives, pre_drives, {"action": "abandoned"}, t0)
+                await self._finalize_cycle(cycle_id, outcome, pre_drives, pre_drives, {**state_changes, "action": "abandoned"}, t0)
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
 
             # ── 9. POLICY VALIDATION & DETERMINISTIC ACTION PREFLIGHT ───────
@@ -1044,7 +1104,7 @@ class AutonomousLoop:
                     outcome,
                     pre_drives,
                     pre_drives,
-                    {"preflight": preflight_res.model_dump(mode="json")},
+                    {**state_changes, "preflight": preflight_res.model_dump(mode="json")},
                     t0,
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -1109,7 +1169,7 @@ class AutonomousLoop:
                     outcome,
                     pre_drives,
                     pre_drives,
-                    {"policy_verdict": verdict.model_dump(mode="json")},
+                    {**state_changes, "policy_verdict": verdict.model_dump(mode="json")},
                     t0,
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -1175,7 +1235,7 @@ class AutonomousLoop:
                     outcome,
                     pre_drives,
                     pre_drives,
-                    {"task_id": task_id, "status": task_state["status"]},
+                    {**state_changes, "task_id": task_id, "status": task_state["status"]},
                     t0,
                 )
                 return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
@@ -1196,11 +1256,12 @@ class AutonomousLoop:
                     if fin_res.post_drives
                     else pre_drives
                 )
-                state_changes = fin_res.evaluation.get("measured_satisfaction_change") and {
+                exec_updates = fin_res.evaluation.get("measured_satisfaction_change") and {
                     "expected_outcome": fin_res.evaluation.get("expected_outcome", {}),
                     "actual_outcome": fin_res.evaluation.get("actual_outcome", {}),
                     "measured_satisfaction_change": fin_res.measured_satisfaction_change,
                 } or {}
+                state_changes = {**state_changes, **exec_updates}
                 outcome = "SUCCEEDED" if fin_res.goal_achieved else "ACTION_FAILED"
             else:
                 # Edge case: task failed before any execution was created (e.g. no healthy agent)
@@ -1210,7 +1271,11 @@ class AutonomousLoop:
                     note=(task_state.get("outcome") or {}).get("error", "task failed before dispatch"),
                 )
                 post_drives = pre_drives
-                state_changes = {"task_status": task_state["status"], "error": (task_state.get("outcome") or {}).get("error")}
+                state_changes = {
+                    **state_changes,
+                    "task_status": task_state["status"],
+                    "error": (task_state.get("outcome") or {}).get("error"),
+                }
                 outcome = "ACTION_FAILED"
 
             # ── 14. STATE UPDATE & 15. SLEEP / NEXT CYCLE ───────────────────
@@ -1697,6 +1762,746 @@ class AutonomousLoop:
         CYCLES_TOTAL.labels(outcome=outcome).inc()
         CYCLE_DURATION.observe(time.perf_counter() - t0)
         logger.info("cycle.finished", cycle_id=str(cycle_id), outcome=outcome, seconds=round(time.perf_counter() - t0, 2))
+
+    @staticmethod
+    def _parse_social_dt(raw: Any) -> datetime | None:
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        if not raw or not isinstance(raw, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    def _sanitize_social_output(self, raw_text: str | None) -> str:
+        text = str(raw_text or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"<internal_monologue>.*?</internal_monologue>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        # Strip inline DB connection URIs or Telegram bot token formats
+        text = re.sub(r"postgresql(?:\+\w+)?://[^\s]+", "[REDACTED_DB_URL]", text)
+        text = re.sub(r"bot[0-9]{6,}:[A-Za-z0-9_-]{10,}", "[REDACTED_BOT_TOKEN]", text)
+        # Strip explicit configured secrets (skip short generic tokens like "joel")
+        secret_holders = [
+            self.settings.telegram.bot_token,
+            self.settings.telegram.webhook_secret,
+            self.settings.llm.api_key,
+            self.settings.api.admin_key,
+            self.settings.api.internal_token,
+            self.settings.memory.letta_token,
+            self.settings.embedding.remote_api_key,
+        ]
+        for holder in secret_holders:
+            if holder is None:
+                continue
+            try:
+                sec = holder.get_secret_value() if hasattr(holder, "get_secret_value") else str(holder)
+            except Exception:
+                continue
+            if sec and len(sec) >= 8 and sec.lower() != "joel":
+                text = text.replace(sec, "[REDACTED]")
+        max_chars = max(80, int(self.settings.social.max_reply_chars))
+        return text[:max_chars].strip()
+
+    async def _extract_social_snapshot(self, pre_obs: Observation) -> dict[str, Any]:
+        env_state = pre_obs.environment_state if isinstance(pre_obs.environment_state, dict) else {}
+        if isinstance(env_state.get("social"), dict):
+            return dict(env_state["social"])
+        # Fallback when a custom SensorManager without EnvironmentSensor is used in tests
+        inbox_rows = await self.repo.list_world_items(kind="human_inbox", status="open")
+        turn_rows = await self.repo.list_world_items(kind="dialogue_turn")
+        def_rows = await self.repo.list_world_items(kind="social_deferred_reply", status="open")
+        rhythm_rows = await self.repo.list_world_items(kind="social_rhythm_state")
+        rhythm = next(
+            (dict(r.get("value") or {}) for r in rhythm_rows if r.get("key") == "primary" and isinstance(r.get("value"), dict)),
+            {},
+        )
+        inbox = [
+            {
+                "key": r["key"],
+                "source": r.get("source", "telegram"),
+                "sender": (r.get("value") or {}).get("sender", "joel"),
+                "chat_id": str((r.get("value") or {}).get("chat_id") or ""),
+                "text": str((r.get("value") or {}).get("text") or ""),
+                "message_id": (r.get("value") or {}).get("message_id"),
+                "update_id": (r.get("value") or {}).get("update_id"),
+                "reply_to_message_id": (r.get("value") or {}).get("reply_to_message_id"),
+                "received_at": str((r.get("value") or {}).get("received_at") or r.get("created_at") or ""),
+            }
+            for r in inbox_rows
+        ]
+        turns = [
+            {
+                "key": r["key"],
+                "role": str((r.get("value") or {}).get("role") or "human"),
+                "sender": str((r.get("value") or {}).get("sender") or ""),
+                "text": str((r.get("value") or {}).get("text") or ""),
+                "action": (r.get("value") or {}).get("action"),
+                "reaction_emoji": (r.get("value") or {}).get("reaction_emoji"),
+                "timestamp": str((r.get("value") or {}).get("timestamp") or r.get("created_at") or ""),
+            }
+            for r in turn_rows
+        ]
+        deferred = [
+            {
+                "key": r["key"],
+                "chat_id": str((r.get("value") or {}).get("chat_id") or ""),
+                "sender": str((r.get("value") or {}).get("sender") or "joel"),
+                "original_text": str((r.get("value") or {}).get("original_text") or ""),
+                "message_id": (r.get("value") or {}).get("message_id"),
+                "due_at": str((r.get("value") or {}).get("due_at") or ""),
+                "reason": str((r.get("value") or {}).get("reason") or ""),
+                "inbox_key": (r.get("value") or {}).get("inbox_key"),
+                "defer_count": int((r.get("value") or {}).get("defer_count") or 1),
+                "deferred_activity": str((r.get("value") or {}).get("deferred_activity") or ""),
+                "created_at": str((r.get("value") or {}).get("created_at") or r.get("created_at") or ""),
+            }
+            for r in def_rows
+        ]
+        inbox.sort(key=lambda x: str(x.get("received_at") or ""))
+        turns.sort(key=lambda x: str(x.get("timestamp") or ""))
+        deferred.sort(key=lambda x: str(x.get("due_at") or ""))
+        return {
+            "inbox": inbox,
+            "dialogue_turns": turns[-max(1, int(self.settings.social.dialogue_window_turns)) :],
+            "deferred_replies": deferred,
+            "rhythm": rhythm,
+        }
+
+    async def _record_social_milestone_from_finalizer(self, result: Any) -> None:
+        """Record verified milestones (crystallized skill or high-IG breakthrough) for proactive sharing."""
+        if not self.settings.social.enabled or getattr(result, "already_finalized", False):
+            return
+        try:
+            ev = getattr(result, "evaluation", None) or {}
+            exec_id = str(getattr(result, "execution_id", "") or "")
+            if not exec_id:
+                return
+            milestone: dict[str, Any] | None = None
+            skill_cryst = ev.get("skill_crystallized")
+            if isinstance(skill_cryst, dict) and skill_cryst:
+                sk_name = str(skill_cryst.get("canonical_name") or skill_cryst.get("skill_key") or "新技能")
+                milestone = {
+                    "kind": "skill_crystallized",
+                    "event_id": exec_id,
+                    "summary": f"刚把「{sk_name}」沉淀为可复用技能并验证通过",
+                    "at": utcnow().isoformat(),
+                }
+            elif bool(getattr(result, "goal_achieved", False)):
+                ig = float(ev.get("information_gain") or 0.0)
+                if ig >= float(self.settings.social.proactive_high_ig_threshold):
+                    raw_sum = str(ev.get("summary") or "").strip()[:180]
+                    milestone = {
+                        "kind": "high_ig_discovery",
+                        "event_id": exec_id,
+                        "summary": raw_sum or f"刚完成高信息增益探索 (IG={ig:.2f})",
+                        "at": utcnow().isoformat(),
+                    }
+            if milestone is not None:
+                await self.repo.upsert_world_item(
+                    kind="social_rhythm_state",
+                    key="primary",
+                    value={"pending_milestone": milestone},
+                    status="active",
+                    source="telegram:social",
+                )
+        except Exception as exc:
+            logger.warning("loop.social_milestone_record_degraded", error=str(exc))
+
+    def _evaluate_proactive_impulse(
+        self,
+        *,
+        now: datetime,
+        rhythm: dict[str, Any],
+        affect_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """24/7 rule gate for proactive affect/milestone outreach with exponential backoff on ignored pokes."""
+        social_cfg = self.settings.social
+        if not social_cfg.proactive_enabled:
+            return None
+
+        target_chat = str(rhythm.get("last_human_chat_id") or "").strip()
+        if not target_chat and not (self.settings.telegram.allowed_chat_ids or []):
+            return None
+
+        consecutive_ignored = max(0, int(rhythm.get("consecutive_ignored_proactive") or 0))
+        base_min = max(1, int(social_cfg.min_proactive_interval_minutes))
+        mult = max(1.0, float(social_cfg.proactive_backoff_multiplier))
+        max_min = max(base_min, int(social_cfg.proactive_max_backoff_minutes))
+        effective_backoff_min = min(float(max_min), float(base_min) * (mult ** consecutive_ignored))
+
+        last_pro_dt = self._parse_social_dt(rhythm.get("last_proactive_at"))
+        if last_pro_dt is not None and (now - last_pro_dt).total_seconds() < effective_backoff_min * 60.0:
+            return None
+
+        last_eval_dt = self._parse_social_dt(rhythm.get("last_proactive_evaluated_at"))
+        if last_eval_dt is not None and (now - last_eval_dt).total_seconds() < float(base_min) * 60.0:
+            return None
+
+        last_reply_dt = self._parse_social_dt(rhythm.get("last_reply_at"))
+        if last_reply_dt is not None and (now - last_reply_dt).total_seconds() < float(base_min) * 60.0:
+            return None
+
+        pending_ms = rhythm.get("pending_milestone")
+        if isinstance(pending_ms, dict) and pending_ms.get("event_id"):
+            ev_id = str(pending_ms["event_id"])
+            if ev_id != str(rhythm.get("last_shared_milestone_id") or ""):
+                return {
+                    "kind": "milestone",
+                    "event_id": ev_id,
+                    "hint": f"刚有新成果 ({pending_ms.get('kind', 'milestone')}): {str(pending_ms.get('summary') or '')[:180]}",
+                }
+
+        if isinstance(affect_snapshot, dict) and affect_snapshot:
+            val = float(affect_snapshot.get("valence", 0.0) or 0.0)
+            aro = float(affect_snapshot.get("arousal", 0.2) or 0.2)
+            fru = float(affect_snapshot.get("frustration", 0.0) or 0.0)
+            bor = float(affect_snapshot.get("boredom", 0.0) or 0.0)
+
+            if val >= float(social_cfg.proactive_valence_threshold) and aro >= float(social_cfg.proactive_arousal_threshold):
+                return {
+                    "kind": "excitement",
+                    "event_id": None,
+                    "hint": f"此刻心情积极且兴奋度高 (valence={val:.2f}, arousal={aro:.2f})，有顺便分享或聊两句的冲动",
+                }
+            if fru >= float(social_cfg.proactive_frustration_threshold):
+                return {
+                    "kind": "frustration",
+                    "event_id": None,
+                    "hint": f"刚才连续碰到卡点有些烦躁 (frustration={fru:.2f})，可以决定是找 Joel 吐槽一句还是自己扛",
+                }
+            if bor >= float(social_cfg.proactive_boredom_threshold):
+                return {
+                    "kind": "boredom",
+                    "event_id": None,
+                    "hint": f"这段时间有些单调无聊 (boredom={bor:.2f})，可以决定要不要随便找 Joel 闲聊一句",
+                }
+        return None
+
+    async def _run_social_reflection(
+        self,
+        *,
+        cycle_id: uuid.UUID,
+        now: datetime,
+        pre_obs: Observation,
+        pre_drives: dict[str, DriveState],
+        decision: DriveDecision,
+        assessment: AssessmentResult | None,
+        affect_state_snapshot: dict[str, Any] | None,
+        llm_available_for_brain: bool,
+        emergency_llm: bool,
+    ) -> dict[str, Any]:
+        """Execute rule-gated unified social reflection inside AutonomousLoop (0 LLM calls when quiet)."""
+        social_cfg = self.settings.social
+        snap = await self._extract_social_snapshot(pre_obs)
+        open_inbox = [m for m in list(snap.get("inbox") or []) if isinstance(m, dict) and str(m.get("text") or "").strip()]
+        open_inbox = open_inbox[: max(1, int(social_cfg.max_inbox_batch))]
+
+        due_deferred: list[dict[str, Any]] = []
+        for item in list(snap.get("deferred_replies") or []):
+            if not isinstance(item, dict):
+                continue
+            due_dt = self._parse_social_dt(item.get("due_at"))
+            if due_dt is None or due_dt <= now:
+                enriched = dict(item)
+                ref_dt = self._parse_social_dt(enriched.get("created_at")) or due_dt
+                if ref_dt is not None:
+                    enriched["elapsed_minutes"] = max(0, int(round((now - ref_dt).total_seconds() / 60.0)))
+                due_deferred.append(enriched)
+
+        rhythm = dict(snap.get("rhythm") or {}) if isinstance(snap.get("rhythm"), dict) else {}
+        eff_affect = affect_state_snapshot
+        if eff_affect is None and self.affect is not None and getattr(self.affect, "enabled", False):
+            eff_affect = self.affect.state.model_dump(mode="json")
+
+        impulse = (
+            None
+            if (open_inbox or due_deferred)
+            else self._evaluate_proactive_impulse(now=now, rhythm=rhythm, affect_snapshot=eff_affect)
+        )
+        proactive_hint = impulse["hint"] if impulse else None
+
+        # Pure-rule gate: 0 extra LLM calls on normal non-social cycles
+        if not open_inbox and not due_deferred and not proactive_hint:
+            return {"triggered": False, "reason": "no_social_trigger", "llm_calls": 0}
+        if decision.constraints.get("emergency_mode"):
+            return {"triggered": False, "reason": "survival_emergency_mode", "llm_calls": 0}
+        if not llm_available_for_brain:
+            return {"triggered": False, "reason": "llm_unavailable", "llm_calls": 0}
+
+        trigger_source = "inbox" if open_inbox else ("deferred_due" if due_deferred else "proactive_impulse")
+
+        # Assemble live organism telemetry (drives, busyness, self_model, memory resonance, fatigue)
+        active_goals = await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=3)
+        running_tasks = await self.repo.list_tasks(
+            statuses=[TaskStatus.RUNNING.value, TaskStatus.DISPATCHING.value, TaskStatus.DISPATCHED.value],
+            limit=3,
+        )
+        busy_focus = 0.25 if decision.selected_drive != NO_DRIVE else 0.05
+        if active_goals:
+            busy_focus += 0.30
+        if running_tasks:
+            busy_focus += 0.35
+        busy_focus += 0.10 * min(1.0, max(0.0, float(decision.priority_score or 0.0)))
+        busy_focus_level = round(min(1.0, busy_focus), 3)
+
+        activity_parts: list[str] = []
+        if running_tasks:
+            activity_parts.append(f"正在运行任务: {str(running_tasks[0].get('objective') or '')[:100]}")
+        elif active_goals:
+            activity_parts.append(f"当前推进目标: {str(active_goals[0].get('title') or '')[:100]}")
+        elif decision.selected_drive != NO_DRIVE:
+            activity_parts.append(f"主导内驱力 {decision.selected_drive}: {decision.reason[:100]}")
+        else:
+            activity_parts.append("当前各内驱力相对满足，处于休整/思考间隙")
+        if assessment is not None and assessment.recommended_focus:
+            activity_parts.append(f"自我评估焦点: {assessment.recommended_focus[:100]}")
+        current_activity_summary = " | ".join(activity_parts)
+
+        self_model_summary: dict[str, Any] = {}
+        if self.self_model is not None:
+            try:
+                sm_snap = await self.self_model.get_latest_snapshot()
+                if isinstance(sm_snap, dict):
+                    self_model_summary = {
+                        "version_number": sm_snap.get("version_number"),
+                        "summary": str(sm_snap.get("summary_text") or "")[:500],
+                    }
+            except Exception as exc:
+                logger.warning("cycle.social_self_model_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+        query_parts = [str(m.get("text") or "") for m in open_inbox] + [
+            str(d.get("original_text") or "") for d in due_deferred
+        ]
+        recall_query = " ".join(p for p in query_parts if p).strip()[:400]
+        relevant_memories: list[dict[str, Any]] = []
+        memory_resonance = 0.0
+        if recall_query and self.memory is not None:
+            try:
+                if hasattr(self.memory, "search_hybrid"):
+                    scored = await self.memory.search_hybrid(query=recall_query, limit=5)
+                    for sc in scored:
+                        d_item = sc.item.model_dump(mode="json")
+                        d_item["score"] = float(getattr(sc, "total_score", 0.0) or 0.0)
+                        relevant_memories.append(d_item)
+                        memory_resonance = max(memory_resonance, d_item["score"])
+                else:
+                    recalled = await self.memory.recall(query=recall_query, limit=5)
+                    for mem in recalled:
+                        relevant_memories.append(mem.model_dump(mode="json"))
+                    if recalled:
+                        memory_resonance = 0.5
+            except Exception as exc:
+                logger.warning("cycle.social_memory_recall_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+        dialogue_turns = [t for t in list(snap.get("dialogue_turns") or []) if isinstance(t, dict)]
+        recent_30m_turns = 0
+        for turn in dialogue_turns:
+            ts = self._parse_social_dt(turn.get("timestamp"))
+            if ts is not None and (now - ts).total_seconds() <= 1800:
+                recent_30m_turns += 1
+        ignored_streak = max(0, int(rhythm.get("consecutive_ignored_proactive") or 0))
+        social_fatigue = round(min(1.0, (recent_30m_turns / 10.0) * 0.7 + min(3, ignored_streak) * 0.15), 3)
+
+        inbox_models = [
+            SocialInboxMessage(
+                key=str(m.get("key") or ""),
+                sender=str(m.get("sender") or "joel"),
+                chat_id=str(m.get("chat_id") or ""),
+                text=str(m.get("text") or ""),
+                message_id=m.get("message_id") if isinstance(m.get("message_id"), int) else None,
+                reply_to_message_id=(
+                    m.get("reply_to_message_id") if isinstance(m.get("reply_to_message_id"), int) else None
+                ),
+                received_at=str(m.get("received_at") or ""),
+            )
+            for m in open_inbox
+        ]
+        social_ctx = SocialContext(
+            trigger_source=trigger_source,
+            now_iso=now.isoformat(),
+            unread_messages=inbox_models,
+            due_deferred_replies=due_deferred,
+            recent_dialogue=dialogue_turns[-max(1, int(social_cfg.dialogue_window_turns)) :],
+            affect_state=eff_affect,
+            drives=list(pre_drives.values()),
+            dominant_drive=decision.selected_drive,
+            busy_focus_level=busy_focus_level,
+            current_activity_summary=current_activity_summary,
+            self_model_summary=self_model_summary,
+            relevant_memories=relevant_memories,
+            memory_resonance=min(1.0, round(memory_resonance, 3)),
+            recent_social_fatigue=social_fatigue,
+            rhythm_state=rhythm,
+            allowed_reaction_emojis=list(social_cfg.allowed_reaction_emojis),
+            proactive_hint=proactive_hint,
+        )
+
+        await self.repo.update_cycle(cycle_id, phase="SOCIAL_REFLECTION")
+        try:
+            with self._gateway_scope(cycle_id=cycle_id, purpose="social_converse", emergency=emergency_llm):
+                social_dec = await self.brain.converse(social_ctx)
+            await self._record_llm_usage("converse", social_dec.usage, cycle_id)
+        except Exception as exc:
+            logger.warning("cycle.social_converse_failed", cycle_id=str(cycle_id), error=str(exc))
+            return {
+                "triggered": True,
+                "trigger_source": trigger_source,
+                "action": "ERROR",
+                "delivered": False,
+                "error": str(exc)[:300],
+            }
+
+        final_action = social_dec.action
+        sanitized_reply = self._sanitize_social_output(social_dec.reply_text)
+        safe_emoji: str | None = None
+        if trigger_source == "proactive_impulse" and final_action in {"REACT_ONLY", "REPLY_LATER"}:
+            final_action = "IGNORE"
+        if final_action == "REPLY_NOW" and not sanitized_reply:
+            if social_dec.reaction_emoji and trigger_source != "proactive_impulse":
+                final_action = "REACT_ONLY"
+            else:
+                final_action = "IGNORE"
+
+        next_defer_count = (
+            (max(int(d.get("defer_count") or 1) for d in due_deferred) + 1)
+            if (due_deferred and not open_inbox)
+            else 1
+        )
+        defer_cap_reached = False
+        if final_action == "REPLY_LATER" and next_defer_count > max(1, int(social_cfg.max_defer_count)):
+            final_action = "IGNORE"
+            defer_cap_reached = True
+
+        if final_action == "REACT_ONLY":
+            safe_emoji = sanitize_reaction_emoji(
+                social_dec.reaction_emoji,
+                allowed=social_cfg.allowed_reaction_emojis,
+                fallback=social_cfg.fallback_reaction_emoji,
+            )
+
+        # Mark inbox & deferred items processed/handled now that converse() succeeded
+        for msg in open_inbox:
+            await self.repo.upsert_world_item(
+                kind="human_inbox",
+                key=str(msg.get("key") or ""),
+                value={
+                    "handled_action": final_action,
+                    "handled_cycle_id": str(cycle_id),
+                    "handled_at": now.isoformat(),
+                },
+                status="processed",
+            )
+        for item in due_deferred:
+            await self.repo.upsert_world_item(
+                kind="social_deferred_reply",
+                key=str(item.get("key") or ""),
+                value={"handled_cycle_id": str(cycle_id), "handled_at": now.isoformat()},
+                status="handled",
+            )
+
+        # Record incoming human turn(s) into short-term dialogue window
+        for idx, msg in enumerate(open_inbox):
+            h_key = f"turn:{int(now.timestamp() * 1000)}:h:{idx}:{secrets.token_hex(3)}"
+            await self.repo.upsert_world_item(
+                kind="dialogue_turn",
+                key=h_key,
+                value={
+                    "role": "human",
+                    "sender": str(msg.get("sender") or "joel"),
+                    "chat_id": str(msg.get("chat_id") or ""),
+                    "text": str(msg.get("text") or "")[:1000],
+                    "message_id": msg.get("message_id"),
+                    "timestamp": str(msg.get("received_at") or now.isoformat()),
+                },
+                status="recorded",
+                source="dialogue:telegram",
+            )
+
+        # Target Telegram chat_id & message_id resolution
+        fallback_chats = list(self.settings.telegram.allowed_chat_ids or [])
+        default_chat = str(fallback_chats[0]).strip() if fallback_chats else ""
+        target_chat_id = str(
+            (open_inbox[-1].get("chat_id") if open_inbox else None)
+            or (due_deferred[-1].get("chat_id") if due_deferred else None)
+            or rhythm.get("last_human_chat_id")
+            or default_chat
+        ).strip()
+        target_sender = str(
+            (open_inbox[-1].get("sender") if open_inbox else None)
+            or (due_deferred[-1].get("sender") if due_deferred else None)
+            or rhythm.get("last_human_sender")
+            or "joel"
+        ).strip()
+        target_msg_id_raw = (
+            open_inbox[-1].get("message_id")
+            if open_inbox
+            else (due_deferred[-1].get("message_id") if due_deferred else None)
+        )
+        target_msg_id = target_msg_id_raw if isinstance(target_msg_id_raw, int) else None
+
+        delivery_res: dict[str, Any] = {"ok": True, "skipped": True}
+        defer_mins_applied: int | None = None
+
+        if final_action == "REPLY_NOW":
+            if self.telegram_notifier is not None and target_chat_id:
+                reply_ref = target_msg_id if (due_deferred and not open_inbox) else None
+                delivery_res = await self.telegram_notifier.send_chat_message(
+                    target_chat_id,
+                    sanitized_reply,
+                    reply_to_message_id=reply_ref,
+                )
+            org_key = f"turn:{int(now.timestamp() * 1000)}:o:{secrets.token_hex(3)}"
+            await self.repo.upsert_world_item(
+                kind="dialogue_turn",
+                key=org_key,
+                value={
+                    "role": "organism",
+                    "sender": self.settings.organism.name,
+                    "chat_id": target_chat_id,
+                    "text": sanitized_reply[:1000],
+                    "action": "REPLY_NOW",
+                    "timestamp": utcnow().isoformat(),
+                },
+                status="recorded",
+                source="dialogue:telegram",
+            )
+            rhythm_upd: dict[str, Any] = {"last_reply_at": now.isoformat(), "last_action": "REPLY_NOW"}
+            if trigger_source == "proactive_impulse":
+                prev_ignored = max(0, int(rhythm.get("consecutive_ignored_proactive") or 0))
+                new_ignored = prev_ignored + 1
+                base_min = max(1, int(social_cfg.min_proactive_interval_minutes))
+                mult = max(1.0, float(social_cfg.proactive_backoff_multiplier))
+                max_min = max(base_min, int(social_cfg.proactive_max_backoff_minutes))
+                next_backoff = round(min(float(max_min), float(base_min) * (mult ** new_ignored)), 2)
+                rhythm_upd.update(
+                    {
+                        "last_proactive_at": now.isoformat(),
+                        "last_proactive_evaluated_at": now.isoformat(),
+                        "consecutive_ignored_proactive": new_ignored,
+                        "current_backoff_minutes": next_backoff,
+                        "last_proactive_kind": (impulse or {}).get("kind"),
+                    }
+                )
+                if (impulse or {}).get("event_id"):
+                    rhythm_upd["last_shared_milestone_id"] = impulse["event_id"]
+                    rhythm_upd["pending_milestone"] = None
+            await self.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value=rhythm_upd,
+                status="active",
+                source="telegram:social",
+            )
+        elif final_action == "REACT_ONLY":
+            if self.telegram_notifier is not None and target_chat_id and target_msg_id is not None:
+                delivery_res = await self.telegram_notifier.set_message_reaction(
+                    target_chat_id,
+                    target_msg_id,
+                    safe_emoji or social_cfg.fallback_reaction_emoji,
+                    allowed_emojis=social_cfg.allowed_reaction_emojis,
+                    fallback_emoji=social_cfg.fallback_reaction_emoji,
+                )
+            org_key = f"turn:{int(now.timestamp() * 1000)}:o:{secrets.token_hex(3)}"
+            await self.repo.upsert_world_item(
+                kind="dialogue_turn",
+                key=org_key,
+                value={
+                    "role": "organism",
+                    "sender": self.settings.organism.name,
+                    "chat_id": target_chat_id,
+                    "text": "",
+                    "action": "REACT_ONLY",
+                    "reaction_emoji": safe_emoji,
+                    "message_id": target_msg_id,
+                    "timestamp": utcnow().isoformat(),
+                },
+                status="recorded",
+                source="dialogue:telegram",
+            )
+            await self.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value={"last_reply_at": now.isoformat(), "last_action": "REACT_ONLY"},
+                status="active",
+                source="telegram:social",
+            )
+        elif final_action == "REPLY_LATER":
+            raw_defer = social_dec.defer_minutes or social_cfg.default_defer_minutes
+            defer_mins_applied = max(
+                int(social_cfg.min_defer_minutes),
+                min(int(social_cfg.max_defer_minutes), int(raw_defer)),
+            )
+            due_at = now + timedelta(minutes=defer_mins_applied)
+            orig_txt = str(
+                (open_inbox[-1].get("text") if open_inbox else None)
+                or (due_deferred[-1].get("original_text") if due_deferred else None)
+                or ""
+            )[:1000]
+            def_key = f"def:{int(now.timestamp() * 1000)}:{secrets.token_hex(3)}"
+            await self.repo.upsert_world_item(
+                kind="social_deferred_reply",
+                key=def_key,
+                value={
+                    "chat_id": target_chat_id,
+                    "sender": target_sender,
+                    "original_text": orig_txt,
+                    "message_id": target_msg_id,
+                    "due_at": due_at.isoformat(),
+                    "reason": str(social_dec.defer_reason or "")[:300],
+                    "inbox_key": open_inbox[-1].get("key") if open_inbox else None,
+                    "defer_count": next_defer_count,
+                    "deferred_activity": current_activity_summary[:180],
+                    "created_at": now.isoformat(),
+                },
+                status="open",
+                source="social:deferred",
+            )
+            await self.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value={"last_action": "REPLY_LATER"},
+                status="active",
+                source="telegram:social",
+            )
+        else:  # IGNORE (true silence — zero Telegram calls)
+            ignore_upd: dict[str, Any] = {"last_action": "IGNORE"}
+            if trigger_source == "proactive_impulse":
+                ignore_upd["last_proactive_evaluated_at"] = now.isoformat()
+                if (impulse or {}).get("event_id"):
+                    ignore_upd["last_shared_milestone_id"] = impulse["event_id"]
+                    ignore_upd["pending_milestone"] = None
+            await self.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value=ignore_upd,
+                status="active",
+                source="telegram:social",
+            )
+
+        # Unified high-value memory promotion -> ExperienceManager (EPISODIC, source="dialogue:telegram")
+        memory_promoted = False
+        promoted_memory_id: str | None = None
+        promoted_importance: float | None = None
+        mem_min_imp = float(social_cfg.memory_promotion_min_importance)
+        mem_max_imp = float(social_cfg.social_memory_max_importance)
+        mem_summary_clean = self._sanitize_social_output(social_dec.memory_summary)
+        if (
+            social_dec.should_remember
+            and len(mem_summary_clean) >= 6
+            and float(social_dec.memory_importance or 0.0) >= mem_min_imp
+            and self.memory is not None
+        ):
+            calibrated_imp = round(min(mem_max_imp, max(0.35, float(social_dec.memory_importance))), 3)
+            try:
+                mem_res = await self.memory.remember(
+                    MemoryItem(
+                        memory_type=MemoryType.EPISODIC.value,
+                        title=f"与 {target_sender} 的对话记忆：{mem_summary_clean[:48]}",
+                        content=mem_summary_clean[:800],
+                        source="dialogue:telegram",
+                        importance=calibrated_imp,
+                        tags=["dialogue", "telegram", "social", trigger_source],
+                    ),
+                    cycle_id=cycle_id,
+                    reliability=0.75,
+                )
+                memory_promoted = True
+                promoted_memory_id = mem_res.stored_index_id
+                promoted_importance = calibrated_imp
+            except Exception as exc:
+                logger.warning("cycle.social_memory_promote_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+        # Gentle conversational goal hint -> queued softly onto social_rhythm_state for next GOAL_GENERATION
+        adopted_hint_clean = self._sanitize_social_output(social_dec.adopted_goal_hint)
+        if social_dec.adopt_as_goal and adopted_hint_clean:
+            try:
+                rhythm_rows_cur = await self.repo.list_world_items(kind="social_rhythm_state")
+                rhythm_cur = next(
+                    (
+                        dict(r.get("value") or {})
+                        for r in rhythm_rows_cur
+                        if r.get("key") == "primary" and isinstance(r.get("value"), dict)
+                    ),
+                    {},
+                )
+                hints_list = [h for h in list(rhythm_cur.get("pending_goal_hints") or []) if isinstance(h, dict)]
+                hints_list.append(
+                    {
+                        "hint": adopted_hint_clean[:400],
+                        "sender": target_sender,
+                        "from_cycle_id": str(cycle_id),
+                        "created_at": now.isoformat(),
+                    }
+                )
+                await self.repo.upsert_world_item(
+                    kind="social_rhythm_state",
+                    key="primary",
+                    value={"pending_goal_hints": hints_list[-3:]},
+                    status="active",
+                    source="telegram:social",
+                )
+            except Exception as exc:
+                logger.warning("cycle.social_goal_hint_store_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+        # Trim short-term dialogue window to max configured turns
+        keep_turns = max(1, int(social_cfg.dialogue_window_turns))
+        all_turns = await self.repo.list_world_items(kind="dialogue_turn")
+        if len(all_turns) > keep_turns:
+            all_turns.sort(key=lambda x: str((x.get("value") or {}).get("timestamp") or x.get("created_at") or ""))
+            for stale in all_turns[: len(all_turns) - keep_turns]:
+                await self.repo.delete_world_item("dialogue_turn", stale["key"])
+
+        await self.repo.log_decision(
+            decision_type="social_reflection",
+            selected=final_action,
+            alternatives=["REPLY_NOW", "REPLY_LATER", "REACT_ONLY", "IGNORE"],
+            reason=str(social_dec.internal_monologue or f"social:{final_action}")[:500],
+            payload={
+                "trigger_source": trigger_source,
+                "proactive_kind": (impulse or {}).get("kind"),
+                "inbox_count": len(open_inbox),
+                "deferred_due_count": len(due_deferred),
+                "internal_monologue": social_dec.internal_monologue,
+                "action": final_action,
+                "reaction_emoji": safe_emoji,
+                "reply_preview": sanitized_reply[:200] if sanitized_reply else None,
+                "defer_minutes": defer_mins_applied,
+                "defer_reason": social_dec.defer_reason,
+                "defer_cap_reached": defer_cap_reached,
+                "adopt_as_goal": social_dec.adopt_as_goal,
+                "adopted_goal_hint": adopted_hint_clean or social_dec.adopted_goal_hint,
+                "should_remember": social_dec.should_remember,
+                "memory_promoted": memory_promoted,
+                "memory_id": promoted_memory_id,
+                "memory_importance": promoted_importance,
+                "affect_snapshot": eff_affect,
+                "busy_focus_level": busy_focus_level,
+                "memory_resonance": social_ctx.memory_resonance,
+                "recent_social_fatigue": social_fatigue,
+                "delivery": delivery_res,
+            },
+            cycle_id=cycle_id,
+        )
+        return {
+            "triggered": True,
+            "trigger_source": trigger_source,
+            "proactive_kind": (impulse or {}).get("kind"),
+            "action": final_action,
+            "reaction_emoji": safe_emoji,
+            "defer_minutes": defer_mins_applied,
+            "defer_cap_reached": defer_cap_reached,
+            "inbox_handled": len(open_inbox),
+            "deferred_handled": len(due_deferred),
+            "adopt_as_goal": social_dec.adopt_as_goal,
+            "adopted_goal_hint": adopted_hint_clean or social_dec.adopted_goal_hint,
+            "memory_promoted": memory_promoted,
+            "memory_id": promoted_memory_id,
+            "memory_importance": promoted_importance,
+            "delivery_ok": bool(delivery_res.get("ok", True)),
+        }
 
     def _gateway_scope(
         self,

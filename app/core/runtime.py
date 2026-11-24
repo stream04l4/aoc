@@ -272,6 +272,7 @@ class OrganismRuntime:
             proposal_manager=self.proposal_manager,
             succession_manager=self.succession_manager,
             human_bridge=self.human_bridge,
+            social_settings=self.settings.social,
         )
         self.telegram_poller: TelegramPoller | None = None
         self.outbox = OutboxDispatcher(
@@ -409,6 +410,8 @@ class OrganismRuntime:
             self.memory.backend.agent_id = identity["memory_agent_id"]
 
         self.lifecycle = LifecycleManager(self.organism_id, self.repo)
+        if self.telegram_webhook.lifecycle is None:
+            self.telegram_webhook.lifecycle = self.lifecycle
 
         # Dynamic Self Model & Skill Registry (V2.0 P1-7)
         sm_cfg = dict(self._self_model_cfg or {})
@@ -468,10 +471,12 @@ class OrganismRuntime:
                 low_ig_threshold=self.settings.kernel_v3.goal_low_ig_threshold,
             )
 
-        # Optional bounded Affect modulation layer (V2.0 P1-9 / V3.0 M2)
+        # Optional bounded Affect modulation layer (V2.0 P1-9 / V3.0 M2 / V5.1 live social affect)
         eff_affect_cfg = dict(self._affect_cfg or {})
         if self.settings.kernel_v3.affect_enabled is not None:
             eff_affect_cfg["enabled"] = bool(self.settings.kernel_v3.affect_enabled)
+        elif self.settings.social.enabled and self.settings.social.auto_enable_affect:
+            eff_affect_cfg["enabled"] = True
         self.affect = AffectModulator(
             organism_id=self.organism_id,
             repo=self.repo,
@@ -567,6 +572,7 @@ class OrganismRuntime:
             investigation_manager=self.investigation_manager,
             entropy_sensor=self.entropy_sensor,
             culling_gc=self.culling_gc,
+            telegram_notifier=self.telegram_notifier,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error
@@ -618,6 +624,7 @@ class OrganismRuntime:
                     status_fn=_status_summary,
                     proposal_manager=self.proposal_manager,
                     succession_manager=self.succession_manager,
+                    social_settings=self.settings.social,
                 )
                 self.telegram_poller.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))

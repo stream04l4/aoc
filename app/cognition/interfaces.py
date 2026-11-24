@@ -161,6 +161,8 @@ class CognitiveContext(BaseModel):
     # V4.2: Active multi-hop investigation threads & organically discovered external channels
     active_investigations: list[dict[str, Any]] = Field(default_factory=list)
     discovered_channels: list[dict[str, Any]] = Field(default_factory=list)
+    # V5.1 M2: Gentle conversational goal hints adopted by social reflection (non-binding inspiration)
+    social_goal_hints: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -221,6 +223,106 @@ class EvaluationResult(BaseModel):
         return val
 
 
+class SocialInboxMessage(BaseModel):
+    """Normalized unread natural human message perceived from world_states(kind='human_inbox')."""
+
+    key: str = ""
+    sender: str = "joel"
+    chat_id: str = ""
+    text: str
+    message_id: int | None = None
+    reply_to_message_id: int | None = None
+    received_at: str = ""
+
+
+class SocialContext(BaseModel):
+    """Unified organism state snapshot passed into CognitionBrain.converse()."""
+
+    trigger_source: str = "inbox"  # inbox | deferred_due | proactive_impulse
+    now_iso: str = ""
+    unread_messages: list[SocialInboxMessage] = Field(default_factory=list)
+    due_deferred_replies: list[dict[str, Any]] = Field(default_factory=list)
+    recent_dialogue: list[dict[str, Any]] = Field(default_factory=list)
+    affect_state: dict[str, Any] | None = None
+    drives: list[DriveState] = Field(default_factory=list)
+    dominant_drive: str = ""
+    busy_focus_level: float = 0.0
+    current_activity_summary: str = ""
+    self_model_summary: dict[str, Any] = Field(default_factory=dict)
+    relevant_memories: list[dict[str, Any]] = Field(default_factory=list)
+    memory_resonance: float = 0.0
+    recent_social_fatigue: float = 0.0
+    rhythm_state: dict[str, Any] = Field(default_factory=dict)
+    allowed_reaction_emojis: list[str] = Field(default_factory=list)
+    proactive_hint: str | None = None
+
+    @field_validator("busy_focus_level", "memory_resonance", "recent_social_fatigue")
+    @classmethod
+    def _clamp_social_metrics(cls, v: float) -> float:
+        return clamp01(v)
+
+
+class SocialTurnDecision(BaseModel):
+    """Structured social reflection decision; private internal_monologue precedes action by design."""
+
+    internal_monologue: str = Field(
+        default="",
+        description="Private first-person internal thoughts BEFORE choosing action; never sent to Telegram.",
+    )
+    action: str = Field(
+        default="IGNORE",
+        description="Action choice: REPLY_NOW | REPLY_LATER | REACT_ONLY | IGNORE",
+    )
+    reply_text: str | None = None
+    reaction_emoji: str | None = None
+    defer_minutes: int | None = None
+    defer_reason: str | None = None
+    adopt_as_goal: bool = False
+    adopted_goal_hint: str | None = None
+    should_remember: bool = False
+    memory_summary: str | None = None
+    memory_importance: float = 0.5
+    usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("action")
+    @classmethod
+    def _normalize_social_action(cls, v: str) -> str:
+        raw = str(v or "").strip().upper()
+        alias = {
+            "REPLY_NOW": "REPLY_NOW",
+            "REPLY": "REPLY_NOW",
+            "RESPOND": "REPLY_NOW",
+            "REPLY_IMMEDIATELY": "REPLY_NOW",
+            "SEND": "REPLY_NOW",
+            "REPLY_LATER": "REPLY_LATER",
+            "DEFER": "REPLY_LATER",
+            "LATER": "REPLY_LATER",
+            "DELAY": "REPLY_LATER",
+            "REACT_ONLY": "REACT_ONLY",
+            "REACT": "REACT_ONLY",
+            "EMOJI": "REACT_ONLY",
+            "REACTION": "REACT_ONLY",
+            "IGNORE": "IGNORE",
+            "SILENT": "IGNORE",
+            "SILENCE": "IGNORE",
+            "NONE": "IGNORE",
+            "SKIP": "IGNORE",
+        }
+        return alias.get(raw, "IGNORE")
+
+    @field_validator("defer_minutes")
+    @classmethod
+    def _clamp_defer_minutes(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        return max(1, min(1440, int(v)))
+
+    @field_validator("memory_importance")
+    @classmethod
+    def _clamp_mem_imp(cls, v: float) -> float:
+        return clamp01(v)
+
+
 class BrainInterface(ABC):
     """Unified Brain contract (task book section 6)."""
 
@@ -240,3 +342,10 @@ class BrainInterface(ABC):
 
     @abstractmethod
     async def evaluate(self, context: EvaluationContext) -> EvaluationResult: ...
+
+    async def converse(self, context: SocialContext) -> SocialTurnDecision:
+        """Optional unified social cognition turn (default silent no-op for minimal stubs)."""
+        return SocialTurnDecision(
+            internal_monologue="social converse not implemented on this BrainInterface stub",
+            action="IGNORE",
+        )

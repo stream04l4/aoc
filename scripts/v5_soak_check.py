@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import inspect, select
+from sqlalchemy import func, inspect, select
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -28,8 +28,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.evolution.constitution_guard import CONSTITUTIONAL_FILES, ConstitutionGuard
 from app.evolution.interfaces import LIVE_INSTANCE_STATUSES, InstanceRole, InstanceStatus
+from app.observability.topic_diversity import TopicDiversityAnalyzer
 from app.storage.database import Database
-from app.storage.models import InstanceRegistryRow, LineageRecordRow
+from app.storage.models import InstanceRegistryRow, LineageRecordRow, WorldState
 
 _ACTIVE_CANDIDATE_STATUSES = (
     InstanceStatus.INITIALIZING.value,
@@ -55,6 +56,7 @@ async def run_v5_soak_check(
     max_concurrent_instances: int = 2,
     db_url: str = "",
     api_base: str = "",
+    api_token: str = "",
 ) -> dict[str, Any]:
     """Run read-only V5 resource, constitution, orphan hygiene, and optional DB/API health checks."""
     failures: list[str] = []
@@ -154,10 +156,44 @@ async def run_v5_soak_check(
                     failures.append(f"Stuck CULLING instances detected: {stuck_culling}")
                 if not lesson_ok:
                     failures.append(f"Lineage lesson_summary exceeded 5KB: {max_lesson_bytes} bytes")
+
+            v5_1_obs: dict[str, Any] = {"ok": True, "skipped": True}
+            if {"active_goals", "world_states", "memory_index", "decision_logs"}.issubset(tbls):
+                td_report = await TopicDiversityAnalyzer(db).analyze()
+                async with db.session() as s:
+                    turn_cnt = int(
+                        (
+                            await s.execute(
+                                select(func.count(WorldState.id)).where(WorldState.kind == "dialogue_turn")
+                            )
+                        ).scalar_one()
+                    )
+                    inbox_open_cnt = int(
+                        (
+                            await s.execute(
+                                select(func.count(WorldState.id)).where(
+                                    WorldState.kind == "human_inbox",
+                                    WorldState.status == "open",
+                                )
+                            )
+                        ).scalar_one()
+                    )
+                turns_bounded = turn_cnt <= 200
+                v5_1_obs = {
+                    "ok": turns_bounded,
+                    "skipped": False,
+                    "dialogue_turn_rows": turn_cnt,
+                    "open_human_inbox_rows": inbox_open_cnt,
+                    "topic_diversity_24h": td_report.get("summary") or {},
+                }
+                if not turns_bounded:
+                    failures.append(f"V5.1 dialogue_turn window exceeded hygiene cap ({turn_cnt} > 200)")
+            checks["v5_1_observability"] = v5_1_obs
         finally:
             await db.dispose()
     else:
         checks["database"] = {"ok": True, "skipped": True, "v5_tables_present": False}
+        checks["v5_1_observability"] = {"ok": True, "skipped": True}
 
     # 4. Orphan directory hygiene under instances_root (excluding `snapshots`)
     dirs_on_disk: list[str] = []
@@ -201,8 +237,33 @@ async def run_v5_soak_check(
         }
         if not api_ok:
             failures.append(f"API health check failed at {url}: status={status_code}, error={err_msg}")
+        if (api_token or "").strip():
+            base = api_base.strip().rstrip("/")
+            headers = {"Authorization": f"Bearer {api_token.strip()}"}
+            api_endpoints = [
+                ("topic_diversity", f"{base}/v5/observability/topic-diversity"),
+                ("control_center_social", f"{base}/v2/control-center/social?limit=5"),
+            ]
+            v5_1_api: dict[str, Any] = {"ok": True, "skipped": False, "endpoints": {}}
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    for ep_name, ep_url in api_endpoints:
+                        r = await client.get(ep_url, headers=headers)
+                        ep_ok = r.status_code == 200
+                        v5_1_api["endpoints"][ep_name] = {"ok": ep_ok, "status_code": r.status_code}
+                        if not ep_ok:
+                            v5_1_api["ok"] = False
+                            failures.append(f"V5.1 API check failed at {ep_url}: status={r.status_code}")
+            except Exception as exc:
+                v5_1_api["ok"] = False
+                v5_1_api["error"] = str(exc)
+                failures.append(f"V5.1 API check error: {exc}")
+            checks["v5_1_api"] = v5_1_api
+        else:
+            checks["v5_1_api"] = {"ok": True, "skipped": True}
     else:
         checks["api_health"] = {"ok": True, "skipped": True}
+        checks["v5_1_api"] = {"ok": True, "skipped": True}
 
     return {
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -222,6 +283,7 @@ def main() -> int:
     parser.add_argument("--max-concurrent-instances", type=int, default=2, help="Maximum concurrent live instances.")
     parser.add_argument("--db-url", type=str, default="", help="Optional database URL for control-plane inspection.")
     parser.add_argument("--api-base", type=str, default="", help="Optional API base URL for /health check.")
+    parser.add_argument("--api-token", type=str, default="", help="Optional Bearer token for V5.1 read-only API checks.")
     parser.add_argument("--output", type=str, default="", help="Optional path to write JSON report.")
     args = parser.parse_args()
 
@@ -233,6 +295,7 @@ def main() -> int:
             max_concurrent_instances=args.max_concurrent_instances,
             db_url=args.db_url,
             api_base=args.api_base,
+            api_token=args.api_token,
         )
     )
     text_out = json.dumps(report, indent=2, ensure_ascii=False)

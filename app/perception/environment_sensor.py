@@ -59,6 +59,13 @@ class EnvironmentSensor(SensorInterface):
         facts: dict[str, Any] = {}
         active_simulations: list[dict[str, Any]] = []
         external_events: list[dict[str, Any]] = []
+        human_inbox: list[dict[str, Any]] = []
+        dialogue_turns: list[dict[str, Any]] = []
+        social_deferred_replies: list[dict[str, Any]] = []
+        social_rhythm: dict[str, Any] = {}
+
+        def _iso(raw_ts: Any) -> str:
+            return raw_ts.isoformat() if hasattr(raw_ts, "isoformat") else str(raw_ts or "")
 
         for item in items:
             kind = item["kind"]
@@ -90,11 +97,53 @@ class EnvironmentSensor(SensorInterface):
                         "source": item.get("source", "environment"),
                         "payload": val,
                         "is_simulated": item.get("is_simulated", False),
-                        "timestamp": item["updated_at"].isoformat()
-                        if hasattr(item["updated_at"], "isoformat")
-                        else str(item["updated_at"]),
+                        "timestamp": _iso(item["updated_at"]),
                     }
                 )
+            elif kind == "human_inbox" and status == "open":
+                human_inbox.append(
+                    {
+                        "key": key,
+                        "source": item.get("source", "telegram"),
+                        "sender": val.get("sender", "joel"),
+                        "chat_id": str(val.get("chat_id") or ""),
+                        "text": str(val.get("text") or ""),
+                        "message_id": val.get("message_id"),
+                        "update_id": val.get("update_id"),
+                        "reply_to_message_id": val.get("reply_to_message_id"),
+                        "received_at": str(val.get("received_at") or _iso(item.get("created_at"))),
+                    }
+                )
+            elif kind == "dialogue_turn":
+                dialogue_turns.append(
+                    {
+                        "key": key,
+                        "role": str(val.get("role") or "human"),
+                        "sender": str(val.get("sender") or ""),
+                        "text": str(val.get("text") or ""),
+                        "action": val.get("action"),
+                        "reaction_emoji": val.get("reaction_emoji"),
+                        "timestamp": str(val.get("timestamp") or _iso(item.get("created_at"))),
+                    }
+                )
+            elif kind == "social_deferred_reply" and status == "open":
+                social_deferred_replies.append(
+                    {
+                        "key": key,
+                        "chat_id": str(val.get("chat_id") or ""),
+                        "sender": str(val.get("sender") or "joel"),
+                        "original_text": str(val.get("original_text") or ""),
+                        "message_id": val.get("message_id"),
+                        "due_at": str(val.get("due_at") or ""),
+                        "reason": str(val.get("reason") or ""),
+                        "inbox_key": val.get("inbox_key"),
+                        "defer_count": int(val.get("defer_count") or 1),
+                        "deferred_activity": str(val.get("deferred_activity") or ""),
+                        "created_at": str(val.get("created_at") or _iso(item.get("created_at"))),
+                    }
+                )
+            elif kind == "social_rhythm_state" and key == "primary" and isinstance(val, dict):
+                social_rhythm = dict(val)
 
         # Call any registered external providers (fault-isolated per provider)
         provider_data: dict[str, Any] = {}
@@ -113,6 +162,16 @@ class EnvironmentSensor(SensorInterface):
             "facts": facts,
             "active_simulations": active_simulations,
         }
+        if human_inbox or dialogue_turns or social_deferred_replies or social_rhythm:
+            human_inbox.sort(key=lambda x: str(x.get("received_at") or ""))
+            dialogue_turns.sort(key=lambda x: str(x.get("timestamp") or ""))
+            social_deferred_replies.sort(key=lambda x: str(x.get("due_at") or ""))
+            env_state["social"] = {
+                "inbox": human_inbox,
+                "dialogue_turns": dialogue_turns[-16:],
+                "deferred_replies": social_deferred_replies,
+                "rhythm": social_rhythm,
+            }
         if provider_data:
             env_state["providers"] = provider_data
         if poll_summary:

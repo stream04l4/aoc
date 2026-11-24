@@ -14,17 +14,62 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 
-from app.core.config import TelegramSettings
+from app.core.config import SocialSettings, TelegramSettings
 from app.governance.approval import ApprovalService
 from app.notifications.human_bridge import HumanBridge
 from app.observability.logging import get_logger
+from app.perception.interfaces import utcnow
 from app.storage.repository import StateRepository
 
 logger = get_logger("aoc.notifications.telegram")
+
+# Official Telegram Bot API standard ReactionTypeEmoji allowlist (notably excludes 😅).
+OFFICIAL_TELEGRAM_REACTION_EMOJIS: frozenset[str] = frozenset(
+    {
+        "👍", "👎", "❤️", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩",
+        "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤️‍🔥", "🌚", "🌭", "💯",
+        "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭",
+        "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍️", "🤗", "🫡", "🎅", "🎄",
+        "☃️", "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂️",
+        "🤷", "🤷‍♀️", "😡",
+    }
+)
+
+_REACTION_EMOJI_ALIASES: dict[str, str] = {
+    "😅": "🙈",
+    "😂": "🤣",
+    "😊": "❤️",
+    "🙂": "👍",
+    "😮": "🤯",
+}
+
+
+def _normalize_official_emoji(raw: str | None) -> str:
+    cand = str(raw or "").strip()
+    cand = _REACTION_EMOJI_ALIASES.get(cand, cand)
+    return cand if cand in OFFICIAL_TELEGRAM_REACTION_EMOJIS else ""
+
+
+def sanitize_reaction_emoji(
+    raw: str | None,
+    *,
+    allowed: Sequence[str] | None = None,
+    fallback: str = "👀",
+) -> str:
+    """Validate/normalize an emoji against official Telegram Bot API ReactionTypeEmoji."""
+    pool = [norm for item in allowed if (norm := _normalize_official_emoji(item))] if allowed else []
+    valid_set = set(pool) if pool else OFFICIAL_TELEGRAM_REACTION_EMOJIS
+    norm_fb = _normalize_official_emoji(fallback)
+    if norm_fb not in valid_set:
+        norm_fb = pool[0] if pool else "👀"
+    cand = _normalize_official_emoji(raw)
+    if cand in valid_set:
+        return cand
+    return norm_fb
 
 
 class TelegramAuthError(PermissionError):
@@ -236,6 +281,8 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
             f"零残留 Culling GC：{'✅ 已清空容器/Schema/工作区' if payload.get('zero_residual') else '⚠️ 待重试恢复'}"
         )
         return text, None
+    if kind == "social_message":
+        return str(payload.get("text") or payload.get("message") or "").strip(), None
     return f"[AOC 通知] {payload.get('message') or payload}", None
 
 
@@ -330,6 +377,133 @@ class TelegramNotifier:
         except Exception as exc:
             logger.warning("telegram.edit_reply_markup_failed", error=str(exc))
 
+    async def send_chat_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Fault-isolated natural social reply sender (never blocks or crashes AutonomousLoop)."""
+        clean_chat = str(chat_id or "").strip()
+        clean_text = str(text or "").strip()
+        if not self.configured or not clean_chat or not clean_text:
+            return {"ok": False, "skipped": True, "reason": "not_configured_or_empty"}
+        req: dict[str, Any] = {"chat_id": clean_chat, "text": clean_text[:4000]}
+        if reply_to_message_id is not None:
+            req["reply_to_message_id"] = int(reply_to_message_id)
+        try:
+            body = await self._post("sendMessage", req)
+            res = body.get("result") if isinstance(body, dict) else None
+            msg_id = res.get("message_id") if isinstance(res, dict) else None
+            return {"ok": True, "chat_id": clean_chat, "message_id": msg_id}
+        except Exception as exc:
+            logger.warning("telegram.send_chat_message_failed", error=str(exc))
+            return {"ok": False, "chat_id": clean_chat, "error": str(exc)}
+
+    async def set_message_reaction(
+        self,
+        chat_id: str,
+        message_id: int,
+        emoji: str,
+        *,
+        allowed_emojis: Sequence[str] | None = None,
+        fallback_emoji: str = "👀",
+    ) -> dict[str, Any]:
+        """Set a whitelist-validated Telegram Bot API message reaction, degrading safely on error."""
+        safe_emoji = sanitize_reaction_emoji(emoji, allowed=allowed_emojis, fallback=fallback_emoji)
+        clean_chat = str(chat_id or "").strip()
+        if not self.configured or not clean_chat or not message_id:
+            return {"ok": False, "skipped": True, "emoji": safe_emoji, "reason": "not_configured_or_missing_ids"}
+        try:
+            await self._post(
+                "setMessageReaction",
+                {
+                    "chat_id": clean_chat,
+                    "message_id": int(message_id),
+                    "reaction": [{"type": "emoji", "emoji": safe_emoji}],
+                },
+            )
+            return {
+                "ok": True,
+                "chat_id": clean_chat,
+                "message_id": int(message_id),
+                "emoji": safe_emoji,
+            }
+        except Exception as exc:
+            logger.warning("telegram.set_message_reaction_failed", emoji=safe_emoji, error=str(exc))
+            return {
+                "ok": False,
+                "chat_id": clean_chat,
+                "message_id": int(message_id),
+                "emoji": safe_emoji,
+                "error": str(exc),
+            }
+
+
+async def _ingest_social_inbox_message(
+    *,
+    repo: StateRepository,
+    lifecycle: Any,
+    chat_id: str,
+    user_id: str,
+    username: str,
+    text: str,
+    message_id: int | None,
+    update_id: int | None,
+    reply_to_message_id: int | None,
+) -> dict[str, Any]:
+    """Channel B ear ingestion: write natural human text to `human_inbox`, reset backoff, and wake loop."""
+    now = utcnow()
+    if message_id is not None:
+        suffix = str(message_id)
+    elif update_id is not None:
+        suffix = f"upd_{update_id}"
+    else:
+        suffix = f"{int(now.timestamp())}_{secrets.token_hex(4)}"
+    inbox_key = f"tg:{chat_id}:{suffix}"
+
+    await repo.upsert_world_item(
+        kind="human_inbox",
+        key=inbox_key,
+        value={
+            "chat_id": str(chat_id),
+            "user_id": str(user_id),
+            "sender": str(username or user_id or "joel")[:80],
+            "text": str(text or "")[:2000],
+            "message_id": message_id,
+            "update_id": update_id,
+            "reply_to_message_id": reply_to_message_id,
+            "received_at": now.isoformat(),
+        },
+        status="open",
+        source=f"telegram:{username}"[:64],
+    )
+    await repo.upsert_world_item(
+        kind="social_rhythm_state",
+        key="primary",
+        value={
+            "last_human_message_at": now.isoformat(),
+            "consecutive_ignored_proactive": 0,
+            "current_backoff_minutes": None,
+            "last_human_chat_id": str(chat_id),
+            "last_human_sender": str(username or user_id or "joel"),
+        },
+        status="active",
+        source="telegram:social",
+    )
+    await repo.log_event(
+        "telegram.social_inbox_received",
+        message=f"Received free-form Telegram social message from {username}",
+        payload={"inbox_key": inbox_key, "chat_id": str(chat_id), "message_id": message_id},
+    )
+    if lifecycle is not None:
+        try:
+            lifecycle.wake(reason=f"telegram social message from {username}")
+        except Exception:
+            pass
+    return {"ok": True, "kind": "social_inbox", "inbox_key": inbox_key, "message_id": message_id}
+
 
 async def _dispatch_human_bridge_callback(
     *,
@@ -406,6 +580,23 @@ async def _dispatch_human_bridge_callback(
 
     already = bool(res.get("already_selected"))
     opt = res["option"]
+    if not already and getattr(human_bridge, "repo", None) is not None:
+        try:
+            await human_bridge.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value={
+                    "last_human_message_at": utcnow().isoformat(),
+                    "consecutive_ignored_proactive": 0,
+                    "current_backoff_minutes": None,
+                    "last_human_chat_id": str(chat_id),
+                    "last_human_sender": str(username or "joel"),
+                },
+                status="active",
+                source="telegram:social",
+            )
+        except Exception:
+            pass
     if not already and lifecycle is not None:
         try:
             lifecycle.wake(reason=f"telegram card choice from {username}")
@@ -457,6 +648,7 @@ class TelegramWebhookHandler:
         succession_manager: Any = None,
         human_bridge: HumanBridge | None = None,
         lifecycle: Any = None,
+        social_settings: SocialSettings | None = None,
     ) -> None:
         self.settings = settings
         self.approval_service = approval_service
@@ -466,6 +658,7 @@ class TelegramWebhookHandler:
         self.succession_manager = succession_manager
         self.human_bridge = human_bridge
         self.lifecycle = lifecycle
+        self.social_settings = social_settings
 
     async def handle_update(
         self,
@@ -490,6 +683,9 @@ class TelegramWebhookHandler:
         raw_action = ""
 
         cb_message_id: int | None = None
+        msg_text = ""
+        msg_id: int | None = None
+        reply_to_msg_id: int | None = None
         if isinstance(cb, dict):
             callback_id = str(cb.get("id") or "")
             frm = cb.get("from") or {}
@@ -506,8 +702,12 @@ class TelegramWebhookHandler:
             chat_id = str(chat.get("id") or "")
             user_id = str(frm.get("id") or "")
             username = str(frm.get("username") or user_id or "telegram_user")
-            text = str(msg.get("text") or "").strip()
-            parts = text.split()
+            msg_text = str(msg.get("text") or "").strip()
+            msg_id = msg.get("message_id") if isinstance(msg.get("message_id"), int) else None
+            rep = msg.get("reply_to_message")
+            if isinstance(rep, dict) and isinstance(rep.get("message_id"), int):
+                reply_to_msg_id = rep["message_id"]
+            parts = msg_text.split()
             if len(parts) >= 2 and parts[0].lower() in {
                 "/approve",
                 "/reject",
@@ -556,6 +756,50 @@ class TelegramWebhookHandler:
                 return hb_res
 
         if ":" not in raw_action:
+            if (
+                isinstance(msg, dict)
+                and msg_text
+                and not msg_text.startswith("/")
+                and self.social_settings is not None
+                and self.social_settings.enabled
+            ):
+                if self.human_bridge is not None:
+                    pending_custom = await self.human_bridge.consume_pending_custom_reply(chat_id)
+                    if pending_custom is not None:
+                        res_custom = await self.human_bridge.record_custom_card_reply(
+                            pending_custom["card_id"],
+                            msg_text,
+                            sender=username,
+                            chat_id=chat_id,
+                            update_id=update.get("update_id") if isinstance(update.get("update_id"), int) else None,
+                        )
+                        if self.lifecycle is not None:
+                            try:
+                                self.lifecycle.wake(reason=f"telegram custom card reply from {username}")
+                            except Exception:
+                                pass
+                        if self.notifier is not None and chat_id:
+                            await self.notifier.send_chat_message(
+                                chat_id,
+                                f"✅ 已收到你的指令（已关联「{res_custom['title']}」）并唤醒思考循环，我会在下一轮优先阅读并执行你的建议。",
+                            )
+                        return {
+                            "ok": True,
+                            "kind": "guidance_custom_card",
+                            "card_id": pending_custom["card_id"],
+                            "guidance_key": res_custom["guidance"]["key"],
+                        }
+                return await _ingest_social_inbox_message(
+                    repo=self.repo,
+                    lifecycle=self.lifecycle,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=username,
+                    text=msg_text,
+                    message_id=msg_id,
+                    update_id=update.get("update_id") if isinstance(update.get("update_id"), int) else None,
+                    reply_to_message_id=reply_to_msg_id,
+                )
             return {"ok": True, "ignored": True, "reason": "no approval command found"}
 
         action, nonce = raw_action.split(":", 1)
@@ -625,6 +869,7 @@ class TelegramPoller:
         status_fn: Any = None,
         proposal_manager: Any = None,
         succession_manager: Any = None,
+        social_settings: SocialSettings | None = None,
     ) -> None:
         self.settings = settings
         self.notifier = notifier
@@ -635,6 +880,7 @@ class TelegramPoller:
         self.status_fn = status_fn
         self.proposal_manager = proposal_manager or getattr(webhook_handler, "proposal_manager", None)
         self.succession_manager = succession_manager or getattr(webhook_handler, "succession_manager", None)
+        self.social_settings = social_settings
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -873,7 +1119,24 @@ class TelegramPoller:
                 "guidance_key": res_custom["guidance"]["key"],
             }
 
-        # Free-form creator guidance -> persist, wake organism, and acknowledge warmly
+        # V5.1 Unified Social Ear (Channel B): when enabled, write human_inbox + wake without canned ack
+        if self.social_settings is not None and self.social_settings.enabled:
+            msg_id = msg.get("message_id") if isinstance(msg.get("message_id"), int) else None
+            rep = msg.get("reply_to_message")
+            reply_to_id = rep.get("message_id") if isinstance(rep, dict) and isinstance(rep.get("message_id"), int) else None
+            return await _ingest_social_inbox_message(
+                repo=self.repo,
+                lifecycle=self.lifecycle,
+                chat_id=chat_id,
+                user_id=user_id,
+                username=username,
+                text=text,
+                message_id=msg_id,
+                update_id=update_id if isinstance(update_id, int) else None,
+                reply_to_message_id=reply_to_id,
+            )
+
+        # Free-form creator guidance (V5.0.1 fallback when social.enabled=False) -> persist, wake organism, and acknowledge
         guidance = await self.human_bridge.record_human_guidance(
             key=f"tg:{update_id if update_id is not None else 'msg'}",
             text=text,
