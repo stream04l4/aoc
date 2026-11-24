@@ -37,6 +37,10 @@ class OrganismScheduler:
             return
         self._task = asyncio.create_task(self._run_forever(), name="aoc-autonomous-scheduler")
 
+    def wake(self, reason: str = "external event") -> None:
+        """Wake the scheduler immediately from sleep when external social/control input arrives."""
+        self.lifecycle.wake(reason=reason)
+
     async def stop(self) -> None:
         await self.lifecycle.stop("scheduler stopping")
         if self._task is not None:

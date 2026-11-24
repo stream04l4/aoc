@@ -249,6 +249,50 @@ class EvolutionSettings(BaseModel):
     health_timeout_seconds: float = 60.0
 
 
+DEFAULT_SOCIAL_REACTION_EMOJIS: tuple[str, ...] = ("👀", "👍", "🤔", "🙈", "🔥", "❤️", "🎉", "👌")
+
+
+class SocialSettings(BaseModel):
+    """V5.1 unified organism social cognition & natural Telegram rhythm settings."""
+
+    enabled: bool = False
+    auto_enable_affect: bool = True
+    dialogue_window_turns: int = 16
+    max_inbox_batch: int = 5
+    min_proactive_interval_minutes: int = 45
+    proactive_backoff_multiplier: float = 2.0
+    proactive_max_backoff_minutes: int = 480
+    proactive_enabled: bool = True
+    max_defer_count: int = 2
+    proactive_valence_threshold: float = 0.55
+    proactive_arousal_threshold: float = 0.48
+    proactive_frustration_threshold: float = 0.60
+    proactive_boredom_threshold: float = 0.65
+    proactive_high_ig_threshold: float = 0.55
+    social_memory_max_importance: float = 0.72
+    default_defer_minutes: int = 15
+    min_defer_minutes: int = 3
+    max_defer_minutes: int = 180
+    max_reply_chars: int = 1200
+    memory_promotion_min_importance: float = 0.65
+    allowed_reaction_emojis: list[str] = Field(default_factory=lambda: list(DEFAULT_SOCIAL_REACTION_EMOJIS))
+    fallback_reaction_emoji: str = "👀"
+    wake_debounce_seconds: float = 1.5
+
+    @field_validator("allowed_reaction_emojis", mode="before")
+    @classmethod
+    def _parse_emoji_list(cls, v: Any) -> list[str]:
+        if v is None or v == "":
+            return list(DEFAULT_SOCIAL_REACTION_EMOJIS)
+        if isinstance(v, str):
+            parsed = [part.strip() for part in v.split(",") if part.strip()]
+            return parsed or list(DEFAULT_SOCIAL_REACTION_EMOJIS)
+        if isinstance(v, (list, tuple, set)):
+            parsed = [str(x).strip() for x in v if str(x).strip()]
+            return parsed or list(DEFAULT_SOCIAL_REACTION_EMOJIS)
+        return [str(v).strip()] or list(DEFAULT_SOCIAL_REACTION_EMOJIS)
+
+
 class _YamlSource(PydanticBaseSettingsSource):
     """Lowest-priority source: config/settings.yaml."""
 
@@ -283,6 +327,7 @@ class Settings(BaseSettings):
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
     kernel_v3: KernelV3Settings = Field(default_factory=KernelV3Settings)
     evolution: EvolutionSettings = Field(default_factory=EvolutionSettings)
+    social: SocialSettings = Field(default_factory=SocialSettings)
 
     @classmethod
     def settings_customise_sources(

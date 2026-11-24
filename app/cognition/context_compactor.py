@@ -171,9 +171,15 @@ def compact_observation_dict(
         out["agent_status"] = fenced_obs["agent_status"]
 
     # Environment state: bound unknown_topics while preserving <untrusted_world_event> closing tag!
+    # Also exclude raw V5.1 `social` chat streams from technical prompts to prevent pollution/injection.
     env = fenced_obs.get("environment_state")
     if isinstance(env, dict):
-        env_c = {k: v for k, v in env.items() if k != "unknown_topics"}
+        env_c = {k: v for k, v in env.items() if k not in {"unknown_topics", "social"}}
+        social_data = env.get("social")
+        if isinstance(social_data, dict):
+            inbox = social_data.get("inbox")
+            if isinstance(inbox, list) and inbox:
+                env_c["social_summary"] = {"unread_messages": len(inbox)}
         topics = env.get("unknown_topics")
         if isinstance(topics, list):
             trimmed_topics: list[dict[str, Any]] = []

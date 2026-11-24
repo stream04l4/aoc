@@ -35,6 +35,7 @@ from app.core.config import (
     get_sensors_config,
     load_yaml,
 )
+from app.observability.topic_diversity import TopicDiversityAnalyzer
 from app.perception.interfaces import utcnow
 from app.storage.models import (
     ActionPlanRow,
@@ -2528,11 +2529,22 @@ def create_control_center_router(get_runtime) -> APIRouter:
             },
             {
                 "id": "affect",
-                "name": "Affect（可选情绪调制）",
-                "description": "默认关闭的有界功能调制层（严禁触碰 Governance 与预算）",
+                "name": "Affect 与 Social（情绪与自主社交）",
+                "description": "有界五维情绪调制与 V5.1 一体化 Telegram 自主社交互动配置（严禁触碰 Governance 与预算）",
                 "items": [
-                    item(key="affect.enabled", label="Affect 调制层开关", description="默认 false（零影响），开启后有界调制优先级与退避", effective_value=bool(affect_yaml.get("enabled", False)), yaml_value=affect_yaml.get("enabled"), default_value=False),
+                    item(key="affect.enabled", label="Affect 调制层开关", description="默认 false，开启 social.enabled 时可自动启用以驱动真实情绪表达", effective_value=bool(rt.affect and rt.affect.enabled), yaml_value=affect_yaml.get("enabled"), default_value=False, env_var="AOC_KERNEL_V3__AFFECT_ENABLED"),
                     item(key="affect.maximum_influence", label="最大调制幅度硬上限", description="硬限幅防止覆盖主欲望与安全边界", effective_value=affect_yaml.get("maximum_influence", 0.15), yaml_value=affect_yaml.get("maximum_influence"), default_value=0.15),
+                    item(key="social.enabled", label="V5.1 一体化自主社交开关", description="关闭即可瞬时无损回退至 V5.0.1 确定性交互模式", effective_value=s.social.enabled, yaml_value=_nested_get(settings_yaml, "social", "enabled"), default_value=False, env_var="AOC_SOCIAL__ENABLED"),
+                    item(key="social.auto_enable_affect", label="社交自动启用情绪层", description="开启自主社交时自动激活 AffectModulator", effective_value=s.social.auto_enable_affect, yaml_value=_nested_get(settings_yaml, "social", "auto_enable_affect"), default_value=True),
+                    item(key="social.proactive_enabled", label="24/7 主动发言开关", description="允许高情绪或里程碑突破时主动联系 Joel（受退避节制）", effective_value=s.social.proactive_enabled, yaml_value=_nested_get(settings_yaml, "social", "proactive_enabled"), default_value=True),
+                    item(key="social.dialogue_window_turns", label="短时对话滑动窗口", description="保留于 world_states 的近期连续对话轮数", effective_value=s.social.dialogue_window_turns, yaml_value=_nested_get(settings_yaml, "social", "dialogue_window_turns"), default_value=16),
+                    item(key="social.min_proactive_interval_minutes", label="主动发言基础冷却 (m)", description="主动发言与反应间最小基础间隔", effective_value=s.social.min_proactive_interval_minutes, yaml_value=_nested_get(settings_yaml, "social", "min_proactive_interval_minutes"), default_value=45),
+                    item(key="social.proactive_backoff_multiplier", label="连续忽略指数退避倍率", description="主动发言未获回应时的冷却倍增系数", effective_value=s.social.proactive_backoff_multiplier, yaml_value=_nested_get(settings_yaml, "social", "proactive_backoff_multiplier"), default_value=2.0),
+                    item(key="social.proactive_max_backoff_minutes", label="主动发言最大退避上限 (m)", description="连续被忽略后允许的最大冷却上限", effective_value=s.social.proactive_max_backoff_minutes, yaml_value=_nested_get(settings_yaml, "social", "proactive_max_backoff_minutes"), default_value=480),
+                    item(key="social.max_defer_count", label="单消息最大延后回复次数", description="超过次数自动收敛为沉默 IGNORE 防止无限拖延", effective_value=s.social.max_defer_count, yaml_value=_nested_get(settings_yaml, "social", "max_defer_count"), default_value=2),
+                    item(key="social.memory_promotion_min_importance", label="对话记忆晋升阈值", description="低于该重要度的闲聊留在短时窗口不入向量长期库", effective_value=s.social.memory_promotion_min_importance, yaml_value=_nested_get(settings_yaml, "social", "memory_promotion_min_importance"), default_value=0.65),
+                    item(key="social.social_memory_max_importance", label="对话情景记忆重要度封顶", description="限制对话记忆权重高于技术记忆造成检索污染", effective_value=s.social.social_memory_max_importance, yaml_value=_nested_get(settings_yaml, "social", "social_memory_max_importance"), default_value=0.72),
+                    item(key="social.allowed_reaction_emojis", label="官方 Reaction Emoji 白名单", description="允许发送给 Telegram Bot API 的标准反应表情集合", effective_value=list(s.social.allowed_reaction_emojis), yaml_value=_nested_get(settings_yaml, "social", "allowed_reaction_emojis")),
                 ],
             },
             {
@@ -2813,6 +2825,197 @@ def create_control_center_router(get_runtime) -> APIRouter:
             "instances": instances,
             "proposals": proposals,
             "lineage": lineage,
+        }
+
+    # ── K. V5.1 Unified Social Mind & Long-Term Topic Diversity Observability ──
+    @router.get("/v5/observability/topic-diversity")
+    async def get_topic_diversity_v5(
+        hours: int | None = Query(default=None, ge=1, le=720),
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = get_runtime()
+        return await TopicDiversityAnalyzer(rt.db).analyze(custom_hours=hours)
+
+    @router.get("/v2/control-center/social")
+    async def cc_social_panel(
+        limit: int = Query(default=20, ge=1, le=100),
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = get_runtime()
+        s_cfg = rt.settings.social
+        affect_enabled_now = bool(rt.affect and rt.affect.enabled)
+        current_affect = rt.affect.state.model_dump(mode="json") if affect_enabled_now else None
+
+        async with rt.db.session() as s:
+            dec_rows = (
+                await s.execute(
+                    select(DecisionLog)
+                    .where(DecisionLog.decision_type == "social_reflection")
+                    .order_by(desc(DecisionLog.created_at))
+                    .limit(limit)
+                )
+            ).scalars().all()
+            open_inbox_count = int(
+                (
+                    await s.execute(
+                        select(func.count(WorldState.id)).where(
+                            WorldState.kind == "human_inbox",
+                            WorldState.status == "open",
+                        )
+                    )
+                ).scalar_one()
+            )
+            deferred_rows = (
+                await s.execute(
+                    select(WorldState).where(
+                        WorldState.kind == "social_deferred_reply",
+                        WorldState.status == "open",
+                    )
+                )
+            ).scalars().all()
+            rhythm_row = (
+                await s.execute(
+                    select(WorldState).where(
+                        WorldState.kind == "social_rhythm_state",
+                        WorldState.key == "primary",
+                    )
+                )
+            ).scalar_one_or_none()
+            turn_rows = (
+                await s.execute(
+                    select(WorldState)
+                    .where(WorldState.kind == "dialogue_turn")
+                    .order_by(desc(WorldState.created_at))
+                    .limit(max(1, int(s_cfg.dialogue_window_turns)))
+                )
+            ).scalars().all()
+            social_mem_total = int(
+                (
+                    await s.execute(
+                        select(func.count(MemoryIndex.id)).where(MemoryIndex.source == "dialogue:telegram")
+                    )
+                ).scalar_one()
+            )
+
+        rhythm_val = dict(rhythm_row.value or {}) if (rhythm_row is not None and isinstance(rhythm_row.value, dict)) else {}
+        pending_hints = [h for h in list(rhythm_val.get("pending_goal_hints") or []) if isinstance(h, dict)]
+
+        deferred_list = []
+        for row in deferred_rows:
+            v = row.value if isinstance(row.value, dict) else {}
+            deferred_list.append(
+                {
+                    "key": row.key,
+                    "sender": str(v.get("sender") or "joel"),
+                    "original_text": str(v.get("original_text") or ""),
+                    "reason": str(v.get("reason") or ""),
+                    "deferred_activity": str(v.get("deferred_activity") or ""),
+                    "defer_count": int(v.get("defer_count") or 1),
+                    "due_at": v.get("due_at"),
+                    "created_at": v.get("created_at") or _iso(row.created_at),
+                }
+            )
+        deferred_list.sort(key=lambda x: str(x.get("due_at") or ""))
+
+        recent_turns = []
+        for row in turn_rows:
+            v = row.value if isinstance(row.value, dict) else {}
+            recent_turns.append(
+                {
+                    "key": row.key,
+                    "role": str(v.get("role") or "human"),
+                    "sender": str(v.get("sender") or ""),
+                    "text": str(v.get("text") or ""),
+                    "action": v.get("action"),
+                    "reaction_emoji": v.get("reaction_emoji"),
+                    "timestamp": str(v.get("timestamp") or _iso(row.created_at) or ""),
+                }
+            )
+        recent_turns.sort(key=lambda x: str(x.get("timestamp") or ""))
+
+        recent_decisions = []
+        action_counts = {"REPLY_NOW": 0, "REPLY_LATER": 0, "REACT_ONLY": 0, "IGNORE": 0}
+        mem_promoted_count = 0
+        adopted_goal_count = 0
+
+        for d in dec_rows:
+            pl = d.payload if isinstance(d.payload, dict) else {}
+            act = str(pl.get("action") or d.selected or "IGNORE").upper()
+            if act in action_counts:
+                action_counts[act] += 1
+            if pl.get("memory_promoted"):
+                mem_promoted_count += 1
+            if pl.get("adopt_as_goal"):
+                adopted_goal_count += 1
+            delivery_obj = pl.get("delivery")
+            delivery_ok = bool(delivery_obj.get("ok", True)) if isinstance(delivery_obj, dict) else True
+            recent_decisions.append(
+                {
+                    "id": str(d.id),
+                    "cycle_id": str(d.cycle_id) if d.cycle_id else None,
+                    "created_at": _iso(d.created_at),
+                    "action": act,
+                    "trigger_source": pl.get("trigger_source"),
+                    "proactive_kind": pl.get("proactive_kind"),
+                    "internal_monologue": pl.get("internal_monologue") or d.reason,
+                    "affect_snapshot": pl.get("affect_snapshot"),
+                    "busy_focus_level": pl.get("busy_focus_level"),
+                    "memory_resonance": pl.get("memory_resonance"),
+                    "recent_social_fatigue": pl.get("recent_social_fatigue"),
+                    "reaction_emoji": pl.get("reaction_emoji"),
+                    "reply_preview": pl.get("reply_preview"),
+                    "defer_minutes": pl.get("defer_minutes"),
+                    "defer_reason": pl.get("defer_reason"),
+                    "defer_cap_reached": bool(pl.get("defer_cap_reached", False)),
+                    "adopt_as_goal": bool(pl.get("adopt_as_goal", False)),
+                    "adopted_goal_hint": pl.get("adopted_goal_hint"),
+                    "memory_promoted": bool(pl.get("memory_promoted", False)),
+                    "memory_id": pl.get("memory_id"),
+                    "memory_importance": pl.get("memory_importance"),
+                    "delivery_ok": delivery_ok,
+                }
+            )
+
+        return {
+            "read_only": True,
+            "generated_at": _iso(utcnow()),
+            "status": {
+                "social_enabled": bool(s_cfg.enabled),
+                "proactive_enabled": bool(s_cfg.proactive_enabled),
+                "affect_enabled": affect_enabled_now,
+                "current_affect": current_affect,
+                "dialogue_window_turns": int(s_cfg.dialogue_window_turns),
+                "allowed_reaction_emojis": list(s_cfg.allowed_reaction_emojis),
+            },
+            "rhythm": {
+                "last_human_message_at": rhythm_val.get("last_human_message_at"),
+                "last_reply_at": rhythm_val.get("last_reply_at"),
+                "last_proactive_at": rhythm_val.get("last_proactive_at"),
+                "last_proactive_evaluated_at": rhythm_val.get("last_proactive_evaluated_at"),
+                "last_action": rhythm_val.get("last_action"),
+                "last_proactive_kind": rhythm_val.get("last_proactive_kind"),
+                "consecutive_ignored_proactive": int(rhythm_val.get("consecutive_ignored_proactive") or 0),
+                "current_backoff_minutes": rhythm_val.get("current_backoff_minutes"),
+                "min_proactive_interval_minutes": int(s_cfg.min_proactive_interval_minutes),
+                "proactive_backoff_multiplier": float(s_cfg.proactive_backoff_multiplier),
+                "proactive_max_backoff_minutes": int(s_cfg.proactive_max_backoff_minutes),
+                "pending_milestone": rhythm_val.get("pending_milestone"),
+                "pending_goal_hints_count": len(pending_hints),
+                "pending_goal_hints": pending_hints,
+            },
+            "queues": {
+                "open_inbox_count": open_inbox_count,
+                "deferred_replies": deferred_list,
+                "recent_dialogue_turns": recent_turns,
+            },
+            "recent_decisions": recent_decisions,
+            "stats": {
+                "total_reflections_sampled": len(recent_decisions),
+                "action_counts": action_counts,
+                "memory_promoted_count": mem_promoted_count,
+                "social_episodic_memory_total": social_mem_total,
+                "adopted_goal_count": adopted_goal_count,
+            },
         }
 
     return router

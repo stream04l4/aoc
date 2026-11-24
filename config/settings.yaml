@@ -66,3 +66,28 @@ governance:
 logging:
   level: "INFO"
   json: true
+
+social:
+  enabled: false                    # V5.1 unified autonomous social loop (disable for pure V5.0.1 mode)
+  auto_enable_affect: true          # Activate AffectModulator automatically when social.enabled=true
+  dialogue_window_turns: 16
+  max_inbox_batch: 5
+  min_proactive_interval_minutes: 45
+  proactive_backoff_multiplier: 2.0
+  proactive_max_backoff_minutes: 480
+  proactive_enabled: true
+  max_defer_count: 2
+  proactive_valence_threshold: 0.55
+  proactive_arousal_threshold: 0.48
+  proactive_frustration_threshold: 0.60
+  proactive_boredom_threshold: 0.65
+  proactive_high_ig_threshold: 0.55
+  social_memory_max_importance: 0.72
+  default_defer_minutes: 15
+  min_defer_minutes: 3
+  max_defer_minutes: 180
+  max_reply_chars: 1200
+  memory_promotion_min_importance: 0.65
+  allowed_reaction_emojis: ["👀", "👍", "🤔", "🙈", "🔥", "❤️", "🎉", "👌"]
+  fallback_reaction_emoji: "👀"
+  wake_debounce_seconds: 1.5
