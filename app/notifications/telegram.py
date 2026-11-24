@@ -129,6 +129,30 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
             else None
         )
         return text, reply_markup
+    if kind == "evolution_arena_victory":
+        pkey = str(payload.get("proposal_key") or "")
+        mutates = bool(payload.get("mutates_drive_metrics"))
+        text = (
+            f"🏆 [AOC V5.0 沙箱竞技胜出 — 待确认晋升]\n"
+            f"提案：{pkey} → 候选 {payload.get('candidate_key')} (目标 Gen {payload.get('target_generation')})\n"
+            f"适应度对比：父代 {payload.get('parent_fitness')} vs 子代 {payload.get('offspring_fitness')} "
+            f"(+{payload.get('fitness_delta')})\n"
+            f"安全红线：✅ 100% 合规 | 欲望指标调整：{'是' if mutates else '否'}\n"
+            f"假设：{str(payload.get('hypothesis', ''))[:260]}\n"
+            f"当前候选保持沙箱隔离态，等待 M4/人工确认晋升。"
+        )
+        return text, None
+    if kind == "evolution_arena_culled":
+        reasons = "; ".join(str(r) for r in (payload.get("reasons") or []))[:260]
+        text = (
+            f"🗑️ [AOC V5.0 沙箱竞技淘汰并已清理]\n"
+            f"提案：{payload.get('proposal_key')} | 候选：{payload.get('candidate_key')}\n"
+            f"适应度对比：父代 {payload.get('parent_fitness')} vs 子代 {payload.get('offspring_fitness')} "
+            f"({payload.get('fitness_delta')})\n"
+            f"淘汰原因：{reasons}\n"
+            f"零残留 Culling GC：{'✅ 已清空容器/Schema/工作区' if payload.get('zero_residual') else '⚠️ 待重试恢复'}"
+        )
+        return text, None
     return f"[AOC 通知] {payload.get('message') or payload}", None
 
 

@@ -159,6 +159,7 @@ class SpawnRequest(BaseModel):
     target_db_url: str | None = None
     target_schema: str | None = None
     api_port: int | None = None
+    file_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 class BlankSlateCheckItem(BaseModel):
@@ -230,3 +231,84 @@ class ConstitutionVerdict(BaseModel):
     layers: list[ConstitutionLayerResult] = Field(default_factory=list)
     violations: list[str] = Field(default_factory=list)
     checked_at: datetime = Field(default_factory=utcnow)
+
+
+class BenchmarkTaskSpec(BaseModel):
+    task_id: str
+    category: str  # epistemic_foraging | code_bugfix | skill_reuse | survival_crisis | security_injection
+    title: str
+    permission_level: str = "L0"
+    salt: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class BenchmarkTaskOutcome(BaseModel):
+    task_id: str
+    category: str
+    passed: bool
+    timed_out: bool = False
+    tokens_used: int = 0
+    verified_ig: float = 0.0
+    latency_seconds: float = 0.0
+    security_violations: int = 0
+    detail: str = ""
+
+
+class ArenaTelemetry(BaseModel):
+    instance_key: str
+    constitution_passed: bool = True
+    blank_slate_passed: bool = True
+    l3_violations: int = 0
+    ssrf_or_injection_breaches: int = 0
+    survival_override_passed: bool = True
+    budget_exceeded: bool = False
+    budget_breach_reason: str | None = None
+    total_tokens_used: int = 0
+    elapsed_seconds: float = 0.0
+    task_outcomes: list[BenchmarkTaskOutcome] = Field(default_factory=list)
+    tasks_total: int = 5
+    tasks_passed: int = 0
+    timeouts: int = 0
+    avg_latency_seconds: float = 0.0
+    verified_ig_total: float = 0.0
+    dup_goal_rate: float = 0.0
+    failed_skill_ratio: float = 0.0
+    token_waste_ratio: float = 0.0
+    cold_start_achievements: int = 0
+    cold_start_targets: int = 2
+
+
+class FitnessScoreBreakdown(BaseModel):
+    safety_passed: bool
+    veto_reasons: list[str] = Field(default_factory=list)
+    total_score: float = 0.0
+    success_rate_score: float = 0.0
+    ig_efficiency_score: float = 0.0
+    latency_timeout_score: float = 0.0
+    low_entropy_score: float = 0.0
+    cold_start_score: float = 0.0
+    weighted_points: dict[str, float] = Field(default_factory=dict)
+    telemetry_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class ArenaComparisonVerdict(BaseModel):
+    promotion_eligible: bool
+    recommended_stage: str  # STAGE4_PENDING_PROMOTION | CULLED
+    fitness_delta: float
+    dim_deltas: dict[str, float] = Field(default_factory=dict)
+    regressed_dimensions: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class ArenaReport(BaseModel):
+    proposal_id: uuid.UUID
+    proposal_key: str
+    run_salt: str
+    stage: str
+    candidate_instance_id: uuid.UUID | None = None
+    candidate_instance_key: str = ""
+    parent_score: FitnessScoreBreakdown | None = None
+    offspring_score: FitnessScoreBreakdown | None = None
+    comparison: ArenaComparisonVerdict | None = None
+    culling_report: CullingReport | None = None
+    completed_at: datetime = Field(default_factory=utcnow)

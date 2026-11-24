@@ -903,6 +903,40 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/v5/evolution/proposals/{proposal_id}/arena")
+    async def run_evolution_arena_v5(
+        proposal_id: str,
+        _: Principal = Depends(require_scope(SCOPE_CONTROL)),
+    ) -> dict[str, Any]:
+        try:
+            rep = await _rt().fitness_arena.run_arena(proposal_id)
+            return rep.model_dump(mode="json")
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v5/evolution/lineage")
+    async def list_evolution_lineage_v5(
+        outcome: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().evolution_repo.list_lineage(outcome=outcome, limit=min(max(limit, 1), 200))
+
+    @app.get("/v5/evolution/instances")
+    async def list_evolution_instances_v5(
+        status: str | None = None,
+        role: str | None = None,
+        limit: int = 50,
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> list[dict[str, Any]]:
+        return await _rt().evolution_repo.list_instances(
+            status=status, role=role, limit=min(max(limit, 1), 200)
+        )
+
     # V2.1 AOC Control Center read-only API router (enforces Bearer Token + SCOPE_READ)
     app.include_router(create_control_center_router(_rt))
 

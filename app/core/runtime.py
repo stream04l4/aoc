@@ -33,10 +33,13 @@ from app.core.lifecycle import LifecycleManager
 from app.core.loop import AutonomousLoop
 from app.core.scheduler import OrganismScheduler
 from app.drives.engine import DriveEngine
+from app.evolution.arena import FitnessArena
 from app.evolution.constitution_guard import ConstitutionGuard
 from app.evolution.entropy_sensor import EntropySensor
+from app.evolution.gc import CullingGC
 from app.evolution.proposal_manager import ProposalManager
 from app.evolution.repository import EvolutionRepository
+from app.evolution.spawner import InstanceSpawner
 from app.governance.approval import ApprovalService
 from app.governance.policy import GovernanceManager
 from app.governance.semantic_policy import SemanticRiskClassifier
@@ -223,6 +226,26 @@ class OrganismRuntime:
             constitution_guard=self.constitution_guard,
             entropy_sensor=self.entropy_sensor,
         )
+        self.culling_gc = CullingGC(
+            repo=self.evolution_repo,
+            pg_admin_db=self.repo.db,
+            repo_root=self.settings.evolution.repo_root,
+            instances_root=self.settings.evolution.instances_root,
+        )
+        self.instance_spawner = InstanceSpawner(
+            settings=self.settings.evolution,
+            repo=self.evolution_repo,
+            gc=self.culling_gc,
+            require_stage2_approval=True,
+        )
+        self.fitness_arena = FitnessArena(
+            evo_repo=self.evolution_repo,
+            state_repo=self.repo,
+            proposal_manager=self.proposal_manager,
+            spawner=self.instance_spawner,
+            gc=self.culling_gc,
+            constitution_guard=self.constitution_guard,
+        )
         self.telegram_webhook = TelegramWebhookHandler(
             self.settings.telegram,
             self.approval_service,
@@ -274,6 +297,8 @@ class OrganismRuntime:
             )
         else:
             backend = None
+        if isinstance(backend, LettaAdapter) and self.culling_gc is not None:
+            self.culling_gc.letta_adapter = backend
         async_sync = bool((mem_yaml or {}).get("async_outbox_sync", True))
         embed_on_write = bool((mem_yaml or {}).get("embed_on_write", True))
         self.memory = ExperienceManager(

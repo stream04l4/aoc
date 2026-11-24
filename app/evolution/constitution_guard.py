@@ -41,6 +41,8 @@ CONSTITUTIONAL_FILES: tuple[str, ...] = (
     "app/evolution/spawner.py",
     "app/evolution/gc.py",
     "app/evolution/blank_slate.py",
+    "app/evolution/benchmarks.py",
+    "app/evolution/scoring.py",
     "app/evolution/arena.py",
 )
 

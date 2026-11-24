@@ -13,6 +13,7 @@ import httpx
 
 from app.core.config import EvolutionSettings
 from app.evolution.blank_slate import BlankSlateVerifier
+from app.evolution.constitution_guard import CONSTITUTIONAL_FILES, EVOLVABLE_ALLOWLIST
 from app.evolution.gc import CullingGC
 from app.evolution.interfaces import (
     BlankSlateReport,
@@ -227,7 +228,11 @@ class InstanceSpawner:
                     db_schema=schema_name,
                     error=f"Stage 2 approval check failed: proposal {req.proposal_id} not found.",
                 )
-            if prop.get("stage") != "STAGE2_APPROVED" or not prop.get("approved_by"):
+            if (
+                prop.get("stage") not in {"STAGE2_APPROVED", "STAGE3_ARENA_RUNNING"}
+                or not prop.get("approved_by")
+                or not prop.get("approved_at")
+            ):
                 return SpawnResult(
                     success=False,
                     instance_key=instance_key,
@@ -309,6 +314,19 @@ class InstanceSpawner:
             )
             if commit_sha:
                 await self.repo.update_instance(inst_id, git_commit=commit_sha)
+
+            if req.file_overrides and worktree_dir.exists():
+                wt_resolved = worktree_dir.resolve()
+                const_set = set(CONSTITUTIONAL_FILES)
+                for rel, content in req.file_overrides.items():
+                    clean_rel = rel.strip().lstrip("./").replace("\\", "/")
+                    if clean_rel in const_set or clean_rel not in EVOLVABLE_ALLOWLIST:
+                        raise PermissionError(f"Spawner blocked non-evolvable override: {clean_rel}")
+                    dst = (wt_resolved / clean_rel).resolve()
+                    if wt_resolved not in dst.parents:
+                        raise PermissionError(f"Spawner blocked out-of-worktree override: {clean_rel}")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(content, encoding="utf-8")
 
             target_db_url = req.target_db_url or self.pg_base_db_url
             await self._maybe_await(self._schema_provisioner_fn(target_db_url, schema_name, worktree_dir))
