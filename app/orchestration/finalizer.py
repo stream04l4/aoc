@@ -910,6 +910,7 @@ class TaskFinalizer:
                             message=str(m.get("message") or ""),
                             reason=str(m.get("reason") or ""),
                             expected_benefit=str(m.get("expected_benefit") or ""),
+                            options=m.get("options") if isinstance(m.get("options"), list) else None,
                             cycle_id=cycle_uuid,
                         )
                 except Exception as exc:

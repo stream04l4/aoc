@@ -67,7 +67,7 @@ class GoalProposal(BaseModel):
     discover_world_source: dict[str, Any] | None = None
     # V4.0 M3: optional external exploration topic {topic_key, domain, question}
     exploration_topic: dict[str, Any] | None = None
-    # V4.1: optional proactive outreach to creator Joel ({kind, topic_key, title, message, reason, expected_benefit})
+    # V4.1/V5.0.1: optional interactive outreach to creator Joel ({kind, topic_key, title, message, reason, expected_benefit, options?: [{label, instruction}]})
     message_to_human: dict[str, Any] | None = None
     # V4.2: optional emergent multi-hop investigation action ({action, thread_key?, core_question?, initial_leads?})
     investigation_action: dict[str, Any] | None = None
@@ -189,7 +189,7 @@ class EvaluationResult(BaseModel):
     hypothesis_verdict: str | None = None  # confirmed | refuted | inconclusive
     # V4.0 M3: Optional external strategy playbook update ({domain, content, change_summary})
     playbook_update: dict[str, Any] | None = None
-    # V4.1: Optional milestone report or blocker outreach to creator Joel
+    # V4.1/V5.0.1: Optional milestone report or blocker outreach to creator Joel ({kind, topic_key, title, message, reason, expected_benefit, options?: [{label, instruction}]})
     message_to_human: dict[str, Any] | None = None
     # V4.2: Optional multi-hop investigation progression & emergent channel/feed update
     investigation_update: dict[str, Any] | None = None

@@ -20,6 +20,31 @@ from app.storage.repository import StateRepository
 
 logger = get_logger("aoc.notifications.human_bridge")
 
+_DEFAULT_ASK_OPTIONS: tuple[dict[str, str], ...] = (
+    {
+        "label": "同意，按推荐方案推进",
+        "instruction": "同意按你在求助说明中推荐的方案继续执行，并在合规边界内完成该任务。",
+    },
+    {
+        "label": "先保守探索，暂不改动",
+        "instruction": "保持只读与最小影响原则，先做保守验证或查找公开替代方案，暂不做激进变更。",
+    },
+    {
+        "label": "跳过此卡点，切换方向",
+        "instruction": "暂时跳过当前阻塞卡点，将该支线标记为搁置并切换到更有信息增益的新探索方向。",
+    },
+)
+_DEFAULT_MILESTONE_OPTIONS: tuple[dict[str, str], ...] = (
+    {
+        "label": "不错，继续深挖此方向",
+        "instruction": "继续沿当前已验证成果方向深入探索，或将经验沉淀为可复用技能。",
+    },
+    {
+        "label": "总结收尾，换新主题",
+        "instruction": "总结固化当前里程碑结论，收敛本支线并转向其他更有价值的探索方向。",
+    },
+)
+
 
 def _parse_iso_utc(raw: str | None) -> datetime | None:
     if not raw or not isinstance(raw, str):
@@ -53,6 +78,38 @@ class HumanBridge:
         slug = re.sub(r"[^a-z0-9_:-]+", "_", raw).strip("_")[:64]
         return slug or "general"
 
+    @staticmethod
+    def _normalize_options(kind: str, raw_options: Any) -> list[dict[str, str]]:
+        """Normalize 2-4 concrete decision options; filter out duplicates or redundant 'Other' choices."""
+        cleaned: list[dict[str, str]] = []
+        seen_labels: set[str] = set()
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if isinstance(opt, dict):
+                    label = str(opt.get("label") or opt.get("text") or opt.get("title") or "").strip()
+                    instruction = str(opt.get("instruction") or opt.get("action") or label).strip()
+                elif isinstance(opt, str):
+                    label = opt.strip()
+                    instruction = label
+                else:
+                    continue
+                if not label or "其它" in label or "其他" in label:
+                    continue
+                norm_label = label[:28].strip()
+                norm_inst = instruction[:240].strip() or norm_label
+                dedup_key = norm_label.lower()
+                if not norm_label or dedup_key in seen_labels:
+                    continue
+                seen_labels.add(dedup_key)
+                cleaned.append({"label": norm_label, "instruction": norm_inst})
+                if len(cleaned) >= 4:
+                    break
+
+        if len(cleaned) >= 2:
+            return cleaned
+        defaults = _DEFAULT_MILESTONE_OPTIONS if kind == "milestone_report" else _DEFAULT_ASK_OPTIONS
+        return [dict(o) for o in defaults]
+
     async def maybe_send_outreach(
         self,
         *,
@@ -62,10 +119,11 @@ class HumanBridge:
         message: str,
         reason: str = "",
         expected_benefit: str = "",
+        options: list[Any] | None = None,
         cycle_id: uuid.UUID | None = None,
         force: bool = False,
     ) -> dict[str, Any]:
-        """Enqueue a rate-limited proactive message to Joel via Outbox."""
+        """Enqueue a rate-limited interactive outreach card to Joel via Outbox."""
         clean_msg = str(message or "").strip()
         if not self.enabled or not clean_msg:
             return {"sent": False, "reason": "disabled_or_empty"}
@@ -99,18 +157,45 @@ class HumanBridge:
                     }
 
         clean_title = str(title or slug).strip()[:200]
+        clean_reason = str(reason or "").strip()[:500]
+        clean_benefit = str(expected_benefit or "").strip()[:500]
+        card_id = uuid.uuid4().hex[:8]
+        norm_options = self._normalize_options(norm_kind, options)
+
+        await self.repo.upsert_world_item(
+            kind="human_outreach_card",
+            key=card_id,
+            value={
+                "card_id": card_id,
+                "kind": norm_kind,
+                "topic_key": slug,
+                "title": clean_title,
+                "message": clean_msg[:1500],
+                "reason": clean_reason,
+                "expected_benefit": clean_benefit,
+                "options": norm_options,
+                "created_at": now.isoformat(),
+                "answered_at": None,
+                "selected_option": None,
+            },
+            status="open",
+            source=f"human_bridge:{norm_kind}",
+        )
+
         payload = {
             "kind": norm_kind,
+            "card_id": card_id,
             "topic_key": slug,
             "title": clean_title,
             "message": clean_msg[:1500],
-            "reason": str(reason or "").strip()[:500],
-            "expected_benefit": str(expected_benefit or "").strip()[:500],
+            "reason": clean_reason,
+            "expected_benefit": clean_benefit,
+            "options": norm_options,
             "cycle_id": str(cycle_id) if cycle_id else None,
         }
         await self.repo.enqueue_outbox_event(
             event_type=OutboxEventType.NOTIFICATION_DISPATCH,
-            idempotency_key=f"notify:{norm_kind}:{slug}:{int(now.timestamp())}",
+            idempotency_key=f"notify:{norm_kind}:{slug}:{card_id}",
             payload=payload,
         )
         await self.repo.upsert_world_item(
@@ -118,6 +203,7 @@ class HumanBridge:
             key=slug,
             value={
                 "kind": norm_kind,
+                "card_id": card_id,
                 "title": clean_title,
                 "message": clean_msg[:500],
                 "sent_at": now.isoformat(),
@@ -129,10 +215,187 @@ class HumanBridge:
         await self.repo.log_event(
             "human_bridge.outreach_enqueued",
             message=f"Enqueued proactive {norm_kind} outreach '{clean_title}'",
-            payload={"kind": norm_kind, "topic_key": slug},
+            payload={"kind": norm_kind, "topic_key": slug, "card_id": card_id},
             cycle_id=cycle_id,
         )
-        return {"sent": True, "kind": norm_kind, "topic_key": slug}
+        return {
+            "sent": True,
+            "kind": norm_kind,
+            "topic_key": slug,
+            "card_id": card_id,
+            "options_count": len(norm_options),
+        }
+
+    async def get_outreach_card(self, card_id: str) -> dict[str, Any] | None:
+        """Fetch an outreach decision card from `world_states` by card_id."""
+        clean_id = str(card_id or "").strip()
+        if not clean_id:
+            return None
+        items = await self.repo.list_world_items(kind="human_outreach_card")
+        return next((item for item in items if str(item.get("key") or "") == clean_id), None)
+
+    async def resolve_outreach_choice(
+        self,
+        card_id: str,
+        option_index: int,
+        *,
+        sender: str = "joel",
+        chat_id: str = "",
+        update_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an inline option button tap on a HumanBridge card and record high-priority guidance."""
+        item = await self.get_outreach_card(card_id)
+        if item is None:
+            raise LookupError(f"Outreach card {card_id} not found")
+        val = dict(item.get("value") or {}) if isinstance(item.get("value"), dict) else {}
+        options = list(val.get("options") or [])
+        if option_index < 0 or option_index >= len(options):
+            raise IndexError(f"Option index {option_index} out of range for card {card_id}")
+
+        opt = dict(options[option_index])
+        title = str(val.get("title") or "AOC 决策卡片")
+        selected = val.get("selected_option") if isinstance(val.get("selected_option"), dict) else None
+        if item.get("status") == "answered" and selected and selected.get("index") == option_index:
+            return {
+                "ok": True,
+                "already_selected": True,
+                "card_id": card_id,
+                "title": title,
+                "option": opt,
+                "guidance": None,
+            }
+
+        now = utcnow()
+        guidance_text = (
+            f"【创作者 Joel 对「{title}」的选择】\n"
+            f"选项：{opt['label']}\n"
+            f"执行指示：{opt['instruction']}"
+        )
+        suffix = str(update_id) if update_id is not None else str(int(now.timestamp()))
+        guidance = await self.record_human_guidance(
+            key=f"tg_choice:{card_id}:{option_index}:{suffix}",
+            text=guidance_text,
+            sender=sender,
+            channel="telegram",
+            chat_id=chat_id,
+        )
+        val["answered_at"] = now.isoformat()
+        val["selected_option"] = {
+            "index": option_index,
+            "label": opt["label"],
+            "instruction": opt["instruction"],
+            "sender": sender,
+        }
+        await self.repo.upsert_world_item(
+            kind="human_outreach_card",
+            key=card_id,
+            value=val,
+            status="answered",
+            source=str(item.get("source") or "human_bridge:ask_human"),
+        )
+        return {
+            "ok": True,
+            "already_selected": False,
+            "card_id": card_id,
+            "title": title,
+            "option": opt,
+            "guidance": guidance,
+        }
+
+    async def mark_awaiting_custom_reply(
+        self,
+        card_id: str,
+        *,
+        chat_id: str,
+        prompt_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Bind the next text reply from `chat_id` to the specified outreach card ('Other' option)."""
+        item = await self.get_outreach_card(card_id)
+        if item is None:
+            raise LookupError(f"Outreach card {card_id} not found")
+        val = item.get("value") if isinstance(item.get("value"), dict) else {}
+        payload = {
+            "card_id": card_id,
+            "title": str(val.get("title") or "AOC 决策卡片"),
+            "prompt_message_id": prompt_message_id,
+            "created_at": utcnow().isoformat(),
+        }
+        await self.repo.upsert_world_item(
+            kind="telegram_pending_reply",
+            key=str(chat_id).strip(),
+            value=payload,
+            status="open",
+            source="telegram:other_choice",
+        )
+        return payload
+
+    async def consume_pending_custom_reply(
+        self,
+        chat_id: str,
+        *,
+        max_age_seconds: float = 7200.0,
+    ) -> dict[str, Any] | None:
+        """Pop any active pending 'Other' custom-reply expectation for `chat_id`."""
+        clean_chat = str(chat_id or "").strip()
+        if not clean_chat:
+            return None
+        items = await self.repo.list_world_items(kind="telegram_pending_reply", status="open")
+        match = next((item for item in items if str(item.get("key") or "") == clean_chat), None)
+        if match is None:
+            return None
+        val = dict(match.get("value") or {}) if isinstance(match.get("value"), dict) else {}
+        await self.repo.upsert_world_item(
+            kind="telegram_pending_reply",
+            key=clean_chat,
+            value=val,
+            status="consumed",
+            source=str(match.get("source") or "telegram:other_choice"),
+        )
+        created_dt = _parse_iso_utc(val.get("created_at"))
+        if created_dt is not None and (utcnow() - created_dt).total_seconds() > max_age_seconds:
+            return None
+        return val
+
+    async def record_custom_card_reply(
+        self,
+        card_id: str,
+        text: str,
+        *,
+        sender: str = "joel",
+        chat_id: str = "",
+        update_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist Joel's custom text reply for an outreach card and close the card as answered."""
+        clean_text = str(text or "").strip()
+        item = await self.get_outreach_card(card_id)
+        val = dict(item.get("value") or {}) if (item and isinstance(item.get("value"), dict)) else {}
+        title = str(val.get("title") or "指定话题")
+        now = utcnow()
+        if item is not None:
+            val["answered_at"] = now.isoformat()
+            val["selected_option"] = {
+                "index": -1,
+                "label": "其它答案（自定义）",
+                "instruction": clean_text[:500],
+                "sender": sender,
+            }
+            await self.repo.upsert_world_item(
+                kind="human_outreach_card",
+                key=card_id,
+                value=val,
+                status="answered",
+                source=str(item.get("source") or "human_bridge:ask_human"),
+            )
+
+        suffix = str(update_id) if update_id is not None else str(int(now.timestamp()))
+        guidance = await self.record_human_guidance(
+            key=f"tg_other:{card_id}:{suffix}",
+            text=f"【创作者 Joel 对「{title}」的自定义回复】\n{clean_text}",
+            sender=sender,
+            channel="telegram",
+            chat_id=chat_id,
+        )
+        return {"ok": True, "card_id": card_id, "title": title, "guidance": guidance}
 
     async def record_human_guidance(
         self,

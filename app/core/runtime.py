@@ -271,6 +271,7 @@ class OrganismRuntime:
             notifier=self.telegram_notifier,
             proposal_manager=self.proposal_manager,
             succession_manager=self.succession_manager,
+            human_bridge=self.human_bridge,
         )
         self.telegram_poller: TelegramPoller | None = None
         self.outbox = OutboxDispatcher(

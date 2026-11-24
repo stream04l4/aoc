@@ -35,6 +35,52 @@ class TelegramAuthError(PermissionError):
         self.status_code = status_code
 
 
+def _format_human_card_parts(
+    *,
+    options: Any,
+    card_id: str,
+    prompt_line: str,
+    legacy_hint: str | None = None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Format readable A/B/C/D options text + inline keyboard with automatic 'Other' choice."""
+    letters = ("A", "B", "C", "D")
+    parsed: list[tuple[str, str]] = []
+    if isinstance(options, list):
+        for raw in options[:4]:
+            if isinstance(raw, dict):
+                lbl = str(raw.get("label") or raw.get("text") or "").strip()
+                inst = str(raw.get("instruction") or raw.get("action") or lbl).strip()
+            elif isinstance(raw, str):
+                lbl = raw.strip()
+                inst = lbl
+            else:
+                continue
+            if lbl:
+                parsed.append((lbl[:28], inst[:240]))
+
+    extra_lines: list[str] = []
+    if parsed:
+        extra_lines.append(f"\n{prompt_line}")
+        for idx, (lbl, inst) in enumerate(parsed):
+            letter = letters[idx]
+            if inst and inst != lbl:
+                extra_lines.append(f"{letter}. {lbl} — {inst[:60]}")
+            else:
+                extra_lines.append(f"{letter}. {lbl}")
+    elif legacy_hint:
+        extra_lines.append(legacy_hint)
+
+    reply_markup: dict[str, Any] | None = None
+    if card_id and parsed:
+        rows = [
+            [{"text": f"{letters[idx]}. {lbl}", "callback_data": f"hb:{card_id}:{idx}"}]
+            for idx, (lbl, _inst) in enumerate(parsed)
+        ]
+        rows.append([{"text": "✏️ 其它答案（自定义输入）", "callback_data": f"hb:{card_id}:other"}])
+        reply_markup = {"inline_keyboard": rows}
+    return extra_lines, reply_markup
+
+
 def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     """Render structured notification payload into concise Chinese operator text + optional inline keyboard."""
     kind = str(payload.get("kind") or "info")
@@ -64,25 +110,35 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
 
     if kind == "ask_human":
         parts = [
-            "[AOC 主动求助 / 能力需求]",
-            f"主题：{payload.get('title', '未命名')}",
-            f"内容：{payload.get('message', '')}",
+            f"💬 【需要你拍板】{payload.get('title', '请确认下一步')}",
+            f"📌 情况说明\n{payload.get('message', '')}",
         ]
         if payload.get("reason"):
-            parts.append(f"原因：{payload['reason']}")
+            parts.append(f"💡 原因说明\n{payload['reason']}")
         if payload.get("expected_benefit"):
-            parts.append(f"预期收益：{payload['expected_benefit']}")
-        parts.append("（直接在此回复文字，我将在下一轮自主思考中读取并优先响应；发送 /status 可查看当前状态）")
-        return "\n".join(parts), None
+            parts.append(f"🎯 解决后收益\n{payload['expected_benefit']}")
+        opt_lines, reply_markup = _format_human_card_parts(
+            options=payload.get("options"),
+            card_id=str(payload.get("card_id") or "").strip(),
+            prompt_line="👇 请直接点击下方选项（或点「其它答案」输入你的想法）：",
+            legacy_hint="（直接在此回复文字，我将在下一轮自主思考中读取并优先响应；发送 /status 可查看当前状态）",
+        )
+        parts.extend(opt_lines)
+        return "\n".join(parts), reply_markup
     if kind == "milestone_report":
         parts = [
-            "[AOC 自主进化阶段进展汇报]",
-            f"成果：{payload.get('title', '能力突破')}",
-            f"摘要：{payload.get('message', '')}",
+            f"✨ 【阶段进展】{payload.get('title', '阶段成果')}",
+            f"📌 核心成果\n{payload.get('message', '')}",
         ]
         if payload.get("expected_benefit"):
-            parts.append(f"价值：{payload['expected_benefit']}")
-        return "\n".join(parts), None
+            parts.append(f"🎯 实际价值\n{payload['expected_benefit']}")
+        opt_lines, reply_markup = _format_human_card_parts(
+            options=payload.get("options"),
+            card_id=str(payload.get("card_id") or "").strip(),
+            prompt_line="👇 接下来希望我怎么做？（可点击选项，也可忽略）：",
+        )
+        parts.extend(opt_lines)
+        return "\n".join(parts), reply_markup
     if kind == "critical_alert":
         return f"[AOC 紧急告警]\n{payload.get('message', '')}\n原因：{payload.get('reason', '')}", None
     if kind == "quota_recovered":
@@ -253,6 +309,140 @@ class TelegramNotifier:
         except Exception as exc:
             logger.warning("telegram.answer_callback_failed", error=str(exc))
 
+    async def edit_message_reply_markup(
+        self,
+        chat_id: str,
+        message_id: int,
+        reply_markup: dict[str, Any] | None,
+    ) -> None:
+        """Best-effort inline keyboard update after operator selects an outreach option."""
+        if not self.configured or not chat_id or not message_id:
+            return
+        try:
+            await self._post(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": int(message_id),
+                    "reply_markup": reply_markup or {"inline_keyboard": []},
+                },
+            )
+        except Exception as exc:
+            logger.warning("telegram.edit_reply_markup_failed", error=str(exc))
+
+
+async def _dispatch_human_bridge_callback(
+    *,
+    human_bridge: HumanBridge | None,
+    notifier: TelegramNotifier | None,
+    lifecycle: Any,
+    raw_action: str,
+    chat_id: str,
+    username: str,
+    callback_id: str,
+    message_id: int | None,
+    update_id: int | None,
+) -> dict[str, Any] | None:
+    """Shared handler for `hb:<card_id>:<index|other>` inline card callbacks across Webhook & Poller."""
+    parts = raw_action.split(":", 2)
+    if len(parts) != 3 or parts[0].strip().lower() != "hb":
+        return None
+    card_id = parts[1].strip()
+    choice = parts[2].strip().lower()
+    if not card_id:
+        return {"ok": False, "kind": "human_card_invalid", "reason": "missing card_id"}
+    if human_bridge is None:
+        if notifier is not None and callback_id:
+            await notifier.answer_callback_query(callback_id, "AOC 人机协作桥接未启用")
+        return {"ok": False, "kind": "human_card_unavailable", "card_id": card_id}
+
+    if choice == "other":
+        card = await human_bridge.get_outreach_card(card_id)
+        if card is None:
+            if notifier is not None and callback_id:
+                await notifier.answer_callback_query(callback_id, "该选项卡已过期，请直接发送文字指令")
+            return {"ok": True, "kind": "human_card_expired", "card_id": card_id}
+        val = card.get("value") if isinstance(card.get("value"), dict) else {}
+        title = str(val.get("title") or "指定话题")
+        prompt_msg_id: int | None = None
+        if notifier is not None and chat_id:
+            sent = await notifier._post(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": f"✏️ 请直接回复你对「{title}」的想法或指令（发送文字即可，我会自动关联此话题并唤醒 AOC）：",
+                    "reply_markup": {
+                        "force_reply": True,
+                        "selective": True,
+                        "input_field_placeholder": "请直接输入你的建议或决定...",
+                    },
+                },
+            )
+            res_obj = sent.get("result") if isinstance(sent, dict) else None
+            if isinstance(res_obj, dict) and isinstance(res_obj.get("message_id"), int):
+                prompt_msg_id = res_obj["message_id"]
+        await human_bridge.mark_awaiting_custom_reply(
+            card_id, chat_id=chat_id, prompt_message_id=prompt_msg_id
+        )
+        if notifier is not None and callback_id:
+            await notifier.answer_callback_query(callback_id, "请直接输入你的自定义回复")
+        return {"ok": True, "kind": "human_card_other", "card_id": card_id}
+
+    try:
+        idx = int(choice)
+    except ValueError:
+        if notifier is not None and callback_id:
+            await notifier.answer_callback_query(callback_id, "无效的选项编号")
+        return {"ok": False, "kind": "human_card_invalid_choice", "card_id": card_id}
+
+    try:
+        res = await human_bridge.resolve_outreach_choice(
+            card_id, idx, sender=username, chat_id=chat_id, update_id=update_id
+        )
+    except (LookupError, IndexError):
+        if notifier is not None and callback_id:
+            await notifier.answer_callback_query(callback_id, "该选项卡或选项已失效，请直接发送文字指令")
+        return {"ok": True, "kind": "human_card_expired", "card_id": card_id}
+
+    already = bool(res.get("already_selected"))
+    opt = res["option"]
+    if not already and lifecycle is not None:
+        try:
+            lifecycle.wake(reason=f"telegram card choice from {username}")
+        except Exception:
+            pass
+
+    if notifier is not None and callback_id:
+        toast = "你已选择过该选项" if already else f"已选择：{opt['label'][:60]}"
+        await notifier.answer_callback_query(callback_id, toast)
+
+    if not already and notifier is not None:
+        if message_id is not None and chat_id:
+            await notifier.edit_message_reply_markup(
+                chat_id,
+                message_id,
+                {
+                    "inline_keyboard": [
+                        [{"text": f"✅ 已选：{opt['label'][:24]}", "callback_data": f"hb:{card_id}:{idx}"}],
+                        [{"text": "✏️ 补充/修改（其它答案）", "callback_data": f"hb:{card_id}:other"}],
+                    ]
+                },
+            )
+        if chat_id:
+            await notifier._post(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": (
+                        f"✅ 已收到你的选择\n"
+                        f"主题：{res['title']}\n"
+                        f"决定：{opt['label']}\n\n"
+                        f"已唤醒 AOC，将在下一轮思考中优先按此执行。"
+                    ),
+                },
+            )
+    return {"ok": True, "kind": "human_card_choice", "card_id": card_id, "option_index": idx, "result": res}
+
 
 class TelegramWebhookHandler:
     """Authenticates Telegram Webhook callbacks and routes approvals through ApprovalService."""
@@ -265,6 +455,8 @@ class TelegramWebhookHandler:
         notifier: TelegramNotifier | None = None,
         proposal_manager: Any = None,
         succession_manager: Any = None,
+        human_bridge: HumanBridge | None = None,
+        lifecycle: Any = None,
     ) -> None:
         self.settings = settings
         self.approval_service = approval_service
@@ -272,6 +464,8 @@ class TelegramWebhookHandler:
         self.notifier = notifier
         self.proposal_manager = proposal_manager
         self.succession_manager = succession_manager
+        self.human_bridge = human_bridge
+        self.lifecycle = lifecycle
 
     async def handle_update(
         self,
@@ -295,10 +489,13 @@ class TelegramWebhookHandler:
         callback_id = ""
         raw_action = ""
 
+        cb_message_id: int | None = None
         if isinstance(cb, dict):
             callback_id = str(cb.get("id") or "")
             frm = cb.get("from") or {}
-            chat = (cb.get("message") or {}).get("chat") or {}
+            cb_msg = cb.get("message") or {}
+            chat = cb_msg.get("chat") or {}
+            cb_message_id = cb_msg.get("message_id") if isinstance(cb_msg.get("message_id"), int) else None
             chat_id = str(chat.get("id") or "")
             user_id = str(frm.get("id") or "")
             username = str(frm.get("username") or user_id or "telegram_user")
@@ -342,6 +539,21 @@ class TelegramWebhookHandler:
                 level="warning",
             )
             raise TelegramAuthError(f"User '{user_id}' is not in allowed_user_ids", status_code=403)
+
+        if isinstance(cb, dict) and raw_action.lower().startswith("hb:"):
+            hb_res = await _dispatch_human_bridge_callback(
+                human_bridge=self.human_bridge,
+                notifier=self.notifier,
+                lifecycle=self.lifecycle,
+                raw_action=raw_action,
+                chat_id=chat_id,
+                username=username,
+                callback_id=callback_id,
+                message_id=cb_message_id,
+                update_id=update.get("update_id") if isinstance(update.get("update_id"), int) else None,
+            )
+            if hb_res is not None:
+                return hb_res
 
         if ":" not in raw_action:
             return {"ok": True, "ignored": True, "reason": "no approval command found"}
@@ -475,7 +687,23 @@ class TelegramPoller:
                 )
                 return {"ok": False, "ignored": True, "reason": "unauthorized"}
 
+            cb_msg = cb.get("message") or {}
+            cb_message_id = cb_msg.get("message_id") if isinstance(cb_msg.get("message_id"), int) else None
             raw_action = str(cb.get("data") or "").strip()
+            if raw_action.lower().startswith("hb:"):
+                hb_res = await _dispatch_human_bridge_callback(
+                    human_bridge=self.human_bridge,
+                    notifier=self.notifier,
+                    lifecycle=self.lifecycle,
+                    raw_action=raw_action,
+                    chat_id=chat_id,
+                    username=username,
+                    callback_id=str(cb.get("id") or ""),
+                    message_id=cb_message_id,
+                    update_id=update_id if isinstance(update_id, int) else None,
+                )
+                if hb_res is not None:
+                    return hb_res
             if ":" in raw_action:
                 action, nonce = raw_action.split(":", 1)
                 action = action.strip().lower()
@@ -612,6 +840,38 @@ class TelegramPoller:
                 status_text += "\n\n直接发送任何文字，我将作为最高优先级引导写入下一轮自主思考循环。"
             await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": status_text[:4000]})
             return {"ok": True, "kind": "command", "command": cmd}
+
+        # Check if user is replying to a pending "Other (custom reply)" outreach prompt first
+        pending_custom = await self.human_bridge.consume_pending_custom_reply(chat_id)
+        if pending_custom is not None:
+            res_custom = await self.human_bridge.record_custom_card_reply(
+                pending_custom["card_id"],
+                text,
+                sender=username,
+                chat_id=chat_id,
+                update_id=update_id if isinstance(update_id, int) else None,
+            )
+            if self.lifecycle is not None:
+                try:
+                    self.lifecycle.wake(reason=f"telegram custom card reply from {username}")
+                except Exception:
+                    pass
+            try:
+                await self.notifier._post(
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": f"✅ 已收到你的指令（已关联「{res_custom['title']}」）并唤醒思考循环，我会在下一轮优先阅读并执行你的建议。",
+                    },
+                )
+            except Exception as exc:
+                logger.warning("telegram.poller_reply_failed", error=str(exc))
+            return {
+                "ok": True,
+                "kind": "guidance_custom_card",
+                "card_id": pending_custom["card_id"],
+                "guidance_key": res_custom["guidance"]["key"],
+            }
 
         # Free-form creator guidance -> persist, wake organism, and acknowledge warmly
         guidance = await self.human_bridge.record_human_guidance(
