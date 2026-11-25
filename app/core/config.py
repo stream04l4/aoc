@@ -269,6 +269,7 @@ class SocialSettings(BaseModel):
     proactive_frustration_threshold: float = 0.60
     proactive_boredom_threshold: float = 0.65
     proactive_high_ig_threshold: float = 0.55
+    milestone_dedup_hours: int = 24
     social_memory_max_importance: float = 0.72
     default_defer_minutes: int = 15
     min_defer_minutes: int = 3

@@ -17,6 +17,7 @@ Key invariants:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import secrets
 import time
@@ -1870,6 +1871,98 @@ class AutonomousLoop:
             "rhythm": rhythm,
         }
 
+    @staticmethod
+    def _is_verified_skill_crystallization(skill_cryst: Any) -> bool:
+        """Return True only when workspace skill crystallization actually succeeded and validated."""
+        if not isinstance(skill_cryst, dict) or not skill_cryst:
+            return False
+        if (
+            skill_cryst.get("crystallized") is False
+            or bool(skill_cryst.get("rejected_unsafe"))
+            or bool(skill_cryst.get("rolled_back"))
+            or bool(skill_cryst.get("awaiting_human_approval"))
+            or skill_cryst.get("passed") is False
+        ):
+            return False
+        status = str(skill_cryst.get("status") or "").strip().upper()
+        if status and status != "VALIDATED":
+            return False
+        return True
+
+    @staticmethod
+    def _build_skill_subject_key(skill_cryst: dict[str, Any]) -> str:
+        raw = str(skill_cryst.get("canonical_name") or skill_cryst.get("skill_key") or "").strip().lower()
+        norm = re.sub(r"\s+", " ", raw)[:120].strip()
+        return f"skill:{norm or 'unknown'}"
+
+    @staticmethod
+    def _extract_milestone_subject(milestone: Any) -> str | None:
+        if not isinstance(milestone, dict):
+            return None
+        explicit = str(milestone.get("subject_key") or "").strip()
+        if explicit:
+            return explicit
+        if milestone.get("kind") == "skill_crystallized":
+            match = re.search(r"「([^」]+)」", str(milestone.get("summary") or ""))
+            if match:
+                norm = re.sub(r"\s+", " ", match.group(1).strip().lower())[:120].strip()
+                if norm:
+                    return f"skill:{norm}"
+        return None
+
+    @classmethod
+    def _prune_recent_milestone_subjects(
+        cls,
+        raw_map: Any,
+        *,
+        now: datetime,
+        dedup_hours: int,
+        max_entries: int = 32,
+    ) -> dict[str, str]:
+        if not isinstance(raw_map, dict):
+            return {}
+        cutoff = now - timedelta(hours=max(1, int(dedup_hours)))
+        valid: list[tuple[str, datetime, str]] = []
+        for k_raw, ts_raw in raw_map.items():
+            key = str(k_raw or "").strip()
+            if not key or not isinstance(ts_raw, str):
+                continue
+            dt = cls._parse_social_dt(ts_raw)
+            if dt is not None and dt >= cutoff:
+                valid.append((key, dt, ts_raw))
+        valid.sort(key=lambda item: item[1], reverse=True)
+        return {k: ts for k, _, ts in valid[: max(1, int(max_entries))]}
+
+    def _consume_milestone_update(
+        self,
+        *,
+        rhythm: dict[str, Any],
+        impulse: dict[str, Any] | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Clear pending_milestone and record its subject_key in the cooldown map."""
+        if not (impulse or {}).get("event_id"):
+            return {}
+        dedup_hours = max(1, int(self.settings.social.milestone_dedup_hours))
+        recent_subjects = self._prune_recent_milestone_subjects(
+            rhythm.get("recent_milestone_subjects"),
+            now=now,
+            dedup_hours=dedup_hours,
+        )
+        subj_key = str((impulse or {}).get("subject_key") or "").strip()
+        if subj_key:
+            recent_subjects[subj_key] = now.isoformat()
+            recent_subjects = self._prune_recent_milestone_subjects(
+                recent_subjects,
+                now=now,
+                dedup_hours=dedup_hours,
+            )
+        return {
+            "last_shared_milestone_id": impulse["event_id"],  # type: ignore[index]
+            "pending_milestone": None,
+            "recent_milestone_subjects": recent_subjects,
+        }
+
     async def _record_social_milestone_from_finalizer(self, result: Any) -> None:
         """Record verified milestones (crystallized skill or high-IG breakthrough) for proactive sharing."""
         if not self.settings.social.enabled or getattr(result, "already_finalized", False):
@@ -1879,31 +1972,86 @@ class AutonomousLoop:
             exec_id = str(getattr(result, "execution_id", "") or "")
             if not exec_id:
                 return
+            now_dt = utcnow()
             milestone: dict[str, Any] | None = None
             skill_cryst = ev.get("skill_crystallized")
-            if isinstance(skill_cryst, dict) and skill_cryst:
-                sk_name = str(skill_cryst.get("canonical_name") or skill_cryst.get("skill_key") or "新技能")
+            if self._is_verified_skill_crystallization(skill_cryst):
+                sk_name = str(skill_cryst.get("canonical_name") or skill_cryst.get("skill_key") or "新技能").strip()
+                subject_key = self._build_skill_subject_key(skill_cryst)
+                if bool(skill_cryst.get("evolved")):
+                    ver = str(skill_cryst.get("version") or "").strip()
+                    summary = (
+                        f"刚把「{sk_name}」迭代升级到 v{ver} 并验证通过"
+                        if ver
+                        else f"刚把「{sk_name}」迭代优化了一版并验证通过"
+                    )
+                else:
+                    summary = f"刚把「{sk_name}」沉淀为可复用技能并验证通过"
                 milestone = {
                     "kind": "skill_crystallized",
                     "event_id": exec_id,
-                    "summary": f"刚把「{sk_name}」沉淀为可复用技能并验证通过",
-                    "at": utcnow().isoformat(),
+                    "subject_key": subject_key,
+                    "summary": summary,
+                    "at": now_dt.isoformat(),
                 }
             elif bool(getattr(result, "goal_achieved", False)):
                 ig = float(ev.get("information_gain") or 0.0)
                 if ig >= float(self.settings.social.proactive_high_ig_threshold):
                     raw_sum = str(ev.get("summary") or "").strip()[:180]
+                    hi_subject = (
+                        f"high_ig:{hashlib.sha256(raw_sum.lower().encode('utf-8')).hexdigest()[:12]}"
+                        if raw_sum
+                        else None
+                    )
                     milestone = {
                         "kind": "high_ig_discovery",
                         "event_id": exec_id,
+                        "subject_key": hi_subject,
                         "summary": raw_sum or f"刚完成高信息增益探索 (IG={ig:.2f})",
-                        "at": utcnow().isoformat(),
+                        "at": now_dt.isoformat(),
                     }
             if milestone is not None:
+                rhythm_rows = await self.repo.list_world_items(kind="social_rhythm_state")
+                rhythm_val = next(
+                    (
+                        dict(r.get("value") or {})
+                        for r in rhythm_rows
+                        if r.get("key") == "primary" and isinstance(r.get("value"), dict)
+                    ),
+                    dict(rhythm_rows[0].get("value") or {})
+                    if rhythm_rows and isinstance(rhythm_rows[0].get("value"), dict)
+                    else {},
+                )
+                dedup_hours = max(1, int(self.settings.social.milestone_dedup_hours))
+                recent_subjects = self._prune_recent_milestone_subjects(
+                    rhythm_val.get("recent_milestone_subjects"),
+                    now=now_dt,
+                    dedup_hours=dedup_hours,
+                )
+                subj_key = self._extract_milestone_subject(milestone)
+                if subj_key and subj_key in recent_subjects:
+                    logger.info(
+                        "loop.social_milestone_dedup_skipped",
+                        subject_key=subj_key,
+                        event_id=exec_id,
+                        reason="recent_cooldown",
+                    )
+                    return
+                if subj_key and self._extract_milestone_subject(rhythm_val.get("pending_milestone")) == subj_key:
+                    logger.info(
+                        "loop.social_milestone_dedup_skipped",
+                        subject_key=subj_key,
+                        event_id=exec_id,
+                        reason="already_pending",
+                    )
+                    return
                 await self.repo.upsert_world_item(
                     kind="social_rhythm_state",
                     key="primary",
-                    value={"pending_milestone": milestone},
+                    value={
+                        "pending_milestone": milestone,
+                        "recent_milestone_subjects": recent_subjects,
+                    },
                     status="active",
                     source="telegram:social",
                 )
@@ -1947,10 +2095,19 @@ class AutonomousLoop:
         pending_ms = rhythm.get("pending_milestone")
         if isinstance(pending_ms, dict) and pending_ms.get("event_id"):
             ev_id = str(pending_ms["event_id"])
-            if ev_id != str(rhythm.get("last_shared_milestone_id") or ""):
+            ms_subject = self._extract_milestone_subject(pending_ms)
+            recent_subjects = self._prune_recent_milestone_subjects(
+                rhythm.get("recent_milestone_subjects"),
+                now=now,
+                dedup_hours=max(1, int(social_cfg.milestone_dedup_hours)),
+            )
+            if ev_id != str(rhythm.get("last_shared_milestone_id") or "") and not (
+                ms_subject and ms_subject in recent_subjects
+            ):
                 return {
                     "kind": "milestone",
                     "event_id": ev_id,
+                    "subject_key": ms_subject,
                     "hint": f"刚有新成果 ({pending_ms.get('kind', 'milestone')}): {str(pending_ms.get('summary') or '')[:180]}",
                 }
 
@@ -2286,8 +2443,13 @@ class AutonomousLoop:
                     }
                 )
                 if (impulse or {}).get("event_id"):
-                    rhythm_upd["last_shared_milestone_id"] = impulse["event_id"]
-                    rhythm_upd["pending_milestone"] = None
+                    rhythm_upd.update(
+                        self._consume_milestone_update(
+                            rhythm=rhythm,
+                            impulse=impulse,
+                            now=now,
+                        )
+                    )
             await self.repo.upsert_world_item(
                 kind="social_rhythm_state",
                 key="primary",
@@ -2371,8 +2533,13 @@ class AutonomousLoop:
             if trigger_source == "proactive_impulse":
                 ignore_upd["last_proactive_evaluated_at"] = now.isoformat()
                 if (impulse or {}).get("event_id"):
-                    ignore_upd["last_shared_milestone_id"] = impulse["event_id"]
-                    ignore_upd["pending_milestone"] = None
+                    ignore_upd.update(
+                        self._consume_milestone_update(
+                            rhythm=rhythm,
+                            impulse=impulse,
+                            now=now,
+                        )
+                    )
             await self.repo.upsert_world_item(
                 kind="social_rhythm_state",
                 key="primary",

@@ -548,3 +548,263 @@ async def test_v5_1_m2_blank_slate_verifier_blocks_all_social_artifacts(tmp_path
         assert {"memory_index_zero", "social_dialogue_memories_zero"} <= failed
     finally:
         await db_mem.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v5_1_milestone_skill_dedup_and_unverified_rejection(tmp_path: Path):
+    tg_calls: list[dict[str, Any]] = []
+
+    def _mock_tg(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sendMessage"):
+            body = json.loads(request.content.decode("utf-8")) if request.content else {}
+            tg_calls.append(body)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 700 + len(tg_calls)}})
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'm2_milestone_dedup.db'}")
+    await _init_db(db)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_tg)) as client:
+        try:
+            script = [
+                SocialTurnDecision(
+                    internal_monologue="这个技能刚验证通过，跟 Joel 简短说一声。",
+                    action="REPLY_NOW",
+                    reply_text="刚把 provenance checksum 检查沉淀成技能，验证过了。",
+                ),
+                SocialTurnDecision(
+                    internal_monologue="另一个新技能验证过了，但现在不想打扰他，先记着吧。",
+                    action="IGNORE",
+                ),
+            ]
+            brain = _M2ScriptBrain(script)
+            settings = Settings(
+                api=ApiSettings(host="127.0.0.1", auth_enabled=False),
+                database=DatabaseSettings(url=f"sqlite+aiosqlite:///{tmp_path / 'm2_milestone_dedup.db'}"),
+                memory=MemorySettings(provider="none", embedding_dim=512),
+                embedding=EmbeddingSettings(provider="hash_fallback", dimensions=512),
+                governance=GovernanceSettings(workspace_root=str(tmp_path / "ws")),
+                perception=PerceptionSettings(llm_probe=False),
+                runner=RunnerSettings(enabled=False),
+                telegram=TelegramSettings(enabled=True, polling_enabled=True, bot_token=SecretStr("123:TOKEN_XYZ_999"), allowed_chat_ids=["777"]),
+                social=SocialSettings(
+                    enabled=True,
+                    proactive_enabled=True,
+                    min_proactive_interval_minutes=5,
+                    milestone_dedup_hours=24,
+                    proactive_high_ig_threshold=0.55,
+                ),
+            )
+            rt = OrganismRuntime(settings=settings, db=db, brain=brain, auto_load_agents=False, llm_probe_fn=_healthy_llm_probe)
+            rt.telegram_notifier._http_client = client
+            await rt.start(start_scheduler=False)
+
+            async def _get_rhythm() -> dict[str, Any]:
+                rows = await rt.repo.list_world_items(kind="social_rhythm_state")
+                return dict(rows[0]["value"] or {}) if rows else {}
+
+            # 1. Unverified / unsafe / rolled-back / non-VALIDATED skill payloads MUST NOT create skill_crystallized milestones
+            bad_skill_payloads = [
+                {"crystallized": False, "rejected_unsafe": True, "violations": ["dynamic_exec"]},
+                {"crystallized": False, "evolved": True, "rolled_back": True, "passed": False, "status": "DEPRECATED", "skill_key": "audit_checksum"},
+                {"crystallized": True, "passed": True, "status": "DRAFT", "skill_key": "draft_skill"},
+                {"crystallized": True, "passed": True, "awaiting_human_approval": True, "skill_key": "l2_skill"},
+            ]
+            for bad_payload in bad_skill_payloads:
+                await rt.loop._record_social_milestone_from_finalizer(
+                    FinalizationResult(
+                        execution_id=str(uuid.uuid4()),
+                        task_id=str(uuid.uuid4()),
+                        already_finalized=False,
+                        goal_achieved=False,
+                        task_status="SUCCEEDED",
+                        evaluation={"skill_crystallized": bad_payload, "information_gain": 0.2},
+                    )
+                )
+            assert (await _get_rhythm()).get("pending_milestone") is None
+
+            # 1b. Failed crystallization with goal_achieved=True and high IG falls back to high_ig_discovery cleanly
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-hi-1",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "skill_crystallized": bad_skill_payloads[0],
+                        "information_gain": 0.85,
+                        "summary": "发现关键配置漂移",
+                    },
+                )
+            )
+            ms_hi = (await _get_rhythm()).get("pending_milestone")
+            assert ms_hi is not None and ms_hi["kind"] == "high_ig_discovery"
+            await rt.repo.upsert_world_item(kind="social_rhythm_state", key="primary", value={"pending_milestone": None}, status="active")
+
+            # 2. First verified crystallization sets pending_milestone; duplicate write while pending preserves original event_id
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-skill-1",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "skill_crystallized": {
+                            "crystallized": True,
+                            "skill_key": "audit_coding_provenance_checksum_check",
+                            "canonical_name": "audit.coding.provenance_checksum_check",
+                            "status": "VALIDATED",
+                            "passed": True,
+                        },
+                        "information_gain": 0.65,
+                    },
+                )
+            )
+            ms1 = (await _get_rhythm())["pending_milestone"]
+            assert ms1["event_id"] == "exec-skill-1"
+            assert ms1["subject_key"] == "skill:audit.coding.provenance_checksum_check"
+
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-skill-1-dup",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "skill_crystallized": {
+                            "crystallized": True,
+                            "evolved": True,
+                            "skill_key": "audit_coding_provenance_checksum_check",
+                            "canonical_name": "audit.coding.provenance_checksum_check",
+                            "status": "VALIDATED",
+                            "passed": True,
+                        },
+                    },
+                )
+            )
+            assert (await _get_rhythm())["pending_milestone"]["event_id"] == "exec-skill-1"
+
+            # 3. Consume via REPLY_NOW -> clears pending_milestone and records subject cooldown
+            c1 = await rt.loop.run_cycle()
+            assert c1["state_changes"]["social_reflection"]["action"] == "REPLY_NOW"
+            assert len(tg_calls) == 1
+            rhythm_after_reply = await _get_rhythm()
+            assert rhythm_after_reply["pending_milestone"] is None
+            assert "skill:audit.coding.provenance_checksum_check" in rhythm_after_reply["recent_milestone_subjects"]
+
+            # 4. Within cooldown, new execution evolving the SAME skill is suppressed at write-time
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-skill-2-evolved",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "skill_crystallized": {
+                            "crystallized": True,
+                            "evolved": True,
+                            "promoted": True,
+                            "version": "1.1.0",
+                            "skill_key": "audit_coding_provenance_checksum_check",
+                            "canonical_name": "audit.coding.provenance_checksum_check",
+                            "status": "VALIDATED",
+                            "passed": True,
+                        },
+                    },
+                )
+            )
+            assert (await _get_rhythm()).get("pending_milestone") is None
+
+            # 5. Legacy pending_milestone without subject_key is also suppressed at read-time during cooldown
+            old_ts = (utcnow() - timedelta(minutes=20)).isoformat()
+            await rt.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value={
+                    "last_proactive_at": old_ts,
+                    "last_proactive_evaluated_at": old_ts,
+                    "last_reply_at": old_ts,
+                    "pending_milestone": {
+                        "kind": "skill_crystallized",
+                        "event_id": "legacy-exec-99",
+                        "summary": "刚把「audit.coding.provenance_checksum_check」沉淀为可复用技能并验证通过",
+                        "at": utcnow().isoformat(),
+                    },
+                },
+                status="active",
+            )
+            rt.affect._state = rt.affect.state.model_copy(update={"valence": 0.1, "arousal": 0.1, "frustration": 0.0, "boredom": 0.0})
+            c_suppressed = await rt.loop.run_cycle()
+            assert c_suppressed["state_changes"]["social_reflection"]["triggered"] is False
+            assert len(brain.converse_contexts) == 1
+
+            # 6. A DIFFERENT skill triggers normally and IGNORE also clears pending_milestone + sets cooldown
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-other-skill-1",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "skill_crystallized": {
+                            "crystallized": True,
+                            "skill_key": "other_skill",
+                            "canonical_name": "cognition.research.other_skill",
+                            "status": "VALIDATED",
+                            "passed": True,
+                        },
+                    },
+                )
+            )
+            assert (await _get_rhythm())["pending_milestone"]["subject_key"] == "skill:cognition.research.other_skill"
+            c_other = await rt.loop.run_cycle()
+            assert c_other["state_changes"]["social_reflection"]["action"] == "IGNORE"
+            rhythm_after_ignore = await _get_rhythm()
+            assert rhythm_after_ignore["pending_milestone"] is None
+            assert "skill:cognition.research.other_skill" in rhythm_after_ignore["recent_milestone_subjects"]
+
+            # 7. After cooldown expires (>24h), same skill records again with evolution wording
+            expired_ts = (utcnow() - timedelta(hours=25)).isoformat()
+            await rt.repo.upsert_world_item(
+                kind="social_rhythm_state",
+                key="primary",
+                value={
+                    "recent_milestone_subjects": {
+                        "skill:audit.coding.provenance_checksum_check": expired_ts,
+                        "skill:cognition.research.other_skill": utcnow().isoformat(),
+                    }
+                },
+                status="active",
+            )
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-skill-v2",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "skill_crystallized": {
+                            "crystallized": True,
+                            "evolved": True,
+                            "version": "2.0.0",
+                            "skill_key": "audit_coding_provenance_checksum_check",
+                            "canonical_name": "audit.coding.provenance_checksum_check",
+                            "status": "VALIDATED",
+                            "passed": True,
+                        },
+                    },
+                )
+            )
+            rhythm_reopened = await _get_rhythm()
+            assert rhythm_reopened["pending_milestone"] is not None
+            assert rhythm_reopened["pending_milestone"]["event_id"] == "exec-skill-v2"
+            assert "迭代升级到 v2.0.0" in rhythm_reopened["pending_milestone"]["summary"]
+            assert "skill:audit.coding.provenance_checksum_check" not in rhythm_reopened["recent_milestone_subjects"]
+            assert "skill:cognition.research.other_skill" in rhythm_reopened["recent_milestone_subjects"]
+        finally:
+            await db.dispose()
