@@ -11,6 +11,7 @@ runtime:
   monitor_poll_seconds: 5           # how often WAIT/MONITOR polls running executions
   max_wait_per_cycle_seconds: 120   # loop never blocks longer than this on a task; task keeps running
   max_cycles: 0                     # 0 = unlimited (used by tests to bound runs)
+  stale_active_goal_hours: 12     # auto-abandon orphaned ACTIVE goals idle beyond this window
 
 api:
   host: "127.0.0.1"
@@ -81,7 +82,7 @@ social:
   proactive_arousal_threshold: 0.48
   proactive_frustration_threshold: 0.60
   proactive_boredom_threshold: 0.65
-  proactive_high_ig_threshold: 0.55
+  proactive_high_ig_threshold: 0.68
   milestone_dedup_hours: 24
   social_memory_max_importance: 0.72
   default_defer_minutes: 15

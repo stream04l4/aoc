@@ -420,6 +420,7 @@ class AutonomousLoop:
 
             # ── 4. SELF ASSESSMENT ──────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="SELF_ASSESSMENT")
+            await self._expire_stale_active_goals(now=now, cycle_id=cycle_id)
             active_goals_for_recall = await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=3)
             recall_query = build_contextual_query(
                 observation=pre_obs,
@@ -1963,6 +1964,110 @@ class AutonomousLoop:
             "recent_milestone_subjects": recent_subjects,
         }
 
+    async def _expire_stale_active_goals(self, *, now: datetime, cycle_id: uuid.UUID) -> int:
+        """Auto-abandon orphaned ACTIVE goals idle beyond stale_active_goal_hours with no live tasks."""
+        try:
+            active_goals = await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=20)
+            if not active_goals:
+                return 0
+            live_statuses = [s.value for s in TaskStatus if not s.is_terminal]
+            live_tasks = await self.repo.list_tasks(statuses=live_statuses, limit=100)
+            live_goal_ids = {str(t["goal_id"]) for t in live_tasks if t.get("goal_id")}
+            stale_hours = max(1, int(self.settings.runtime.stale_active_goal_hours))
+            cutoff = now - timedelta(hours=stale_hours)
+            expired = 0
+            for g in active_goals:
+                gid_str = str(g.get("goal_id") or g.get("id") or "").strip()
+                if not gid_str or gid_str in live_goal_ids:
+                    continue
+                ref_dt = self._parse_social_dt(g.get("updated_at")) or self._parse_social_dt(g.get("created_at"))
+                if ref_dt is not None and ref_dt < cutoff:
+                    age_h = round((now - ref_dt).total_seconds() / 3600.0, 1)
+                    await self.repo.transition_goal(
+                        uuid.UUID(gid_str),
+                        GoalStatus.ABANDONED.value,
+                        note=f"Auto-expired stale ACTIVE goal (idle {age_h}h > {stale_hours}h with no live task)",
+                    )
+                    logger.info(
+                        "loop.stale_active_goal_expired",
+                        cycle_id=str(cycle_id),
+                        goal_id=gid_str,
+                        title=str(g.get("title") or "")[:100],
+                        age_hours=age_h,
+                    )
+                    expired += 1
+            return expired
+        except Exception as exc:
+            logger.warning("loop.stale_active_goal_expire_degraded", cycle_id=str(cycle_id), error=str(exc))
+            return 0
+
+    @staticmethod
+    def _clean_high_ig_milestone_summary(raw_sum: str) -> str | None:
+        text = str(raw_sum or "").strip()
+        for _ in range(3):
+            updated = re.sub(
+                r"^(?:execution succeeded(?:\s+and\s+verification\s+passed)?\.?|verification passed\.?)\s*",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+            if updated == text:
+                break
+            text = updated
+        text = text[:180].strip()
+        if not text:
+            return None
+        low = text.lower()
+        markers = (
+            "report.json",
+            "fixture.json",
+            "stdlib-only",
+            "unittest",
+            "checksum",
+            "isolated l1",
+            "verification passed",
+            "sha256",
+        )
+        if sum(1 for m in markers if m in low) >= 2:
+            return None
+        return text
+
+    @staticmethod
+    def _dialogue_memory_similarity_tokens(text: str) -> set[str]:
+        cleaned = re.sub(r"[^\w]+", "", str(text or "").lower())
+        tokens = {cleaned[i : i + 2] for i in range(max(0, len(cleaned) - 1))}
+        tokens.update(re.findall(r"[a-z0-9_]{2,}", str(text or "").lower()))
+        return tokens
+
+    @classmethod
+    def _is_duplicate_dialogue_memory(
+        cls,
+        candidate: str,
+        existing_rows: list[dict[str, Any]],
+        threshold: float = 0.50,
+    ) -> bool:
+        cand_norm = re.sub(r"[^\w]+", "", str(candidate or "").lower())
+        if not cand_norm:
+            return True
+        cand_tokens = cls._dialogue_memory_similarity_tokens(candidate)
+        for row in existing_rows:
+            if not isinstance(row, dict) or row.get("source") != "dialogue:telegram":
+                continue
+            existing_text = str(row.get("summary") or row.get("content") or row.get("title") or "").strip()
+            ex_norm = re.sub(r"[^\w]+", "", existing_text.lower())
+            if not ex_norm:
+                continue
+            if cand_norm == ex_norm:
+                return True
+            if len(cand_norm) >= 12 and len(ex_norm) >= 12 and (cand_norm in ex_norm or ex_norm in cand_norm):
+                return True
+            ex_tokens = cls._dialogue_memory_similarity_tokens(existing_text)
+            if cand_tokens and ex_tokens:
+                jaccard = len(cand_tokens & ex_tokens) / float(len(cand_tokens | ex_tokens))
+                if jaccard >= threshold:
+                    return True
+        return False
+
     async def _record_social_milestone_from_finalizer(self, result: Any) -> None:
         """Record verified milestones (crystallized skill or high-IG breakthrough) for proactive sharing."""
         if not self.settings.social.enabled or getattr(result, "already_finalized", False):
@@ -1997,19 +2102,16 @@ class AutonomousLoop:
             elif bool(getattr(result, "goal_achieved", False)):
                 ig = float(ev.get("information_gain") or 0.0)
                 if ig >= float(self.settings.social.proactive_high_ig_threshold):
-                    raw_sum = str(ev.get("summary") or "").strip()[:180]
-                    hi_subject = (
-                        f"high_ig:{hashlib.sha256(raw_sum.lower().encode('utf-8')).hexdigest()[:12]}"
-                        if raw_sum
-                        else None
-                    )
-                    milestone = {
-                        "kind": "high_ig_discovery",
-                        "event_id": exec_id,
-                        "subject_key": hi_subject,
-                        "summary": raw_sum or f"刚完成高信息增益探索 (IG={ig:.2f})",
-                        "at": now_dt.isoformat(),
-                    }
+                    clean_sum = self._clean_high_ig_milestone_summary(str(ev.get("summary") or ""))
+                    if clean_sum:
+                        hi_subject = f"high_ig:{hashlib.sha256(clean_sum.lower().encode('utf-8')).hexdigest()[:12]}"
+                        milestone = {
+                            "kind": "high_ig_discovery",
+                            "event_id": exec_id,
+                            "subject_key": hi_subject,
+                            "summary": clean_sum,
+                            "at": now_dt.isoformat(),
+                        }
             if milestone is not None:
                 rhythm_rows = await self.repo.list_world_items(kind="social_rhythm_state")
                 rhythm_val = next(
@@ -2556,28 +2658,37 @@ class AutonomousLoop:
         mem_max_imp = float(social_cfg.social_memory_max_importance)
         mem_summary_clean = self._sanitize_social_output(social_dec.memory_summary)
         if (
-            social_dec.should_remember
+            trigger_source != "proactive_impulse"
+            and social_dec.should_remember
             and len(mem_summary_clean) >= 6
             and float(social_dec.memory_importance or 0.0) >= mem_min_imp
             and self.memory is not None
         ):
             calibrated_imp = round(min(mem_max_imp, max(0.35, float(social_dec.memory_importance))), 3)
             try:
-                mem_res = await self.memory.remember(
-                    MemoryItem(
-                        memory_type=MemoryType.EPISODIC.value,
-                        title=f"与 {target_sender} 的对话记忆：{mem_summary_clean[:48]}",
-                        content=mem_summary_clean[:800],
-                        source="dialogue:telegram",
-                        importance=calibrated_imp,
-                        tags=["dialogue", "telegram", "social", trigger_source],
-                    ),
-                    cycle_id=cycle_id,
-                    reliability=0.75,
-                )
-                memory_promoted = True
-                promoted_memory_id = mem_res.stored_index_id
-                promoted_importance = calibrated_imp
+                recent_ep = await self.repo.list_memory_index(memory_type=MemoryType.EPISODIC.value, limit=40)
+                if self._is_duplicate_dialogue_memory(mem_summary_clean, recent_ep):
+                    logger.info(
+                        "cycle.social_memory_dedup_skipped",
+                        cycle_id=str(cycle_id),
+                        summary_preview=mem_summary_clean[:60],
+                    )
+                else:
+                    mem_res = await self.memory.remember(
+                        MemoryItem(
+                            memory_type=MemoryType.EPISODIC.value,
+                            title=f"与 {target_sender} 的对话记忆：{mem_summary_clean[:48]}",
+                            content=mem_summary_clean[:800],
+                            source="dialogue:telegram",
+                            importance=calibrated_imp,
+                            tags=["dialogue", "telegram", "social", trigger_source],
+                        ),
+                        cycle_id=cycle_id,
+                        reliability=0.75,
+                    )
+                    memory_promoted = True
+                    promoted_memory_id = mem_res.stored_index_id
+                    promoted_importance = calibrated_imp
             except Exception as exc:
                 logger.warning("cycle.social_memory_promote_degraded", cycle_id=str(cycle_id), error=str(exc))
 

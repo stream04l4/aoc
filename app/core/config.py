@@ -42,6 +42,7 @@ class RuntimeSettings(BaseModel):
     monitor_poll_seconds: float = 5
     max_wait_per_cycle_seconds: float = 120
     max_cycles: int = 0
+    stale_active_goal_hours: int = 12
 
 
 class ApiSettings(BaseModel):
@@ -268,7 +269,7 @@ class SocialSettings(BaseModel):
     proactive_arousal_threshold: float = 0.48
     proactive_frustration_threshold: float = 0.60
     proactive_boredom_threshold: float = 0.65
-    proactive_high_ig_threshold: float = 0.55
+    proactive_high_ig_threshold: float = 0.68
     milestone_dedup_hours: int = 24
     social_memory_max_importance: float = 0.72
     default_defer_minutes: int = 15

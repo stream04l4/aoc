@@ -308,13 +308,20 @@ class TelegramNotifier:
         base = self.settings.api_base_url.rstrip("/")
         return f"{base}/bot{tok}/{method}"
 
-    async def _post(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         url = self._bot_url(method)
+        req_timeout = float(timeout_seconds) if timeout_seconds is not None else float(self.settings.timeout_seconds)
         try:
             if self._http_client is not None:
-                resp = await self._http_client.post(url, json=payload, timeout=self.settings.timeout_seconds)
+                resp = await self._http_client.post(url, json=payload, timeout=req_timeout)
             else:
-                async with httpx.AsyncClient(timeout=self.settings.timeout_seconds) as client:
+                async with httpx.AsyncClient(timeout=req_timeout) as client:
                     resp = await client.post(url, json=payload)
             resp.raise_for_status()
             body = resp.json()
@@ -324,7 +331,10 @@ class TelegramNotifier:
         except Exception as exc:
             # Never leak bot token from exception URLs into logs or outbox last_error!
             tok = self.settings.bot_token.get_secret_value() if self.settings.bot_token else ""
-            safe_err = str(exc).replace(tok, "<redacted>") if tok else str(exc)
+            raw_detail = str(exc).strip() or repr(exc)
+            safe_detail = raw_detail.replace(tok, "<redacted>") if tok else raw_detail
+            exc_name = type(exc).__name__
+            safe_err = safe_detail if safe_detail.startswith(exc_name) else f"{exc_name}: {safe_detail}"
             raise RuntimeError(f"Telegram {method} failed: {safe_err}") from None
 
     async def get_me(self) -> dict[str, Any]:
@@ -1170,6 +1180,7 @@ class TelegramPoller:
         body = await self.notifier._post(
             "getUpdates",
             {"offset": offset, "timeout": 5, "allowed_updates": ["message", "callback_query"]},
+            timeout_seconds=max(float(self.settings.timeout_seconds), 15.0),
         )
         updates = body.get("result") or []
         if not updates:
@@ -1218,6 +1229,11 @@ class TelegramPoller:
             except Exception as exc:
                 err_streak += 1
                 backoff = min(60.0, interval * (2 ** min(err_streak, 4)))
-                logger.warning("telegram_poller.poll_error", error=str(exc), backoff_seconds=backoff)
+                logger.warning(
+                    "telegram_poller.poll_error",
+                    error=str(exc) or repr(exc),
+                    error_type=type(exc).__name__,
+                    backoff_seconds=backoff,
+                )
                 await asyncio.sleep(backoff)
         logger.info("telegram_poller.stopped")

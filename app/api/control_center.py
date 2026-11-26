@@ -2559,6 +2559,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="runtime.throttled_max_sleep_seconds", label="THROTTLED 切片休眠 (s)", description="等待 quota_reset_at 时的单次最大休眠切片", effective_value=s.runtime.throttled_max_sleep_seconds, yaml_value=_nested_get(settings_yaml, "runtime", "throttled_max_sleep_seconds"), default_value=900.0),
                     item(key="runtime.max_wait_per_cycle_seconds", label="单周期最大等待任务 (s)", description="超出后任务转跨周期在途运行，不阻塞主循环", effective_value=s.runtime.max_wait_per_cycle_seconds, yaml_value=_nested_get(settings_yaml, "runtime", "max_wait_per_cycle_seconds"), default_value=120.0),
                     item(key="runtime.max_cycles", label="最大运行周期数", description="0 表示无限制持续自主运行", effective_value=s.runtime.max_cycles, yaml_value=_nested_get(settings_yaml, "runtime", "max_cycles"), default_value=0),
+                    item(key="runtime.stale_active_goal_hours", label="僵尸活跃目标自动过期 (h)", description="无在途任务且超期未推进的 ACTIVE 目标自动归档为 ABANDONED", effective_value=s.runtime.stale_active_goal_hours, yaml_value=_nested_get(settings_yaml, "runtime", "stale_active_goal_hours"), default_value=12),
                 ],
             },
             {

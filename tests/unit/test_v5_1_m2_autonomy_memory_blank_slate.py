@@ -35,11 +35,12 @@ from app.core.config import (
     MemorySettings,
     PerceptionSettings,
     RunnerSettings,
+    RuntimeSettings,
     Settings,
     SocialSettings,
     TelegramSettings,
 )
-from app.core.enums import DriveType, MemoryType, TaskStatus
+from app.core.enums import DriveType, GoalStatus, MemoryType, TaskStatus
 from app.core.runtime import OrganismRuntime
 from app.drives.interfaces import DriveState, KnowledgeGap
 from app.evolution.blank_slate import BlankSlateVerifier
@@ -806,5 +807,222 @@ async def test_v5_1_milestone_skill_dedup_and_unverified_rejection(tmp_path: Pat
             assert "迭代升级到 v2.0.0" in rhythm_reopened["pending_milestone"]["summary"]
             assert "skill:audit.coding.provenance_checksum_check" not in rhythm_reopened["recent_milestone_subjects"]
             assert "skill:cognition.research.other_skill" in rhythm_reopened["recent_milestone_subjects"]
+        finally:
+            await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v5_1_2_stale_goal_expiry_social_hygiene_and_telegram_error_diag(tmp_path: Path):
+    db_path = tmp_path / "m2_v512_hygiene.db"
+    db = Database(f"sqlite+aiosqlite:///{db_path}")
+    await _init_db(db)
+    tg_calls: list[dict[str, Any]] = []
+
+    def _mock_tg(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sendMessage"):
+            body = json.loads(request.content.decode("utf-8")) if request.content else {}
+            tg_calls.append(body)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 800 + len(tg_calls)}})
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_mock_tg)) as client:
+        try:
+            repo = StateRepository(db)
+            emb_cfg = EmbeddingSettings(provider="hash_fallback", dimensions=128)
+            emb = EmbeddingService(repo, build_embedding_provider(emb_cfg))
+            ret = HybridRetrievalEngine(repo, emb)
+            mem = ExperienceManager(
+                repo,
+                backend=None,
+                embedding_service=emb,
+                retrieval_engine=ret,
+                outbox_enabled=False,
+                embed_on_write=True,
+            )
+            script = [
+                # Cycle 1 (proactive_impulse): brain tries should_remember=True -> code MUST block it!
+                SocialTurnDecision(
+                    internal_monologue="我有高信息增益突破想记一下。",
+                    action="REPLY_NOW",
+                    reply_text="发现 Lightpanda 内存占用只有 Chromium 的 1/10。",
+                    should_remember=True,
+                    memory_summary="AOC 自己播报：Lightpanda 内存占用只有 Chromium 的 1/10。",
+                    memory_importance=0.90,
+                ),
+                # Cycle 2 (inbox #1): genuine creator preference -> saved (row 1)
+                SocialTurnDecision(
+                    internal_monologue="Joel 提出扩展非安全研究范围。",
+                    action="REPLY_NOW",
+                    reply_text="记下了，后面会切一部分好奇心出去。",
+                    should_remember=True,
+                    memory_summary="Joel 建议 AOC 不要只研究专业/技术相关，也可研究 AI 业内热点趋势及人类话题（心理学、运动等），扩大研究范围。",
+                    memory_importance=0.80,
+                ),
+                # Cycle 3 (inbox #2): paraphrased duplicate -> deduplicated (still row 1!)
+                SocialTurnDecision(
+                    internal_monologue="他又提了差不多意思的话，模型试图再记一遍。",
+                    action="REPLY_NOW",
+                    reply_text="收到，我注意换换口味。",
+                    should_remember=True,
+                    memory_summary="Joel 建议 AOC 扩大研究范围：除专业相关外，也研究 AI 业内热点趋势、心理学、运动等人类领域。",
+                    memory_importance=0.80,
+                ),
+                # Cycle 4 (inbox #3): genuinely distinct preference -> saved (row 2)
+                SocialTurnDecision(
+                    internal_monologue="这是新的表达偏好要求。",
+                    action="REPLY_NOW",
+                    reply_text="明白，后面直接说人话。",
+                    should_remember=True,
+                    memory_summary="以后跟我聊技术少堆术语",
+                    memory_importance=0.80,
+                ),
+            ]
+            brain = _M2ScriptBrain(script, goal_proposals=[GoalProposal(should_act=False, rationale="done")])
+            settings = Settings(
+                api=ApiSettings(host="127.0.0.1", auth_enabled=False),
+                database=DatabaseSettings(url=f"sqlite+aiosqlite:///{db_path}"),
+                runtime=RuntimeSettings(stale_active_goal_hours=12),
+                memory=MemorySettings(provider="none", embedding_dim=128),
+                embedding=EmbeddingSettings(provider="hash_fallback", dimensions=128),
+                governance=GovernanceSettings(workspace_root=str(tmp_path / "ws")),
+                perception=PerceptionSettings(llm_probe=False),
+                runner=RunnerSettings(enabled=False),
+                telegram=TelegramSettings(
+                    enabled=True,
+                    polling_enabled=True,
+                    bot_token=SecretStr("123:SECRET_TOKEN_999"),
+                    allowed_chat_ids=["777"],
+                ),
+                social=SocialSettings(
+                    enabled=True,
+                    proactive_enabled=True,
+                    min_proactive_interval_minutes=5,
+                    proactive_high_ig_threshold=0.68,
+                    memory_promotion_min_importance=0.65,
+                ),
+            )
+            rt = OrganismRuntime(settings=settings, db=db, brain=brain, auto_load_agents=False, llm_probe_fn=_healthy_llm_probe)
+            rt.telegram_notifier._http_client = client
+            rt.memory = mem
+            await rt.start(start_scheduler=False)
+            rt.loop.memory = mem
+
+            # 1. Seed stale orphaned ACTIVE goal (15h), stale ACTIVE goal WITH live RUNNING task (15h), and fresh ACTIVE goal (1h)
+            dummy_cycle_id = uuid.uuid4()
+            gid_zombie = await repo.create_goal(
+                rt.loop.organism_id,
+                dummy_cycle_id,
+                drive_type=DriveType.CURIOSITY.value,
+                title="Read-only evidence matrix for current assessment knowledge gaps",
+                status=GoalStatus.ACTIVE.value,
+            )
+            gid_with_task = await repo.create_goal(
+                rt.loop.organism_id,
+                dummy_cycle_id,
+                drive_type=DriveType.CURIOSITY.value,
+                title="Old goal still backed by running task",
+                status=GoalStatus.ACTIVE.value,
+            )
+            gid_fresh = await repo.create_goal(
+                rt.loop.organism_id,
+                dummy_cycle_id,
+                drive_type=DriveType.CURIOSITY.value,
+                title="Fresh active goal within window",
+                status=GoalStatus.ACTIVE.value,
+            )
+            await repo.create_task(
+                goal_id=gid_with_task,
+                cycle_id=dummy_cycle_id,
+                objective="long running exploration",
+                assigned_agent="codex",
+                workspace=str(tmp_path / "ws" / "t1"),
+                timeout_seconds=600,
+                permission_level="L1",
+                status=TaskStatus.RUNNING.value,
+            )
+            t_15h = utcnow() - timedelta(hours=15)
+            t_1h = utcnow() - timedelta(hours=1)
+            await repo.update_goal(gid_zombie, updated_at=t_15h)
+            await repo.update_goal(gid_with_task, updated_at=t_15h)
+            await repo.update_goal(gid_fresh, updated_at=t_1h)
+
+            # 2. Boilerplate high_ig_discovery summary MUST be suppressed; concise real finding MUST be recorded
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-boiler-1",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "information_gain": 0.85,
+                        "summary": "Execution succeeded and verification passed. An isolated L1 stdlib-only skill and unittest produced fixture.json, report.json, and report.sha256; all 10 records passed.",
+                    },
+                )
+            )
+            rhythm_rows = await repo.list_world_items(kind="social_rhythm_state")
+            assert not rhythm_rows or (rhythm_rows[0]["value"] or {}).get("pending_milestone") is None
+
+            await rt.loop._record_social_milestone_from_finalizer(
+                FinalizationResult(
+                    execution_id="exec-real-finding-1",
+                    task_id=str(uuid.uuid4()),
+                    already_finalized=False,
+                    goal_achieved=True,
+                    task_status="SUCCEEDED",
+                    evaluation={
+                        "information_gain": 0.85,
+                        "summary": "发现 Lightpanda 内存占用只有 Chromium 的 1/10",
+                    },
+                )
+            )
+            rhythm_ms = (await repo.list_world_items(kind="social_rhythm_state"))[0]["value"]
+            assert rhythm_ms["pending_milestone"] is not None
+            assert "Lightpanda" in rhythm_ms["pending_milestone"]["summary"]
+
+            # 3. Cycle 1 runs: expires zombie goal (leaving live-task + fresh ACTIVE), and proactive should_remember=True is blocked!
+            c1 = await rt.loop.run_cycle()
+            assert (await repo.get_goal(gid_zombie))["status"] == GoalStatus.ABANDONED.value
+            hist = await repo.goal_history(gid_zombie)
+            assert any(h["to"] == GoalStatus.ABANDONED.value and "Auto-expired stale ACTIVE goal" in h["note"] for h in hist)
+            assert (await repo.get_goal(gid_with_task))["status"] == GoalStatus.ACTIVE.value
+            assert (await repo.get_goal(gid_fresh))["status"] == GoalStatus.ACTIVE.value
+
+            assert c1["state_changes"]["social_reflection"]["trigger_source"] == "proactive_impulse"
+            assert c1["state_changes"]["social_reflection"]["memory_promoted"] is False
+            assert len([m for m in await repo.list_memory_index(limit=50) if m.get("source") == "dialogue:telegram"]) == 0
+
+            # 4. Cycles 2-4: first preference saves, paraphrased duplicate skipped, distinct preference saves
+            for idx, txt in enumerate(
+                [
+                    "多关注点 AI 行业趋势、心理学和运动",
+                    "记得也要看看人类话题别光看安全",
+                    "以后跟我聊技术少堆术语",
+                ],
+                start=1,
+            ):
+                await repo.upsert_world_item(
+                    kind="human_inbox",
+                    key=f"tg:777:50{idx}",
+                    value={"chat_id": "777", "sender": "joel", "text": txt, "message_id": 500 + idx, "received_at": utcnow().isoformat()},
+                    status="open",
+                )
+                c = await rt.loop.run_cycle()
+                expected_promoted = idx != 2
+                assert c["state_changes"]["social_reflection"]["memory_promoted"] is expected_promoted
+
+            dlg_rows = [m for m in await repo.list_memory_index(limit=50) if m.get("source") == "dialogue:telegram"]
+            assert len(dlg_rows) == 2
+
+            # 5. TelegramNotifier._post diagnostic formatting on empty ReadTimeout("") (no token leak)
+            def _timeout_tg(_request: httpx.Request) -> httpx.Response:
+                raise httpx.ReadTimeout("", request=_request)
+
+            rt.telegram_notifier._http_client = httpx.AsyncClient(transport=httpx.MockTransport(_timeout_tg))
+            with pytest.raises(RuntimeError) as exc_info:
+                await rt.telegram_notifier._post("getUpdates", {"offset": 0}, timeout_seconds=15.0)
+            msg = str(exc_info.value)
+            assert "ReadTimeout" in msg and "123:SECRET_TOKEN_999" not in msg
+            await rt.telegram_notifier._http_client.aclose()
         finally:
             await db.dispose()
