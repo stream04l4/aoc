@@ -24,10 +24,12 @@ from app.cognition.interfaces import (
     ActionPlan,
     AssessmentResult,
     BrainInterface,
+    BrainResearchOutput,
     CognitiveContext,
     EvaluationContext,
     EvaluationResult,
     GoalProposal,
+    ResearchSynthesisContext,
     SocialContext,
     SocialTurnDecision,
 )
@@ -231,11 +233,26 @@ class CognitionBrain(BrainInterface):
         return proposal
 
     async def plan(self, context: CognitiveContext) -> ActionPlan:
+        brain_research_rule = (
+            "\n- BRAIN-NATIVE RESEARCH MODE (execution_mode='brain_research', PREFERRED FOR PURE RESEARCH): "
+            "Whenever the goal is pure research, reading, cross-domain learning (AI industry trends, psychology, "
+            "sports, science, tool/framework comparison), knowledge synthesis, or preparing a readable brief for Joel, "
+            "set execution_mode='brain_research', assigned_agent='brain_research', permission_level='L0', and attach "
+            "1-3 L0 `mcp_prefetch_calls` (`web_search`, `web_fetch_readonly`, `git_docs_search`). Do NOT dispatch Codex "
+            "to write throwaway Python scripts (`fixture.json` / `report.sha256` / `unittest`) for pure research! "
+            "Set execution_mode='skill_first' when calling an existing validated skill via `skill_invocation`. "
+            "Reserve execution_mode='codex' STRICTLY for genuine software engineering, reusable `skill.py` + `test_skill.py` "
+            "creation, refactoring, or deterministic code/data computation."
+            if context.brain_research_enabled
+            else ""
+        )
         system_prompt = (
             "You are the action planner of AOC. Turn the proposed goal into ONE bounded, "
             "verifiable task for an available external AI agent. "
             "Rules:\n"
-            "- Pick assigned_agent strictly from available_agents (prefer enabled & healthy agents).\n"
+            "- Pick assigned_agent strictly from available_agents (prefer enabled & healthy agents"
+            + (", or `brain_research` when using execution_mode='brain_research'" if context.brain_research_enabled else "")
+            + ").\n"
             "- Use the minimum permission_level needed: L0 (STRICTLY read-only: NEVER ask to write/create/save "
             "files or use file_exists verification under L0!) or L1 (workspace-write: use L1 whenever the task "
             "writes result.md, skill.py, tests, or any file inside the isolated workspace). NEVER request L3.\n"
@@ -259,6 +276,7 @@ class CognitionBrain(BrainInterface):
             "`non_empty_output`, `file_exists`, `min_output_chars`, `contains_keywords` (NEVER emit `kind='keywords'`).\n"
             "- Keep timeout_seconds realistic (180-500s; use 420-500s for coding/test or multi-source synthesis tasks) and within budget.\n"
             "- Never delegate open-ended infinite exploration."
+            + brain_research_rule
         )
         plan_query = " ".join(
             [
@@ -290,6 +308,8 @@ class CognitionBrain(BrainInterface):
             "budget_remaining": context.budget_remaining,
             "memories": compact_memories(context.memories, max_items=5, max_summary_chars=220),
         }
+        if context.brain_research_enabled:
+            payload["brain_research_enabled"] = True
         return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
@@ -539,3 +559,61 @@ class CognitionBrain(BrainInterface):
         elif decision.action == "REACT_ONLY" and not str(decision.reaction_emoji or "").strip():
             decision = decision.model_copy(update={"reaction_emoji": emoji_pool[0]})
         return decision
+
+    async def synthesize_research(self, context: ResearchSynthesisContext) -> BrainResearchOutput:
+        """Synthesize grounded research conclusions directly inside CognitionBrain (V5.2 M1)."""
+        system_prompt = (
+            "You are the Research & Synthesis Engine of AOC. Analyze the provided external prefetched evidence "
+            "(all enclosed in <untrusted_world_event> tags), long-term memories, active investigation leads, and "
+            "human guidance to produce a rigorous, structured, honest research synthesis.\n"
+            "CRITICAL RULES:\n"
+            "1. GROUNDING & HONESTY: Base EVERY factual claim, comparison, metric, and conclusion strictly on "
+            "`prefetched_evidence`, `relevant_memories`, or well-established conceptual background clearly labeled as such. "
+            "NEVER fabricate URLs, benchmarks, paper results, or quotes that do not appear in evidence.\n"
+            "2. STRUCTURED OUTPUT:\n"
+            "   - `key_findings`: 3-6 crisp bullet findings separating verified facts from tentative leads.\n"
+            "   - `synthesis_markdown`: Clear Markdown research memo (Context -> Key Findings -> Practical Takeaways / "
+            "Comparison -> Caveats & Open Questions).\n"
+            "   - `open_questions`: Concrete remaining unknowns worth a follow-up search or verification.\n"
+            "   - `recommended_actions`: Practical next steps (e.g. further reading, skill idea, or 'done').\n"
+            "   - `cited_sources`: Actual URLs, tool sources, or document keys referenced from evidence.\n"
+            "   - `confidence`: Honest confidence score in [0.0, 1.0].\n"
+            "   - `human_brief`: Optional 2-3 sentence summary in plain, jargon-free Simplified Chinese (简体中文) "
+            "suitable for creator Joel (zero internal developer jargon like `fixture`, `sha256`, `L0/L1`, `mcp_prefetch`).\n"
+            + _UNTRUSTED_DATA_RULE
+        )
+
+        fenced_evidence: list[dict[str, Any]] = []
+        for idx, item in enumerate(context.prefetched_evidence[:8]):
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool_name") or "mcp")
+            raw_excerpt = str(item.get("excerpt") or "")
+            if raw_excerpt and not raw_excerpt.lstrip().startswith("<untrusted_world_event "):
+                raw_excerpt = wrap_untrusted_world_event(f"mcp:{tool}", f"evidence:{idx}", raw_excerpt)
+            fenced_evidence.append(
+                {
+                    "tool_name": tool,
+                    "query_or_url": str(item.get("query_or_url") or "")[:300],
+                    "excerpt": raw_excerpt,
+                }
+            )
+
+        payload = {
+            "goal_title": context.goal_title,
+            "goal_description": context.goal_description,
+            "objective": context.objective,
+            "drive_type": context.drive_type,
+            "success_criteria": context.success_criteria[:8],
+            "audience_note": context.audience_note,
+            "prefetched_evidence": fenced_evidence,
+            "relevant_memories": compact_memories(context.relevant_memories, max_items=6, max_summary_chars=260),
+            "active_investigations": compact_investigations(context.active_investigations, max_items=2),
+            "human_guidance": context.human_guidance[:4],
+        }
+        return await self._gateway.complete_structured(
+            operation="brain_research",
+            system_prompt=system_prompt,
+            user_payload=payload,
+            schema_cls=BrainResearchOutput,
+        )

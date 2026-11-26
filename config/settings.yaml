@@ -93,3 +93,7 @@ social:
   allowed_reaction_emojis: ["👀", "👍", "🤔", "🙈", "🔥", "❤️", "🎉", "👌"]
   fallback_reaction_emoji: "👀"
   wake_debounce_seconds: 1.5
+
+kernel_v3:
+  brain_research_enabled: false     # V5.2 M1: Brain-native research/synthesis path (0 Codex for pure research)
+  max_brain_research_mcp_calls: 4   # max bounded L0 read-only MCP calls per brain_research execution

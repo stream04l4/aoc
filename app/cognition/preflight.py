@@ -91,6 +91,13 @@ def detect_write_intent(plan: ActionPlan) -> list[str]:
     return reasons
 
 
+def _is_brain_research_plan(plan_obj: ActionPlan) -> bool:
+    """Return True when ActionPlan targets the kernel-hosted Brain-Native Research path."""
+    mode = str(getattr(plan_obj, "execution_mode", "") or "").strip().lower()
+    agent = str(plan_obj.assigned_agent or "").strip().lower()
+    return mode == "brain_research" or agent == "brain_research"
+
+
 class PreflightResult(BaseModel):
     decision: str  # ACCEPT | REJECT | REQUIRE_APPROVAL
     reason_codes: list[str] = Field(default_factory=list)
@@ -196,6 +203,7 @@ class ActionPreflight:
                     notes.append(f"verification[{idx}].target '{tgt}' must be a safe workspace-relative path")
 
         plan_hash = compute_plan_hash(plan_obj)
+        is_brain_research = _is_brain_research_plan(plan_obj)
         eff_level = (
             verdict.effective_level if verdict is not None else str(plan_obj.permission_level or PermissionLevel.L0.value)
         )
@@ -206,7 +214,8 @@ class ActionPreflight:
         )
 
         # 2. Hard L0 read-only vs filesystem write-intent mismatch check
-        if eff_level == PermissionLevel.L0.value or sandbox_mode == "read-only":
+        # (Brain-Native research runs 0 external shell commands; kernel writes fixed research_brief files)
+        if not is_brain_research and (eff_level == PermissionLevel.L0.value or sandbox_mode == "read-only"):
             write_signals = detect_write_intent(plan_obj)
             if write_signals:
                 reason_codes.append("PERMISSION_MISMATCH")
@@ -222,8 +231,8 @@ class ActionPreflight:
             reason_codes.append("DUPLICATE_PLAN")
             notes.append(f"Identical plan_hash {plan_hash[:12]} already seen in recent window")
 
-        # 5. External Agent availability & capability check
-        if registry is not None:
+        # 5. External Agent availability & capability check (skipped for kernel-hosted brain_research)
+        if registry is not None and not is_brain_research:
             healthy = registry.list_healthy()
             if not healthy:
                 reason_codes.append("AGENT_UNAVAILABLE")

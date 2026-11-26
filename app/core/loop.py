@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import secrets
 import time
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Sequence
 
 from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
@@ -40,8 +42,10 @@ from app.cognition.interfaces import (
     AssessmentResult,
     BrainError,
     BrainInterface,
+    BrainResearchOutput,
     CognitiveContext,
     GoalProposal,
+    ResearchSynthesisContext,
     SocialContext,
     SocialInboxMessage,
     SocialTurnDecision,
@@ -688,6 +692,7 @@ class AutonomousLoop:
                 active_investigations=active_investigations,
                 discovered_channels=discovered_channels,
                 social_goal_hints=pending_social_hints,
+                brain_research_enabled=bool(self.settings.kernel_v3.brain_research_enabled),
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -1015,6 +1020,15 @@ class AutonomousLoop:
 
             # ── 9. POLICY VALIDATION & DETERMINISTIC ACTION PREFLIGHT ───────
             await self.repo.update_cycle(cycle_id, phase="POLICY_VALIDATION")
+            plan_wants_brain = (
+                str(plan.execution_mode or "").strip().lower() == "brain_research"
+                or str(plan.assigned_agent or "").strip().lower() == "brain_research"
+            )
+            if not kv3.brain_research_enabled and plan_wants_brain:
+                healthy_agents = self.registry.list_healthy()
+                fallback_agent = healthy_agents[0].agent_id if healthy_agents else "codex"
+                plan = plan.model_copy(update={"execution_mode": "codex", "assigned_agent": fallback_agent})
+            is_brain_research = bool(kv3.brain_research_enabled) and plan_wants_brain
             verdict = await self.governance.validate_plan(plan, decision.selected_drive)
             plan_hash = compute_plan_hash(plan)
 
@@ -1178,7 +1192,8 @@ class AutonomousLoop:
 
             # ── 10. BOUNDED L0 MCP PREFETCH + AGENT DISPATCH ────────────────
             if (
-                self.mcp_manager is not None
+                not is_brain_research
+                and self.mcp_manager is not None
                 and self.settings.kernel_v3.mcp_in_loop_enabled
                 and plan.mcp_prefetch_calls
             ):
@@ -1204,6 +1219,23 @@ class AutonomousLoop:
                     plan=plan,
                     verdict=verdict,
                 )
+
+            if task_state is None and is_brain_research:
+                task_state, br_summary = await self._try_brain_native_research(
+                    cycle_id=cycle_id,
+                    goal_id=goal_id,
+                    plan_id=plan_id,
+                    goal=goal_proposal,
+                    plan=plan,
+                    verdict=verdict,
+                    recalled_memories=mem_dicts,
+                    active_investigations=active_investigations,
+                    human_guidance=pending_human_guidance,
+                    llm_available=llm_available_for_brain,
+                    emergency_llm=bool(decision.constraints.get("emergency_mode")),
+                )
+                if br_summary:
+                    state_changes["brain_research"] = br_summary
 
             if task_state is None:
                 retry_backoff_mult = float(
@@ -1620,28 +1652,22 @@ class AutonomousLoop:
             "outcome": outcome_dict,
         }
 
-    async def _run_mcp_prefetch(
+    async def _execute_mcp_l0_calls(
         self,
         *,
         cycle_id: uuid.UUID,
-        plan: ActionPlan,
-    ) -> tuple[list[dict[str, Any]], str | None]:
-        """Execute strictly bounded L0 read-only MCP prefetch calls inside AutonomousLoop (V3.0 M3).
+        calls: Sequence[dict[str, Any]],
+        max_calls: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Execute strictly bounded L0 read-only MCP calls with governance & prompt-injection quarantine."""
+        if self.mcp_manager is None or not calls:
+            return [], []
 
-        Hard guarantees:
-          - Never bypasses MCPClientManager Governance / policy_evaluations / resource_usage.
-          - Strictly refuses any L1+ / mutating tool call during autonomous prefetch.
-          - Quarantines Prompt Injection payloads; wraps clean results as untrusted external data.
-          - Fault-isolated: timeouts or server crashes NEVER block or fail the cycle.
-        """
-        if self.mcp_manager is None or not plan.mcp_prefetch_calls:
-            return [], None
-
-        max_calls = max(1, int(self.settings.kernel_v3.max_mcp_calls_per_cycle))
+        cap = max(1, int(max_calls))
         audit_records: list[dict[str, Any]] = []
-        clean_excerpts: list[str] = []
+        evidence_items: list[dict[str, Any]] = []
 
-        for raw_call in list(plan.mcp_prefetch_calls)[:max_calls]:
+        for raw_call in list(calls)[:cap]:
             if not isinstance(raw_call, dict):
                 continue
             tool_name = str(raw_call.get("tool_name") or "").strip()
@@ -1652,7 +1678,7 @@ class AutonomousLoop:
             if not tool_name:
                 continue
 
-            # Hard L0 read-only gate for autonomous prefetch
+            # Hard L0 read-only gate for autonomous calls
             spec = self.mcp_manager.get_tool(tool_name)
             if spec is not None:
                 action_val = str(args.get("action") or "").strip().lower()
@@ -1700,7 +1726,7 @@ class AutonomousLoop:
                 )
                 continue
 
-            # Sanitize & guard against Prompt Injection before surfacing to external Agent
+            # Sanitize & guard against Prompt Injection before surfacing to Brain or external Agent
             raw_text = _format_mcp_output_for_prefetch(tool_name, res.output)
             clean_text = sanitize_external_text(raw_text, max_chars=6500)
             inj_flags = detect_prompt_injection(raw_text) or detect_prompt_injection(clean_text)
@@ -1722,7 +1748,14 @@ class AutonomousLoop:
                 continue
 
             wrapped = wrap_untrusted_world_event(f"mcp:{tool_name}", f"MCP prefetch ({tool_name})", clean_text)
-            clean_excerpts.append(wrapped)
+            evidence_items.append(
+                {
+                    "tool_name": tool_name,
+                    "arguments": args,
+                    "wrapped_excerpt": wrapped,
+                    "raw_output": res.output,
+                }
+            )
             audit_records.append(
                 {
                     "tool_name": tool_name,
@@ -1733,12 +1766,320 @@ class AutonomousLoop:
                 }
             )
 
+        return audit_records, evidence_items
+
+    async def _run_mcp_prefetch(
+        self,
+        *,
+        cycle_id: uuid.UUID,
+        plan: ActionPlan,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Execute strictly bounded L0 read-only MCP prefetch calls inside AutonomousLoop (V3.0 M3).
+
+        Hard guarantees:
+          - Never bypasses MCPClientManager Governance / policy_evaluations / resource_usage.
+          - Strictly refuses any L1+ / mutating tool call during autonomous prefetch.
+          - Quarantines Prompt Injection payloads; wraps clean results as untrusted external data.
+          - Fault-isolated: timeouts or server crashes NEVER block or fail the cycle.
+        """
+        max_calls = max(1, int(self.settings.kernel_v3.max_mcp_calls_per_cycle))
+        audit_records, evidence_items = await self._execute_mcp_l0_calls(
+            cycle_id=cycle_id,
+            calls=list(plan.mcp_prefetch_calls or []),
+            max_calls=max_calls,
+        )
         enriched_desc: str | None = None
-        if clean_excerpts:
+        if evidence_items:
             base_desc = (plan.description or "").strip()
-            block = "\n\n".join(clean_excerpts)
+            block = "\n\n".join(ev["wrapped_excerpt"] for ev in evidence_items)
             enriched_desc = f"{base_desc}\n\n[Read-Only MCP Prefetched Context]\n{block}".strip()
         return audit_records, enriched_desc
+
+    async def _try_brain_native_research(
+        self,
+        *,
+        cycle_id: uuid.UUID,
+        goal_id: uuid.UUID,
+        plan_id: uuid.UUID,
+        goal: GoalProposal,
+        plan: ActionPlan,
+        verdict: Any,
+        recalled_memories: list[dict[str, Any]],
+        active_investigations: list[dict[str, Any]],
+        human_guidance: list[dict[str, Any]],
+        llm_available: bool,
+        emergency_llm: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Execute Brain-Native Research & Synthesis directly in CognitionBrain without Codex (V5.2 M1)."""
+        t_start = time.perf_counter()
+        started_dt = utcnow()
+        task_uuid = uuid.uuid4()
+        exec_uuid = uuid.uuid4()
+        max_calls = max(1, int(self.settings.kernel_v3.max_brain_research_mcp_calls))
+
+        calls = list(plan.mcp_prefetch_calls or [])
+        if not calls and self.mcp_manager is not None and self.mcp_manager.get_tool("web_search") is not None:
+            q_seed = (goal.title or plan.objective or "").strip()[:160]
+            if q_seed:
+                calls = [{"tool_name": "web_search", "arguments": {"query": q_seed, "max_results": 5}}]
+
+        audit_records: list[dict[str, Any]] = []
+        evidence_items: list[dict[str, Any]] = []
+        if self.mcp_manager is not None and calls:
+            audit_records, evidence_items = await self._execute_mcp_l0_calls(
+                cycle_id=cycle_id,
+                calls=calls,
+                max_calls=max_calls,
+            )
+
+        # Bounded 2nd-hop read: fetch up to 2 top search URLs if no web_fetch_readonly was explicitly requested
+        already_fetched = any(str(r.get("tool_name") or "") == "web_fetch_readonly" for r in audit_records)
+        if (
+            self.mcp_manager is not None
+            and self.mcp_manager.get_tool("web_fetch_readonly") is not None
+            and not already_fetched
+            and len(audit_records) < max_calls
+        ):
+            remaining = max_calls - len(audit_records)
+            hop_limit = min(2, remaining)
+            candidate_urls: list[str] = []
+            seen_urls: set[str] = set()
+            for ev in evidence_items:
+                if ev.get("tool_name") != "web_search":
+                    continue
+                raw_out = ev.get("raw_output")
+                if not isinstance(raw_out, dict):
+                    continue
+                for row in list(raw_out.get("results") or []):
+                    if not isinstance(row, dict):
+                        continue
+                    url_val = str(row.get("url") or "").strip()
+                    if url_val.startswith(("https://", "http://")) and url_val not in seen_urls:
+                        seen_urls.add(url_val)
+                        candidate_urls.append(url_val)
+                        if len(candidate_urls) >= hop_limit:
+                            break
+                if len(candidate_urls) >= hop_limit:
+                    break
+            if candidate_urls:
+                hop_calls = [{"tool_name": "web_fetch_readonly", "arguments": {"url": u}} for u in candidate_urls]
+                audit2, ev2 = await self._execute_mcp_l0_calls(
+                    cycle_id=cycle_id,
+                    calls=hop_calls,
+                    max_calls=len(hop_calls),
+                )
+                audit_records.extend(audit2)
+                evidence_items.extend(ev2)
+
+        prefetched_evidence = [
+            {
+                "tool_name": ev["tool_name"],
+                "query_or_url": str(
+                    (ev.get("arguments") or {}).get("query")
+                    or (ev.get("arguments") or {}).get("url")
+                    or (ev.get("arguments") or {}).get("path")
+                    or (ev.get("arguments") or {}).get("pattern")
+                    or ""
+                )[:300],
+                "excerpt": ev["wrapped_excerpt"],
+            }
+            for ev in evidence_items
+        ]
+        synth_ctx = ResearchSynthesisContext(
+            goal_title=str(goal.title or plan.goal_title or plan.objective)[:300],
+            goal_description=str(goal.description or plan.description or "")[:1200],
+            objective=str(plan.objective or "")[:600],
+            success_criteria=list(plan.success_criteria or [])[:8],
+            drive_type=str(goal.drive_type or "curiosity"),
+            prefetched_evidence=prefetched_evidence,
+            relevant_memories=recalled_memories,
+            active_investigations=active_investigations,
+            human_guidance=human_guidance,
+            audience_note="Prefer crisp, structured findings and include a plain Simplified Chinese `human_brief` when suitable for creator Joel.",
+        )
+
+        out: BrainResearchOutput | None = None
+        err_msg: str | None = None
+        if not llm_available:
+            err_msg = "LLM unavailable for brain_research"
+        else:
+            try:
+                scope_cm = (
+                    self.llm_gateway.scope(
+                        cycle_id=cycle_id,
+                        goal_id=goal_id,
+                        task_id=task_uuid,
+                        purpose="brain_research",
+                        emergency=emergency_llm,
+                    )
+                    if isinstance(self.llm_gateway, LLMGateway)
+                    else nullcontext()
+                )
+                with scope_cm:
+                    out = await self.brain.synthesize_research(synth_ctx)
+                await self._record_llm_usage("brain_research", out.usage, cycle_id)
+            except Exception as exc:
+                err_msg = str(exc)[:400]
+                logger.warning("loop.brain_research_failed", cycle_id=str(cycle_id), error=err_msg)
+
+        findings_clean = [str(f).strip() for f in (out.key_findings or []) if str(f).strip()] if out is not None else []
+        synthesis_clean = str(out.synthesis_markdown or "").strip() if out is not None else ""
+        sources_clean = [str(s).strip() for s in (out.cited_sources or []) if str(s).strip()] if out is not None else []
+        checks = [
+            {"kind": "non_empty_findings", "passed": len(findings_clean) >= 1, "detail": f"count={len(findings_clean)}"},
+            {"kind": "min_synthesis_chars", "passed": len(synthesis_clean) >= 80, "detail": f"chars={len(synthesis_clean)}"},
+            {
+                "kind": "grounded_context",
+                "passed": len(evidence_items) >= 1 or len(recalled_memories) >= 1 or len(sources_clean) >= 1,
+                "detail": f"evidence={len(evidence_items)}, memories={len(recalled_memories)}, cited={len(sources_clean)}",
+            },
+        ]
+        passed = out is not None and all(c["passed"] for c in checks)
+
+        ws = self.governance.prepare_workspace(str(task_uuid))
+        brief_md = ""
+        if out is not None:
+            md_lines = [f"# {goal.title or plan.objective}", ""]
+            if out.human_brief:
+                md_lines.extend(["## 简明结论", str(out.human_brief).strip(), ""])
+            if findings_clean:
+                md_lines.append("## 核心发现")
+                md_lines.extend([f"- {f}" for f in findings_clean])
+                md_lines.append("")
+            md_lines.extend(["## 综合分析", synthesis_clean, ""])
+            if out.open_questions:
+                md_lines.append("## 待验证问题")
+                md_lines.extend([f"- {q}" for q in out.open_questions if str(q).strip()])
+                md_lines.append("")
+            if sources_clean:
+                md_lines.append("## 参考来源")
+                md_lines.extend([f"- {s}" for s in sources_clean])
+            brief_md = "\n".join(md_lines).strip()
+            (Path(ws) / "research_brief.md").write_text(brief_md, encoding="utf-8")
+            (Path(ws) / "brief.json").write_text(
+                json.dumps(out.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        wall_s = max(0.0, time.perf_counter() - t_start)
+        completed_dt = utcnow()
+        task_status = TaskStatus.SUCCEEDED.value if passed else TaskStatus.FAILED.value
+        exec_status = "SUCCEEDED" if passed else "FAILED"
+        fail_reason = err_msg or "; ".join(f"{c['kind']} failed ({c['detail']})" for c in checks if not c["passed"])
+        verif_dict = {
+            "passed": passed,
+            "summary": (
+                f"Brain-native research synthesized {len(findings_clean)} findings ({len(synthesis_clean)} chars, {len(audit_records)} MCP calls)"
+                if passed
+                else f"Brain-native research verification failed: {fail_reason[:220]}"
+            ),
+            "checks": checks,
+        }
+        res_summary = (
+            str(out.human_brief or findings_clean[0] or synthesis_clean[:200])[:300]
+            if out is not None and findings_clean
+            else (synthesis_clean[:300] or fail_reason[:300])
+        )
+        outcome_dict: dict[str, Any] = {
+            "execution_id": str(exec_uuid),
+            "agent_id": "brain_research",
+            "status": exec_status,
+            "verification": verif_dict,
+            "brain_research_execution": {
+                "execution_mode": "brain_research",
+                "mcp_calls": len(audit_records),
+                "evidence_count": len(evidence_items),
+                "findings_count": len(findings_clean),
+                "synthesis_chars": len(synthesis_clean),
+                "cited_sources_count": len(sources_clean),
+                "confidence": round(float(out.confidence), 3) if out is not None else 0.0,
+                "wall_seconds": round(wall_s, 3),
+                "passed": passed,
+                "artifacts": ["research_brief.md", "brief.json"] if out is not None else [],
+            },
+        }
+        if not passed:
+            outcome_dict["error"] = fail_reason[:400]
+
+        await self.repo.create_task(
+            id=task_uuid,
+            plan_id=plan_id,
+            goal_id=goal_id,
+            cycle_id=cycle_id,
+            objective=plan.objective,
+            description=plan.description,
+            assigned_agent="brain_research",
+            expected_output=plan.expected_output,
+            workspace=ws,
+            timeout_seconds=max(15, int(plan.timeout_seconds or 180)),
+            resource_budget={"sandbox_mode": verdict.sandbox_mode, "brain_research": True},
+            permission_level=verdict.effective_level,
+            success_criteria=plan.success_criteria,
+            verification=[v.model_dump(mode="json") for v in plan.verification],
+            required_capability=plan.required_capability or "research",
+            status=task_status,
+            attempt=1,
+            max_attempts=1,
+            tried_agents=["brain_research"],
+            outcome=outcome_dict,
+        )
+        await self.repo.create_execution(
+            task_uuid,
+            "brain_research",
+            exec_status,
+            execution_id=exec_uuid,
+            attempt_number=1,
+            idempotency_key=f"brain_research:{task_uuid}",
+        )
+        await self.repo.update_execution(
+            exec_uuid,
+            completed_at=completed_dt,
+            result=(
+                {
+                    "summary": res_summary,
+                    "output": out.model_dump(mode="json") if out is not None else None,
+                    "mcp_audit": audit_records,
+                }
+            ),
+            stdout=brief_md[:8000] if brief_md else None,
+            error=None if passed else fail_reason[:800],
+            verification=verif_dict,
+            resource_usage={
+                "wall_seconds": round(wall_s, 3),
+                "mcp_calls": len(audit_records),
+                "brain_research": True,
+            },
+        )
+        await self.repo.record_usage(
+            category="brain_research",
+            amount=1.0,
+            seconds=round(wall_s, 3),
+            details={"mcp_calls": len(audit_records), "evidence_count": len(evidence_items), "passed": passed},
+            cycle_id=cycle_id,
+            task_id=task_uuid,
+        )
+        await self.repo.log_decision(
+            decision_type="brain_research_execution",
+            selected="SUCCEEDED" if passed else "FAILED",
+            alternatives=["codex"],
+            reason=verif_dict["summary"],
+            payload=outcome_dict["brain_research_execution"],
+            cycle_id=cycle_id,
+        )
+        task_row = (await self.repo.get_task(task_uuid)) or {
+            "task_id": str(task_uuid),
+            "status": task_status,
+            "outcome": outcome_dict,
+        }
+        return task_row, {
+            "executed": True,
+            "passed": passed,
+            "task_id": str(task_uuid),
+            "mcp_calls": len(audit_records),
+            "evidence_count": len(evidence_items),
+            "findings_count": len(findings_clean),
+            "wall_seconds": round(wall_s, 3),
+        }
 
     async def _finalize_cycle(
         self,

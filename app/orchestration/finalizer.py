@@ -700,6 +700,7 @@ class TaskFinalizer:
                 and self.skill_registry is not None
                 and self.skill_auto_crystallize
                 and task_row.get("workspace")
+                and str(task_row.get("assigned_agent") or "") not in {"brain_research", "skill_runtime"}
             ):
                 try:
                     raw_skey = (

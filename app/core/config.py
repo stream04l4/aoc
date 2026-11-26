@@ -232,6 +232,9 @@ class KernelV3Settings(BaseModel):
     max_active_investigations: int = 2
     investigation_max_hops: int = 6
     investigation_low_ig_stall_streak: int = 2
+    # V5.2 M1: Brain-Native Research & Synthesis path (bypasses Codex for pure research/synthesis)
+    brain_research_enabled: bool = False
+    max_brain_research_mcp_calls: int = 4
 
 
 class EvolutionSettings(BaseModel):
