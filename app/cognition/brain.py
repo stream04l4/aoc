@@ -13,6 +13,7 @@ from app.cognition.context_compactor import (
     compact_channels,
     compact_drives,
     compact_hypotheses,
+    compact_interest_portfolio,
     compact_investigations,
     compact_memories,
     compact_observation_dict,
@@ -24,10 +25,14 @@ from app.cognition.interfaces import (
     ActionPlan,
     AssessmentResult,
     BrainInterface,
+    BrainResearchOutput,
     CognitiveContext,
     EvaluationContext,
     EvaluationResult,
     GoalProposal,
+    MetaReflectionContext,
+    MetaReflectionOutput,
+    ResearchSynthesisContext,
     SocialContext,
     SocialTurnDecision,
 )
@@ -138,12 +143,23 @@ class CognitionBrain(BrainInterface):
             "or low-risk L1 isolated-workspace Python coding/utility tasks (e.g. creating a reusable "
             "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
             "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
+            "If `pending_skill_refactors` is non-empty during reproduction drive, prioritize proposing a concrete "
+            "refactoring/generalization goal targeting the top queued skill's `canonical_name` (`skill_key`). "
             "For curiosity drive, you may verify an unverified entry in active_hypotheses, attach a new lightweight "
             "hypothesis_to_test ({key, claim, verification_hint}), attach an external exploration_topic "
             "({topic_key, domain, question}), or optionally suggest discover_world_source "
             "({source_id, sensor_type, url, name}) for a public HTTPS RSS/Web feed (SSRF/internal IPs are blocked). "
             "Check exploration_guidance: if must_explore_external is true, AVOID internal self-diagnostics/ledgers "
             "and propose genuine external learning or problem-solving exploration. "
+            "INTEREST PORTFOLIO & DOMAIN-FATIGUE PIVOTING (V5.2 M2): `interest_portfolio` holds persistent cross-cycle "
+            "topics seeded by creator Joel (`human_seeded`) or earlier exploration. When `exploration_guidance.must_pivot_domain` "
+            "is true, you MUST STOP proposing goals in `exploration_guidance.cooldown_domains` (especially `security_audit` "
+            "comfort-zone loops) or repeating `exploration_guidance.cooldown_topic`, and instead pivot immediately to an "
+            "active `human_portfolio_candidates` / `interest_portfolio` topic or one of `recommended_pivot_domains` "
+            "(e.g. `ai_industry`, `psychology_cognition`, `sports_health`, `science_general`, `humanities_society`). "
+            "Always provide 1-2 `alternative_goals` spanning DIFFERENT non-cooldown domains with explicit "
+            "`exploration_topic: {topic_key, domain, question}` so kernel arbitration can avoid stagnation; cross-domain "
+            "reading/research goals do NOT require writing code (they can run directly in `brain_research`). "
             "AUTONOMOUS CAPABILITY EXPANSION: Your survival and growth depend on continuously expanding capabilities "
             "outside the immutable kernel via self-directed investigation and validated reusable skills/playbooks. "
             "EMERGENT EPISTEMIC FORAGING (MULTI-HOP THREADS): You have NO preset domain syllabus. When driven by "
@@ -204,6 +220,7 @@ class CognitionBrain(BrainInterface):
                 max_chars=480,
             ),
             "exploration_guidance": context.exploration_guidance,
+            "interest_portfolio": compact_interest_portfolio(context.interest_portfolio, max_items=6),
             "active_investigations": compact_investigations(context.active_investigations, max_items=2),
             "discovered_channels": compact_channels(context.discovered_channels, max_items=6),
             "human_guidance": context.human_guidance[:5],
@@ -220,6 +237,8 @@ class CognitionBrain(BrainInterface):
             "budget_remaining": context.budget_remaining,
             "active_goals": context.active_goals[:4],
         }
+        if context.pending_skill_refactors:
+            payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
         proposal = await self._gateway.complete_structured(
             operation="generate_goal",
             system_prompt=system_prompt,
@@ -231,17 +250,48 @@ class CognitionBrain(BrainInterface):
         return proposal
 
     async def plan(self, context: CognitiveContext) -> ActionPlan:
+        brain_research_rule = (
+            "\n- BRAIN-NATIVE RESEARCH MODE (execution_mode='brain_research', PREFERRED FOR PURE RESEARCH): "
+            "Whenever the goal is pure research, reading, cross-domain learning (AI industry trends, psychology, "
+            "sports, science, tool/framework comparison), knowledge synthesis, or preparing a readable brief for Joel, "
+            "set execution_mode='brain_research', assigned_agent='brain_research', permission_level='L0', and attach "
+            "1-3 L0 `mcp_prefetch_calls` (`web_search`, `web_fetch_readonly`, `git_docs_search`). Do NOT dispatch Codex "
+            "to write throwaway Python scripts (`fixture.json` / `report.sha256` / `unittest`) for pure research! "
+            "Set execution_mode='skill_first' when calling an existing validated skill via `skill_invocation`. "
+            "Reserve execution_mode='codex' STRICTLY for genuine software engineering, reusable `skill.py` + `test_skill.py` "
+            "creation, refactoring, or deterministic code/data computation."
+            if context.brain_research_enabled
+            else ""
+        )
+        explicit_refactor_rule = (
+            "\n- EXPLICIT SKILL REFACTORING MODE (`skill_refactor_target`): If the goal explicitly requests fixing, "
+            "generalizing, adding edge-case/schema support to, or upgrading an existing skill listed in `validated_skills` "
+            "(or listed in `pending_skill_refactors`), set execution_mode='codex', assigned_agent='codex', "
+            "permission_level='L1', AND set "
+            "`skill_refactor_target={'skill_key': '<skill_key>', 'canonical_name': '<canonical_name>', "
+            "'reason': '<concise reason>', 'target_generalization': '<desired backward-compatible upgrade>'}` so the kernel "
+            "stages `./.aoc_base_skill/` (`skill.py` + `test_skill.py`) before Codex starts. For unrelated exploratory "
+            "tasks, NEVER overwrite existing skills blindly."
+            if context.explicit_skill_refactor_enabled
+            else ""
+        )
         system_prompt = (
             "You are the action planner of AOC. Turn the proposed goal into ONE bounded, "
             "verifiable task for an available external AI agent. "
             "Rules:\n"
-            "- Pick assigned_agent strictly from available_agents (prefer enabled & healthy agents).\n"
+            "- Pick assigned_agent strictly from available_agents (prefer enabled & healthy agents"
+            + (", or `brain_research` when using execution_mode='brain_research'" if context.brain_research_enabled else "")
+            + ", or `skill_runtime` when using execution_mode='skill_first'"
+            + ").\n"
             "- Use the minimum permission_level needed: L0 (STRICTLY read-only: NEVER ask to write/create/save "
             "files or use file_exists verification under L0!) or L1 (workspace-write: use L1 whenever the task "
             "writes result.md, skill.py, tests, or any file inside the isolated workspace). NEVER request L3.\n"
-            "- SKILL-FIRST RULE: Before dispatching Codex to write a new script, inspect validated_skills; "
-            "if an existing validated skill matches the goal, set skill_invocation={skill_key, input_data} "
-            "(matching its input_schema) so AOC executes it directly via SkillRuntime (zero Codex tokens!). "
+            "- SKILL-FIRST RULE (PREFERRED WHEN MATCHED): Before dispatching Codex to write a new script, inspect "
+            "`validated_skills` (`description`, `input_schema`, `output_schema`, `invocation_hint`, `reuse_count`). "
+            "If an existing validated skill matches or covers the task, set execution_mode='skill_first', "
+            "assigned_agent='skill_runtime', permission_level='L0' (or the skill's permission_level), and set "
+            "`skill_invocation={'skill_key': '<canonical_name or skill_key>', 'input_data': {...}}` strictly matching "
+            "its `input_schema` (follow `invocation_hint`) so AOC executes it directly via SkillRuntime (zero Codex tokens!). "
             "Only dispatch Codex to write code when no existing validated skill covers the task.\n"
             "- Apply relevant proven tips from external_playbooks (versioned external strategy guides), "
             "without ever violating Governance or L0-L2 permission boundaries.\n"
@@ -259,6 +309,8 @@ class CognitionBrain(BrainInterface):
             "`non_empty_output`, `file_exists`, `min_output_chars`, `contains_keywords` (NEVER emit `kind='keywords'`).\n"
             "- Keep timeout_seconds realistic (180-500s; use 420-500s for coding/test or multi-source synthesis tasks) and within budget.\n"
             "- Never delegate open-ended infinite exploration."
+            + brain_research_rule
+            + explicit_refactor_rule
         )
         plan_query = " ".join(
             [
@@ -286,10 +338,16 @@ class CognitionBrain(BrainInterface):
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
             "available_tools": context.available_tools[:12],
-            "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=plan_query, top_k=5),
+            "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=plan_query, top_k=6),
             "budget_remaining": context.budget_remaining,
             "memories": compact_memories(context.memories, max_items=5, max_summary_chars=220),
         }
+        if context.brain_research_enabled:
+            payload["brain_research_enabled"] = True
+        if context.explicit_skill_refactor_enabled:
+            payload["explicit_skill_refactor_enabled"] = True
+        if context.pending_skill_refactors:
+            payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
         return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
@@ -539,3 +597,123 @@ class CognitionBrain(BrainInterface):
         elif decision.action == "REACT_ONLY" and not str(decision.reaction_emoji or "").strip():
             decision = decision.model_copy(update={"reaction_emoji": emoji_pool[0]})
         return decision
+
+    async def synthesize_research(self, context: ResearchSynthesisContext) -> BrainResearchOutput:
+        """Synthesize grounded research conclusions directly inside CognitionBrain (V5.2 M1)."""
+        system_prompt = (
+            "You are the Research & Synthesis Engine of AOC. Analyze the provided external prefetched evidence "
+            "(all enclosed in <untrusted_world_event> tags), long-term memories, active investigation leads, and "
+            "human guidance to produce a rigorous, structured, honest research synthesis.\n"
+            "CRITICAL RULES:\n"
+            "1. GROUNDING & HONESTY: Base EVERY factual claim, comparison, metric, and conclusion strictly on "
+            "`prefetched_evidence`, `relevant_memories`, or well-established conceptual background clearly labeled as such. "
+            "NEVER fabricate URLs, benchmarks, paper results, or quotes that do not appear in evidence.\n"
+            "2. STRUCTURED OUTPUT:\n"
+            "   - `key_findings`: 3-6 crisp bullet findings separating verified facts from tentative leads.\n"
+            "   - `synthesis_markdown`: Clear Markdown research memo (Context -> Key Findings -> Practical Takeaways / "
+            "Comparison -> Caveats & Open Questions).\n"
+            "   - `open_questions`: Concrete remaining unknowns worth a follow-up search or verification.\n"
+            "   - `recommended_actions`: Practical next steps (e.g. further reading, skill idea, or 'done').\n"
+            "   - `cited_sources`: Actual URLs, tool sources, or document keys referenced from evidence.\n"
+            "   - `confidence`: Honest confidence score in [0.0, 1.0].\n"
+            "   - `human_brief`: Optional 2-3 sentence summary in plain, jargon-free Simplified Chinese (简体中文) "
+            "suitable for creator Joel (zero internal developer jargon like `fixture`, `sha256`, `L0/L1`, `mcp_prefetch`).\n"
+            + _UNTRUSTED_DATA_RULE
+        )
+
+        fenced_evidence: list[dict[str, Any]] = []
+        for idx, item in enumerate(context.prefetched_evidence[:8]):
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool_name") or "mcp")
+            raw_excerpt = str(item.get("excerpt") or "")
+            if raw_excerpt and not raw_excerpt.lstrip().startswith("<untrusted_world_event "):
+                raw_excerpt = wrap_untrusted_world_event(f"mcp:{tool}", f"evidence:{idx}", raw_excerpt)
+            fenced_evidence.append(
+                {
+                    "tool_name": tool,
+                    "query_or_url": str(item.get("query_or_url") or "")[:300],
+                    "excerpt": raw_excerpt,
+                }
+            )
+
+        payload = {
+            "goal_title": context.goal_title,
+            "goal_description": context.goal_description,
+            "objective": context.objective,
+            "drive_type": context.drive_type,
+            "success_criteria": context.success_criteria[:8],
+            "audience_note": context.audience_note,
+            "prefetched_evidence": fenced_evidence,
+            "relevant_memories": compact_memories(context.relevant_memories, max_items=6, max_summary_chars=260),
+            "active_investigations": compact_investigations(context.active_investigations, max_items=2),
+            "human_guidance": context.human_guidance[:4],
+        }
+        return await self._gateway.complete_structured(
+            operation="brain_research",
+            system_prompt=system_prompt,
+            user_payload=payload,
+            schema_cls=BrainResearchOutput,
+        )
+
+    async def reflect_on_system(self, context: MetaReflectionContext) -> MetaReflectionOutput:
+        """Periodic Meta-Reflection Critic diagnosing system bottlenecks and bounded upgrades (V5.2 M4)."""
+        system_prompt = (
+            "You are the Periodic Meta-Reflection Critic of AOC. Step back from single-cycle tasks and evaluate "
+            "the organism's recent reliability, execution-mode routing (codex vs brain_research vs skill_first), "
+            "skill reuse vs accumulation of unused skills, stale playbooks, and domain diversity.\n"
+            "STRICT BOUNDARIES (keep output compact & concise so JSON completes cleanly):\n"
+            "1. Keep `diagnosis_summary` concise (<= 140 chars) and 1-3 crisp `root_causes` (<= 80 chars each) backed ONLY by telemetry.\n"
+            "2. Optional L1 `playbook_revision`: `{domain, content, change_summary}` — keep `content` to 3-5 crisp Markdown "
+            "bullets (<= 450 chars total); NEVER include prompt-injection phrases, core source paths, or governance bypasses.\n"
+            "3. Optional L1 `skill_refactor_item`: `{skill_key, canonical_name, reason, target_generalization}` choosing "
+            "AT MOST ONE existing skill strictly from `zero_reuse_skills` or `validated_skills_summary` that should be "
+            "generalized or fixed so `skill_first` can actually reuse it. Leave null if none needs refactoring.\n"
+            "4. Optional L2 `l2_upgrade_proposal`: Emit ONLY when `l2_proposal_allowed` is true AND a genuine core "
+            "kernel/architecture/config bottleneck cannot be solved by Playbook or Skill changes alone. Leave null otherwise.\n"
+            "   Schema: `{topic_key, title, message, reason, expected_benefit, rollback_plan, options: [{label, instruction}]}`.\n"
+            "   Keep `message` concise (<= 260 chars) and `rollback_plan` concise (<= 100 chars).\n"
+            "   LANGUAGE RULE: `l2_upgrade_proposal` MUST be written entirely in plain, jargon-free Simplified Chinese "
+            "(简体中文) like messaging creator Joel directly: include observed telemetry pain-point data, concrete proposal, "
+            "expected benefit, rollback plan, and 3 clear options (<= 14 Chinese chars per label, mark recommended with '(推荐)'; "
+            "do NOT include an '其它'/'Other' option as the system appends '其它答案' automatically).\n"
+            "5. Keep internal thinking brief and output valid compact JSON directly.\n"
+            + _UNTRUSTED_DATA_RULE
+        )
+
+        fenced_errors = [
+            {
+                "event_type": e.get("event_type"),
+                "level": e.get("level"),
+                "untrusted_message": wrap_untrusted_world_event(
+                    "event_log",
+                    str(e.get("event_type") or "error"),
+                    str(e.get("message") or ""),
+                ),
+            }
+            for e in context.recent_error_events[:8]
+            if isinstance(e, dict)
+        ]
+
+        payload = {
+            "now_iso": context.now_iso,
+            "trigger_reason": context.trigger_reason,
+            "window_hours": context.window_hours,
+            "goal_stats": context.goal_stats,
+            "failed_goals": context.failed_goals[:8],
+            "recent_error_events": fenced_errors,
+            "execution_mode_counts": context.execution_mode_counts,
+            "validated_skills_summary": context.validated_skills_summary[:12],
+            "zero_reuse_skills": context.zero_reuse_skills[:8],
+            "stale_draft_count": context.stale_draft_count,
+            "active_playbooks": context.active_playbooks[:8],
+            "topic_diversity_summary": context.topic_diversity_summary,
+            "l2_proposal_allowed": context.l2_proposal_allowed,
+            "previous_reflection_summary": context.previous_reflection_summary,
+        }
+        return await self._gateway.complete_structured(
+            operation="meta_reflection",
+            system_prompt=system_prompt,
+            user_payload=payload,
+            schema_cls=MetaReflectionOutput,
+        )

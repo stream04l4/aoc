@@ -91,6 +91,24 @@ def detect_write_intent(plan: ActionPlan) -> list[str]:
     return reasons
 
 
+def _is_brain_research_plan(plan_obj: ActionPlan) -> bool:
+    """Return True when ActionPlan targets the kernel-hosted Brain-Native Research path."""
+    mode = str(getattr(plan_obj, "execution_mode", "") or "").strip().lower()
+    agent = str(plan_obj.assigned_agent or "").strip().lower()
+    return mode == "brain_research" or agent == "brain_research"
+
+
+def _is_skill_first_plan(plan_obj: ActionPlan) -> bool:
+    """Return True when ActionPlan targets kernel-hosted direct SkillRuntime execution."""
+    mode = str(getattr(plan_obj, "execution_mode", "") or "").strip().lower()
+    inv = getattr(plan_obj, "skill_invocation", None)
+    return (
+        mode == "skill_first"
+        and isinstance(inv, dict)
+        and bool(str(inv.get("skill_key") or "").strip())
+    )
+
+
 class PreflightResult(BaseModel):
     decision: str  # ACCEPT | REJECT | REQUIRE_APPROVAL
     reason_codes: list[str] = Field(default_factory=list)
@@ -196,6 +214,9 @@ class ActionPreflight:
                     notes.append(f"verification[{idx}].target '{tgt}' must be a safe workspace-relative path")
 
         plan_hash = compute_plan_hash(plan_obj)
+        is_brain_research = _is_brain_research_plan(plan_obj)
+        is_skill_first = _is_skill_first_plan(plan_obj)
+        is_kernel_hosted = is_brain_research or is_skill_first
         eff_level = (
             verdict.effective_level if verdict is not None else str(plan_obj.permission_level or PermissionLevel.L0.value)
         )
@@ -206,7 +227,8 @@ class ActionPreflight:
         )
 
         # 2. Hard L0 read-only vs filesystem write-intent mismatch check
-        if eff_level == PermissionLevel.L0.value or sandbox_mode == "read-only":
+        # (Kernel-hosted brain_research & skill_first run without dispatching an external shell CLI agent)
+        if not is_kernel_hosted and (eff_level == PermissionLevel.L0.value or sandbox_mode == "read-only"):
             write_signals = detect_write_intent(plan_obj)
             if write_signals:
                 reason_codes.append("PERMISSION_MISMATCH")
@@ -222,8 +244,8 @@ class ActionPreflight:
             reason_codes.append("DUPLICATE_PLAN")
             notes.append(f"Identical plan_hash {plan_hash[:12]} already seen in recent window")
 
-        # 5. External Agent availability & capability check
-        if registry is not None:
+        # 5. External Agent availability & capability check (skipped for kernel-hosted brain_research / skill_first)
+        if registry is not None and not is_kernel_hosted:
             healthy = registry.list_healthy()
             if not healthy:
                 reason_codes.append("AGENT_UNAVAILABLE")

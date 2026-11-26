@@ -35,8 +35,9 @@ from app.core.config import (
     get_sensors_config,
     load_yaml,
 )
-from app.observability.topic_diversity import TopicDiversityAnalyzer
+from app.observability.topic_diversity import TopicDiversityAnalyzer, compute_shannon_entropy
 from app.perception.interfaces import utcnow
+from app.perception.world.exploration import infer_topic_domain
 from app.storage.models import (
     ActionPlanRow,
     ActiveGoal,
@@ -2433,6 +2434,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="drives.weights", label="三大欲望基础权重", description="Survival / Reproduction / Curiosity 基础仲裁权重", effective_value=_nested_get(drives_yaml, "arbitration", "weights") or drives_yaml.get("weights"), yaml_value=_nested_get(drives_yaml, "arbitration", "weights") or drives_yaml.get("weights")),
                     item(key="self_model.minimum_samples", label="能力 VALIDATED 最小样本量", description="Beta-Binomial 能力晋升 VALIDATED 的最小验证样本数", effective_value=self_model_yaml.get("minimum_samples", 3), yaml_value=self_model_yaml.get("minimum_samples"), default_value=3),
                     item(key="self_model.confidence_threshold", label="能力置信下界阈值", description="90% Beta 置信下界达标阈值", effective_value=self_model_yaml.get("confidence_threshold", 0.55), yaml_value=self_model_yaml.get("confidence_threshold"), default_value=0.55),
+                    item(key="kernel_v3.reproduction_quality_scoring_enabled", label="繁殖/能力质量驱动评分开关", description="按近期技能复用率、执行可靠性与 Playbook 新鲜度动态评估 Reproduction 欲望（默认关闭）", effective_value=s.kernel_v3.reproduction_quality_scoring_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "reproduction_quality_scoring_enabled"), default_value=False, env_var="AOC_KERNEL_V3__REPRODUCTION_QUALITY_SCORING_ENABLED"),
                 ],
             },
             {
@@ -2447,6 +2449,10 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="llm.max_tokens", label="单次最大生成 Token", description="单次 LLM 响应 Token 上限", effective_value=s.llm.max_tokens, yaml_value=_nested_get(settings_yaml, "llm", "max_tokens"), default_value=9999, env_var="AOC_LLM__MAX_TOKENS"),
                     item(key="llm.timeout_seconds", label="单次推理超时 (s)", description="HTTP 请求超时阈值", effective_value=s.llm.timeout_seconds, yaml_value=_nested_get(settings_yaml, "llm", "timeout_seconds"), default_value=180.0, env_var="AOC_LLM__TIMEOUT_SECONDS"),
                     item(key="llm.max_schema_retries", label="Schema 重试次数", description="JSON/Pydantic 校验失败后的最大重试次数", effective_value=s.llm.max_schema_retries, yaml_value=_nested_get(settings_yaml, "llm", "max_schema_retries"), default_value=2, env_var="AOC_LLM__MAX_SCHEMA_RETRIES"),
+                    item(key="kernel_v3.brain_research_enabled", label="大脑原生研究综合开关", description="纯调研/跨界阅读直接由大脑配合 L0 MCP 完成综合，免走 Codex 写脚本", effective_value=s.kernel_v3.brain_research_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "brain_research_enabled"), default_value=False, env_var="AOC_KERNEL_V3__BRAIN_RESEARCH_ENABLED"),
+                    item(key="kernel_v3.interest_portfolio_enabled", label="动态兴趣组合与跨界配额开关", description="启用持久化 interest_portfolio、舒适区/同题疲劳检测与强制跨界探索仲裁", effective_value=s.kernel_v3.interest_portfolio_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "interest_portfolio_enabled"), default_value=False, env_var="AOC_KERNEL_V3__INTEREST_PORTFOLIO_ENABLED"),
+                    item(key="kernel_v3.explicit_skill_refactor_enabled", label="显式定向技能重构开关", description="禁止同名盲撞覆盖；仅在显式指定 skill_refactor_target 时预置基线源码与测试进行演进", effective_value=s.kernel_v3.explicit_skill_refactor_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "explicit_skill_refactor_enabled"), default_value=False, env_var="AOC_KERNEL_V3__EXPLICIT_SKILL_REFACTOR_ENABLED"),
+                    item(key="kernel_v3.meta_reflection_enabled", label="周期性元反思自诊断开关", description="纯规则触发系统级元诊断，驱动 Playbook 热更新、技能重构排队与每日至多1次L2改进卡片", effective_value=s.kernel_v3.meta_reflection_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "meta_reflection_enabled"), default_value=False, env_var="AOC_KERNEL_V3__META_REFLECTION_ENABLED"),
                 ],
             },
             {
@@ -2837,6 +2843,243 @@ def create_control_center_router(get_runtime) -> APIRouter:
     ) -> dict[str, Any]:
         rt = get_runtime()
         return await TopicDiversityAnalyzer(rt.db).analyze(custom_hours=hours)
+
+    @router.get("/v5/observability/self-evolution")
+    async def get_self_evolution_v5_2(
+        hours: int = Query(default=24, ge=1, le=720),
+        _: Principal = Depends(require_scope(SCOPE_READ)),
+    ) -> dict[str, Any]:
+        rt = get_runtime()
+        kv3 = rt.settings.kernel_v3
+        ref_now = utcnow()
+        if ref_now.tzinfo is None:
+            ref_now = ref_now.replace(tzinfo=timezone.utc)
+        since = ref_now - timedelta(hours=hours)
+        since_7d = ref_now - timedelta(days=7)
+
+        def _utc(dt: datetime | None) -> datetime | None:
+            if dt is None:
+                return None
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+        def _parse_iso(raw: Any) -> datetime | None:
+            if isinstance(raw, datetime):
+                return _utc(raw)
+            if not raw or not isinstance(raw, str):
+                return None
+            try:
+                dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+                return _utc(dt)
+            except ValueError:
+                return None
+
+        async with rt.db.session() as s:
+            goal_rows = (
+                await s.execute(select(ActiveGoal).order_by(desc(ActiveGoal.created_at)).limit(1000))
+            ).scalars().all()
+            plan_rows = (
+                await s.execute(select(ActionPlanRow).order_by(desc(ActionPlanRow.created_at)).limit(1000))
+            ).scalars().all()
+            exec_rows = (
+                await s.execute(select(AgentExecutionRow).order_by(desc(AgentExecutionRow.started_at)).limit(1000))
+            ).scalars().all()
+            skill_rows = (
+                await s.execute(select(SkillRegistry).order_by(desc(SkillRegistry.updated_at)).limit(500))
+            ).scalars().all()
+            inv_rows = (
+                await s.execute(select(SkillInvocation).order_by(desc(SkillInvocation.created_at)).limit(1000))
+            ).scalars().all()
+            ws_rows = (
+                await s.execute(
+                    select(WorldState).where(
+                        WorldState.kind.in_(
+                            ["external_playbook", "interest_portfolio", "meta_reflection_state", "skill_refactor_queue"]
+                        )
+                    )
+                )
+            ).scalars().all()
+            meta_decs = (
+                await s.execute(
+                    select(DecisionLog)
+                    .where(DecisionLog.decision_type == "meta_reflection")
+                    .order_by(desc(DecisionLog.created_at))
+                    .limit(10)
+                )
+            ).scalars().all()
+
+        td_report = await TopicDiversityAnalyzer(rt.db).analyze(custom_hours=hours)
+
+        w_goals = [g for g in goal_rows if (_utc(g.created_at) or since) >= since]
+        g_achieved = sum(1 for g in w_goals if g.status == "ACHIEVED")
+        g_failed = sum(1 for g in w_goals if g.status == "FAILED")
+        g_abandoned = sum(1 for g in w_goals if g.status == "ABANDONED")
+        g_active = sum(1 for g in w_goals if g.status == "ACTIVE")
+        g_terminal = g_achieved + g_failed + g_abandoned
+        by_drive: dict[str, int] = {}
+        domain_counts: dict[str, int] = {}
+        for g in w_goals:
+            d_key = str(g.drive_type or "unknown")
+            by_drive[d_key] = by_drive.get(d_key, 0) + 1
+            exp = g.expected_outcome if isinstance(g.expected_outcome, dict) else {}
+            dom = infer_topic_domain(
+                g.title or "",
+                g.description or "",
+                explicit_domain=(str(exp.get("exploration_domain")) if exp.get("exploration_domain") else None),
+            )
+            domain_counts[dom] = domain_counts.get(dom, 0) + 1
+
+        dom_entropy, dom_norm_div = compute_shannon_entropy(domain_counts)
+        dominant_domain = None
+        dominant_ratio = 0.0
+        if domain_counts and w_goals:
+            dominant_domain, dom_cnt = max(domain_counts.items(), key=lambda kv: kv[1])
+            dominant_ratio = round(dom_cnt / len(w_goals), 4)
+
+        w_plans = [p for p in plan_rows if (_utc(p.created_at) or since) >= since]
+        mode_counts: dict[str, int] = {"codex": 0, "brain_research": 0, "skill_first": 0}
+        for p in w_plans:
+            pl = p.plan if isinstance(p.plan, dict) else {}
+            m = str(pl.get("execution_mode") or "codex").strip().lower()
+            mode_counts[m] = mode_counts.get(m, 0) + 1
+        plan_total = sum(mode_counts.values())
+        mode_ratios = {
+            k: round(v / plan_total, 4) if plan_total > 0 else 0.0 for k, v in mode_counts.items()
+        }
+
+        w_execs = [e for e in exec_rows if (_utc(e.started_at) or since) >= since]
+        brain_res_execs = [e for e in w_execs if e.agent_id == "brain_research"]
+        brain_res_failures = sum(1 for e in brain_res_execs if e.status in {"FAILED", "TIMEOUT", "CANCELLED"})
+
+        stale_draft_cutoff = ref_now - timedelta(hours=max(1, int(kv3.draft_skill_expiry_hours)))
+        val_skills = [sk for sk in skill_rows if sk.status == "VALIDATED"]
+        draft_skills = [sk for sk in skill_rows if sk.status == "DRAFT"]
+        stale_draft_cnt = sum(
+            1 for sk in draft_skills if (_utc(sk.updated_at or sk.created_at) or ref_now) < stale_draft_cutoff
+        )
+        dep_cnt = sum(1 for sk in skill_rows if sk.status == "DEPRECATED")
+        evolved_cnt = sum(1 for sk in skill_rows if sk.parent_version is not None)
+        reused_val_cnt = sum(1 for sk in val_skills if int(sk.reuse_count or 0) > 0)
+        w_invs = [iv for iv in inv_rows if (_utc(iv.created_at) or since_7d) >= since_7d]
+
+        playbooks_ws = [w for w in ws_rows if w.kind == "external_playbook" and w.status == "active"]
+        pb_domains = sorted(str(w.key) for w in playbooks_ws)
+        pb_dates = [
+            _parse_iso((w.value or {}).get("updated_at") if isinstance(w.value, dict) else None) or _utc(w.updated_at)
+            for w in playbooks_ws
+        ]
+        pb_dates = [d for d in pb_dates if d is not None]
+        latest_pb_dt = max(pb_dates) if pb_dates else None
+        pb_freshness = (
+            round(max(0.0, min(1.0, 1.0 - max(0.0, (ref_now - latest_pb_dt).total_seconds() / 86400.0) / 14.0)), 4)
+            if latest_pb_dt is not None
+            else 0.0
+        )
+
+        portfolio_ws = [w for w in ws_rows if w.kind == "interest_portfolio"]
+        portfolio_active = [w for w in portfolio_ws if w.status == "active"]
+        portfolio_human = [
+            w for w in portfolio_active if isinstance(w.value, dict) and w.value.get("origin") == "human_seeded"
+        ]
+        portfolio_domains = sorted(
+            {
+                str((w.value or {}).get("domain") or "general")
+                for w in portfolio_active
+                if isinstance(w.value, dict)
+            }
+        )
+
+        refactor_open = [
+            {
+                "queue_key": w.key,
+                "canonical_name": (w.value or {}).get("canonical_name") if isinstance(w.value, dict) else None,
+                "skill_key": (w.value or {}).get("skill_key") if isinstance(w.value, dict) else None,
+                "reason": (w.value or {}).get("reason") if isinstance(w.value, dict) else None,
+                "enqueued_at": (w.value or {}).get("enqueued_at") if isinstance(w.value, dict) else _iso(w.created_at),
+            }
+            for w in ws_rows
+            if w.kind == "skill_refactor_queue" and w.status == "open"
+        ]
+
+        meta_state_row = next((w for w in ws_rows if w.kind == "meta_reflection_state" and w.key == "primary"), None)
+        meta_state = dict(meta_state_row.value or {}) if (meta_state_row and isinstance(meta_state_row.value, dict)) else {}
+
+        return {
+            "read_only": True,
+            "generated_at": _iso(ref_now),
+            "window_hours": int(hours),
+            "feature_flags": {
+                "brain_research_enabled": bool(kv3.brain_research_enabled),
+                "interest_portfolio_enabled": bool(kv3.interest_portfolio_enabled),
+                "explicit_skill_refactor_enabled": bool(kv3.explicit_skill_refactor_enabled),
+                "reproduction_quality_scoring_enabled": bool(kv3.reproduction_quality_scoring_enabled),
+                "meta_reflection_enabled": bool(kv3.meta_reflection_enabled),
+            },
+            "execution_modes": {
+                "counts": mode_counts,
+                "ratios": mode_ratios,
+                "total_plans": plan_total,
+                "brain_research_executions": len(brain_res_execs),
+                "brain_research_failures": brain_res_failures,
+            },
+            "goals": {
+                "total": len(w_goals),
+                "achieved": g_achieved,
+                "failed": g_failed,
+                "abandoned": g_abandoned,
+                "active": g_active,
+                "success_rate": round(g_achieved / g_terminal, 4) if g_terminal > 0 else None,
+                "failure_rate": round((g_failed + g_abandoned) / g_terminal, 4) if g_terminal > 0 else None,
+                "by_drive": by_drive,
+            },
+            "topic_diversity": {
+                "unique_domains": len(domain_counts),
+                "domain_counts": domain_counts,
+                "dominant_domain": dominant_domain,
+                "dominant_ratio": dominant_ratio,
+                "domain_shannon_entropy": dom_entropy,
+                "domain_normalized_diversity": dom_norm_div,
+                "focus_pattern": (td_report.get("summary") or {}).get("focus_pattern"),
+                "topic_summary": td_report.get("summary") or {},
+                "interest_portfolio": {
+                    "total": len(portfolio_ws),
+                    "active": len(portfolio_active),
+                    "human_seeded": len(portfolio_human),
+                    "domains": portfolio_domains,
+                },
+            },
+            "skills": {
+                "validated_count": len(val_skills),
+                "draft_count": len(draft_skills),
+                "stale_draft_count": stale_draft_cnt,
+                "deprecated_count": dep_cnt,
+                "evolved_versions_count": evolved_cnt,
+                "reused_validated_count": reused_val_cnt,
+                "skill_reuse_ratio": round(reused_val_cnt / len(val_skills), 4) if val_skills else 0.0,
+                "recent_invocations_7d": len(w_invs),
+                "recent_invocations_succeeded_7d": sum(1 for iv in w_invs if iv.passed),
+                "pending_refactor_queue_count": len(refactor_open),
+                "pending_refactor_queue": refactor_open,
+            },
+            "playbooks": {
+                "active_count": len(playbooks_ws),
+                "domains": pb_domains,
+                "latest_updated_at": _iso(latest_pb_dt),
+                "freshness_score": pb_freshness,
+            },
+            "meta_reflection": {
+                "enabled": bool(kv3.meta_reflection_enabled),
+                "state": meta_state,
+                "recent_decisions": [
+                    {
+                        "selected": d.selected,
+                        "reason": d.reason,
+                        "created_at": _iso(d.created_at),
+                        "payload": d.payload if isinstance(d.payload, dict) else {},
+                    }
+                    for d in meta_decs
+                ],
+            },
+        }
 
     @router.get("/v2/control-center/social")
     async def cc_social_panel(

@@ -146,6 +146,7 @@ class TaskFinalizer:
         human_bridge: Any = None,
         investigation_manager: Any = None,
         world_pipeline: Any = None,
+        meta_reflection_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -168,6 +169,7 @@ class TaskFinalizer:
         self.human_bridge = human_bridge
         self.investigation_manager = investigation_manager
         self.world_pipeline = world_pipeline
+        self.meta_reflection_manager = meta_reflection_manager
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -700,6 +702,7 @@ class TaskFinalizer:
                 and self.skill_registry is not None
                 and self.skill_auto_crystallize
                 and task_row.get("workspace")
+                and str(task_row.get("assigned_agent") or "") not in {"brain_research", "skill_runtime"}
             ):
                 try:
                     raw_skey = (
@@ -713,6 +716,15 @@ class TaskFinalizer:
                         if effective_cap_key and effective_cap_key != "general_task"
                         else (task_row.get("required_capability") or "coding")
                     )
+                    res_budget = (
+                        task_row.get("resource_budget")
+                        if isinstance(task_row.get("resource_budget"), dict)
+                        else {}
+                    )
+                    refactor_target = res_budget.get("skill_refactor_target")
+                    if not isinstance(refactor_target, dict):
+                        exp_ref = (goal_dict.get("expected_outcome") or {}).get("skill_refactor_target")
+                        refactor_target = exp_ref if isinstance(exp_ref, dict) else None
                     skill_crystallized = await self.skill_registry.crystallize_from_workspace(
                         workspace=str(task_row["workspace"]),
                         skill_key=str(raw_skey),
@@ -721,10 +733,48 @@ class TaskFinalizer:
                         permission_level=str(task_row.get("permission_level") or "L1"),
                         source_task_id=task_uuid,
                         source_execution_id=exec_uuid,
+                        skill_refactor_target=refactor_target if isinstance(refactor_target, dict) else None,
                     )
                     if skill_crystallized is not None:
                         updated_outcome["skill_crystallized"] = skill_crystallized
                         await self.repo.update_task(task_uuid, outcome=updated_outcome)
+                        if skill_crystallized.get("status") == "VALIDATED" and (
+                            isinstance(refactor_target, dict) or skill_crystallized.get("evolved")
+                        ):
+                            c_target = str(
+                                (refactor_target or {}).get("canonical_name")
+                                or (refactor_target or {}).get("skill_key")
+                                or skill_crystallized.get("canonical_name")
+                                or skill_crystallized.get("skill_key")
+                                or ""
+                            ).strip()
+                            if c_target:
+                                if self.meta_reflection_manager is not None and hasattr(
+                                    self.meta_reflection_manager, "mark_skill_refactor_consumed"
+                                ):
+                                    await self.meta_reflection_manager.mark_skill_refactor_consumed(
+                                        c_target, execution_id=exec_key
+                                    )
+                                else:
+                                    q_rows = await self.repo.list_world_items(
+                                        kind="skill_refactor_queue", status="open"
+                                    )
+                                    for qr in q_rows:
+                                        qv = dict(qr.get("value") or {}) if isinstance(qr.get("value"), dict) else {}
+                                        if (
+                                            qr.get("key") == f"refactor:{c_target}"
+                                            or qv.get("skill_key") == c_target
+                                            or qv.get("canonical_name") == c_target
+                                        ):
+                                            qv["consumed_at"] = utcnow().isoformat()
+                                            qv["consumed_execution_id"] = exec_key
+                                            await self.repo.upsert_world_item(
+                                                kind="skill_refactor_queue",
+                                                key=str(qr["key"]),
+                                                value=qv,
+                                                status="completed",
+                                                source="skill_refactor_consumed",
+                                            )
                 except Exception as exc:
                     logger.warning("finalizer.skill_crystallize_degraded", execution_id=exec_key, error=str(exc))
 
@@ -764,7 +814,7 @@ class TaskFinalizer:
                 except Exception as exc:
                     logger.warning("finalizer.playbook_evolution_degraded", execution_id=exec_key, error=str(exc))
 
-            # V4.0 M3: Mark Curiosity exploration topic as verified on verified achievement
+            # V4.0 M3 + V5.2 M2: Mark Curiosity exploration topic verified & update persistent interest portfolio
             if self.exploration_manager is not None and eval_res.goal_achieved and verification_passed:
                 try:
                     exp_out = goal_dict.get("expected_outcome") or {}
@@ -786,11 +836,27 @@ class TaskFinalizer:
                             verified_fact=fact_txt,
                             information_gain=measured_info_gain,
                         )
+                    if getattr(self.exploration_manager, "interest_portfolio_enabled", False):
+                        ip_upd = await self.exploration_manager.mark_interest_explored(
+                            goal_title=str(goal_dict.get("title") or ""),
+                            goal_description=str(goal_dict.get("description") or ""),
+                            related_key=goal_dict.get("related_key"),
+                            portfolio_key=exp_out.get("interest_portfolio_key"),
+                            domain=exp_out.get("exploration_domain"),
+                        )
+                        if ip_upd is not None:
+                            updated_outcome["interest_portfolio_updated"] = {
+                                "key": ip_upd.get("key"),
+                                "domain": ip_upd.get("domain"),
+                                "touched_count": ip_upd.get("touched_count"),
+                                "last_explored_at": ip_upd.get("last_explored_at"),
+                            }
                 except Exception as exc:
                     logger.warning("finalizer.exploration_topic_degraded", execution_id=exec_key, error=str(exc))
 
-            if playbook_evolution:
-                updated_outcome["playbook_evolution"] = playbook_evolution
+            if playbook_evolution or "interest_portfolio_updated" in updated_outcome:
+                if playbook_evolution:
+                    updated_outcome["playbook_evolution"] = playbook_evolution
                 await self.repo.update_task(task_uuid, outcome=updated_outcome)
 
             # V4.2: Emergent multi-hop investigation progression, feed subscription & stall bounds

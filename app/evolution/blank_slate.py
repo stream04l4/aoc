@@ -22,6 +22,9 @@ _NON_INHERITABLE_WORLD_KINDS = (
     "social_rhythm_state",
     "human_outreach_card",
     "telegram_pending_reply",
+    "interest_portfolio",
+    "meta_reflection_state",
+    "skill_refactor_queue",
 )
 _REQUIRED_BLANK_TABLES = (
     "memory_index",

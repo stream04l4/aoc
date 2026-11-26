@@ -104,6 +104,7 @@ class ActionPlan(BaseModel):
     goal_title: str = ""
     objective: str = ""
     description: str = ""
+    execution_mode: str = "codex"  # codex | skill_first | brain_research
     assigned_agent: str = "codex"
     required_capability: str = "general_task"
     expected_output: str = ""
@@ -115,10 +116,22 @@ class ActionPlan(BaseModel):
     mcp_prefetch_calls: list[dict[str, Any]] = Field(default_factory=list)
     # V4.0 M1: optional Skill-first direct invocation ({skill_key, version?, input_data}) bypassing Codex
     skill_invocation: dict[str, Any] | None = None
+    # V5.2 M3: optional explicit directed skill refactoring target ({skill_key, canonical_name?, skill_id?, reason?, target_generalization?})
+    skill_refactor_target: dict[str, Any] | None = None
     # Advisory prediction ONLY — never directly updates drive satisfaction (task book 9.1)
     expected_improvement: float = 0.0
     rationale: str = ""
     usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def _normalize_execution_mode(cls, v: Any) -> str:
+        raw = str(v or "").strip().lower()
+        if raw in {"brain_research", "brain", "research_synthesis", "direct_research", "native_research"}:
+            return "brain_research"
+        if raw in {"skill_first", "skill", "skill_runtime"}:
+            return "skill_first"
+        return "codex"
 
     @field_validator("permission_level")
     @classmethod
@@ -163,6 +176,14 @@ class CognitiveContext(BaseModel):
     discovered_channels: list[dict[str, Any]] = Field(default_factory=list)
     # V5.1 M2: Gentle conversational goal hints adopted by social reflection (non-binding inspiration)
     social_goal_hints: list[dict[str, Any]] = Field(default_factory=list)
+    # V5.2 M1: Feature flag informing CognitionBrain.plan() that brain_research mode is enabled
+    brain_research_enabled: bool = False
+    # V5.2 M2: Persistent cross-cycle interest portfolio seeded by creator Joel or exploration
+    interest_portfolio: list[dict[str, Any]] = Field(default_factory=list)
+    # V5.2 M3: Feature flag informing CognitionBrain.plan() that explicit skill refactoring staging is enabled
+    explicit_skill_refactor_enabled: bool = False
+    # V5.2 M4: Pending open skill refactor queue items injected from MetaReflectionManager
+    pending_skill_refactors: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -323,6 +344,75 @@ class SocialTurnDecision(BaseModel):
         return clamp01(v)
 
 
+class ResearchSynthesisContext(BaseModel):
+    """Input snapshot for Brain-Native Research & Synthesis (V5.2 M1)."""
+
+    goal_title: str
+    goal_description: str = ""
+    objective: str = ""
+    success_criteria: list[str] = Field(default_factory=list)
+    drive_type: str = "curiosity"
+    prefetched_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    relevant_memories: list[dict[str, Any]] = Field(default_factory=list)
+    active_investigations: list[dict[str, Any]] = Field(default_factory=list)
+    human_guidance: list[dict[str, Any]] = Field(default_factory=list)
+    audience_note: str = ""
+
+
+class BrainResearchOutput(BaseModel):
+    """Structured synthesis returned directly by CognitionBrain without dispatching Codex (V5.2 M1)."""
+
+    key_findings: list[str] = Field(default_factory=list)
+    synthesis_markdown: str = ""
+    open_questions: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+    cited_sources: list[str] = Field(default_factory=list)
+    confidence: float = 0.7
+    human_brief: str | None = None
+    usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("confidence")
+    @classmethod
+    def _clamp_conf(cls, v: float) -> float:
+        return clamp01(v)
+
+
+class MetaReflectionContext(BaseModel):
+    """Compact system-wide telemetry snapshot for Periodic Meta-Reflection Critic (V5.2 M4)."""
+
+    now_iso: str = ""
+    trigger_reason: str = "interval_elapsed"
+    window_hours: int = 12
+    goal_stats: dict[str, Any] = Field(default_factory=dict)
+    failed_goals: list[dict[str, Any]] = Field(default_factory=list)
+    recent_error_events: list[dict[str, Any]] = Field(default_factory=list)
+    execution_mode_counts: dict[str, int] = Field(default_factory=dict)
+    validated_skills_summary: list[dict[str, Any]] = Field(default_factory=list)
+    zero_reuse_skills: list[dict[str, Any]] = Field(default_factory=list)
+    stale_draft_count: int = 0
+    active_playbooks: list[dict[str, Any]] = Field(default_factory=list)
+    topic_diversity_summary: dict[str, Any] = Field(default_factory=dict)
+    l2_proposal_allowed: bool = True
+    previous_reflection_summary: str = ""
+
+
+class MetaReflectionOutput(BaseModel):
+    """Structured self-diagnosis and bounded L1/L2 upgrade proposals from CognitionBrain (V5.2 M4)."""
+
+    diagnosis_summary: str = ""
+    root_causes: list[str] = Field(default_factory=list)
+    playbook_revision: dict[str, Any] | None = None
+    skill_refactor_item: dict[str, Any] | None = None
+    l2_upgrade_proposal: dict[str, Any] | None = None
+    confidence: float = 0.7
+    usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("confidence")
+    @classmethod
+    def _clamp_meta_conf(cls, v: float) -> float:
+        return clamp01(v)
+
+
 class BrainInterface(ABC):
     """Unified Brain contract (task book section 6)."""
 
@@ -349,3 +439,11 @@ class BrainInterface(ABC):
             internal_monologue="social converse not implemented on this BrainInterface stub",
             action="IGNORE",
         )
+
+    async def synthesize_research(self, context: ResearchSynthesisContext) -> BrainResearchOutput:
+        """Optional Brain-native research synthesis (default minimal fallback for minimal stubs)."""
+        return BrainResearchOutput(key_findings=[], synthesis_markdown="", confidence=0.0)
+
+    async def reflect_on_system(self, context: MetaReflectionContext) -> MetaReflectionOutput:
+        """Optional periodic meta-reflection critic (default no-op for minimal stubs)."""
+        return MetaReflectionOutput(diagnosis_summary="meta_reflection_not_implemented", confidence=0.0)

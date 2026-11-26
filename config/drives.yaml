@@ -58,6 +58,15 @@ drives:
       capability_goals: 0.20
       resource_reserve: 0.10
       expansion_readiness: 0.10      # Identity + memory + knowledge transfer readiness + healthy agents
+    quality_dimension_weights:       # V5.2 M4: active only when kernel_v3.reproduction_quality_scoring_enabled=true
+      capability_coverage: 0.03
+      reusable_skills: 0.06
+      capability_goals: 0.04
+      resource_reserve: 0.03
+      expansion_readiness: 0.02
+      skill_reuse_quality: 0.45
+      execution_reliability: 0.25
+      playbook_freshness: 0.12
     targets:
       skills: 10                 # reusable procedural skills considered "fully stocked"
       capability_goals_window: 5 # completed capability goals considered "fully satisfied" (rolling window)

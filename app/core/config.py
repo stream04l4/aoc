@@ -232,6 +232,23 @@ class KernelV3Settings(BaseModel):
     max_active_investigations: int = 2
     investigation_max_hops: int = 6
     investigation_low_ig_stall_streak: int = 2
+    # V5.2 M1: Brain-Native Research & Synthesis path (bypasses Codex for pure research/synthesis)
+    brain_research_enabled: bool = False
+    max_brain_research_mcp_calls: int = 4
+    # V5.2 M2: Dynamic Interest Portfolio, cross-domain quotas & topic-fatigue de-weighting
+    interest_portfolio_enabled: bool = False
+    max_same_domain_streak: int = 3
+    max_same_topic_streak: int = 3
+    portfolio_starvation_cycles: int = 6
+    # V5.2 M3: Explicit directed skill refactoring, skill_first routing enrichment & stale DRAFT expiry
+    explicit_skill_refactor_enabled: bool = False
+    draft_skill_expiry_hours: int = 48
+    # V5.2 M4: Unfreeze reproduction quality drive, periodic meta-reflection critic & self-evolution observability
+    reproduction_quality_scoring_enabled: bool = False
+    meta_reflection_enabled: bool = False
+    meta_reflection_interval_hours: int = 12
+    meta_reflection_failure_threshold: int = 5
+    meta_reflection_l2_cooldown_hours: int = 24
 
 
 class EvolutionSettings(BaseModel):

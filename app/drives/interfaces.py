@@ -112,6 +112,12 @@ class DriveContext(BaseModel):
     identity_persisted: bool | None = None
     self_model_synced: bool | None = None
     knowledge_transfer_readiness: float | None = None
+    # V5.2 M4: optional quality telemetry for unfreezing reproduction drive (off by default)
+    reproduction_quality_scoring_enabled: bool = False
+    skill_reuse_ratio_recent: float | None = None
+    execution_reliability_recent: float | None = None
+    playbook_freshness_score: float | None = None
+    pending_skill_refactor_count: int = 0
 
     # curiosity
     open_knowledge_gaps: list[KnowledgeGap] = Field(default_factory=list)

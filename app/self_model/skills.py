@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -31,10 +32,24 @@ from app.cognition.interfaces import ActionPlan
 from app.core.enums import DriveType, PermissionLevel
 from app.governance.interfaces import GovernanceInterface
 from app.observability.logging import get_logger
+from app.perception.interfaces import utcnow
 from app.self_model.interfaces import SelfModelConfig, SkillRegistryInterface, SkillStatus
 from app.storage.repository import StateRepository
 
 logger = get_logger("aoc.self_model.skills")
+
+
+def _ensure_utc_dt(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw.astimezone(timezone.utc)
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    try:
+        dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def compute_file_sha256(path: Path) -> str:
@@ -111,6 +126,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         governance: GovernanceInterface | None = None,
         config: SelfModelConfig | dict[str, Any] | None = None,
         self_model: Any = None,
+        explicit_skill_refactor_enabled: bool = False,
     ) -> None:
         self.repo = repo
         self.governance = governance
@@ -121,6 +137,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         else:
             self.cfg = SelfModelConfig()
         self.self_model = self_model
+        self.explicit_skill_refactor_enabled = bool(explicit_skill_refactor_enabled)
         self.storage_dir = Path(self.cfg.skill_storage_dir).resolve()
         self._on_skills_changed: Callable[[], Awaitable[Any]] | None = None
         self.evolution_engine: Any = None
@@ -551,6 +568,81 @@ class SkillRegistryManager(SkillRegistryInterface):
                 break
         return reusable
 
+    async def resolve_validated_skill(self, target: dict[str, Any]) -> dict[str, Any] | None:
+        """Resolve an integrity-verified VALIDATED skill by id, canonical_name, or skill_key."""
+        if not isinstance(target, dict):
+            return None
+        candidate: dict[str, Any] | None = None
+        raw_id = str(target.get("skill_id") or target.get("base_skill_id") or "").strip()
+        if raw_id:
+            try:
+                candidate = await self.repo.get_skill(uuid.UUID(raw_id))
+            except (ValueError, TypeError):
+                candidate = None
+        if candidate is None:
+            for key_field in ("canonical_name", "skill_key"):
+                ref = str(target.get(key_field) or "").strip()
+                if not ref:
+                    continue
+                candidate = await self.repo.get_skill_by_name(ref, validated_only=True)
+                if candidate is not None:
+                    break
+        if candidate is None or candidate.get("status") != SkillStatus.VALIDATED.value:
+            return None
+        ok, _ = await self.verify_skill_integrity(candidate["id"])
+        return candidate if ok else None
+
+    async def stage_base_skill_in_workspace(
+        self, workspace: str, target: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Copy baseline skill source, regression tests & schemas into `<workspace>/.aoc_base_skill/`."""
+        base = await self.resolve_validated_skill(target)
+        if base is None:
+            return None
+        art_raw = base.get("artifact_path")
+        if not art_raw or not Path(art_raw).is_file():
+            return None
+
+        ws_dir = Path(workspace).resolve()
+        base_dir = ws_dir / ".aoc_base_skill"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(art_raw, base_dir / "skill.py")
+        base_test_code = str((base.get("test_spec") or {}).get("code") or "").strip()
+        (base_dir / "test_skill.py").write_text(
+            (base_test_code + "\n") if base_test_code else "",
+            encoding="utf-8",
+        )
+        meta_payload = {
+            "skill_id": base["id"],
+            "skill_key": base["skill_key"],
+            "canonical_name": base.get("canonical_name") or base["skill_key"],
+            "version": base["version"],
+            "capability_key": base["capability_key"],
+            "permission_level": base.get("permission_level") or "L1",
+            "description": base.get("description") or "",
+            "input_schema": base.get("input_schema") or {},
+            "output_schema": base.get("output_schema") or {},
+            "reason": str(target.get("reason") or "")[:300],
+            "target_generalization": str(target.get("target_generalization") or "")[:300],
+        }
+        (base_dir / "metadata.json").write_text(
+            json.dumps(meta_payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "base_skill_id": base["id"],
+            "skill_key": base["skill_key"],
+            "canonical_name": meta_payload["canonical_name"],
+            "base_version": base["version"],
+            "capability_key": base["capability_key"],
+            "permission_level": meta_payload["permission_level"],
+            "reason": meta_payload["reason"],
+            "target_generalization": meta_payload["target_generalization"],
+            "staged_dir": str(base_dir),
+            "has_base_tests": bool(base_test_code),
+        }
+
     async def crystallize_from_workspace(
         self,
         *,
@@ -561,14 +653,9 @@ class SkillRegistryManager(SkillRegistryInterface):
         permission_level: str = PermissionLevel.L1.value,
         source_task_id: uuid.UUID | str | None = None,
         source_execution_id: uuid.UUID | str | None = None,
+        skill_refactor_target: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Auto-extract a candidate Skill + isolated assertion test from a verified task workspace (V3.0 M4).
-
-        Convention: external Agent writes `skill.py` (or a single non-test `*.py` file) AND
-        `test_skill.py` (or `test_*.py`) inside its isolated task workspace.
-        Runs static safety scan -> registers DRAFT -> executes isolated sandbox validation ->
-        L0/L1 auto-promotes to VALIDATED without human approval.
-        """
+        """Auto-extract a candidate Skill + isolated assertion test from a verified task workspace (V3.0 M4 + V5.2 M3)."""
         ws = Path(workspace)
         if not ws.exists() or not ws.is_dir():
             return None
@@ -595,6 +682,21 @@ class SkillRegistryManager(SkillRegistryInterface):
         if not art_code.strip() or not test_code.strip():
             return None
 
+        # Optional schemas emitted alongside skill.py (`skill_meta.json`, <= 64KB)
+        meta_in_schema: dict[str, Any] | None = None
+        meta_out_schema: dict[str, Any] | None = None
+        meta_file = ws / "skill_meta.json"
+        if meta_file.is_file() and meta_file.stat().st_size <= 65536:
+            try:
+                parsed_meta = json.loads(meta_file.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(parsed_meta, dict):
+                    if isinstance(parsed_meta.get("input_schema"), dict):
+                        meta_in_schema = parsed_meta["input_schema"]
+                    if isinstance(parsed_meta.get("output_schema"), dict):
+                        meta_out_schema = parsed_meta["output_schema"]
+            except Exception:
+                pass
+
         # Static safety scan on BOTH artifact and test code
         test_violations = scan_skill_code_safety(test_code)
         if test_violations:
@@ -603,6 +705,63 @@ class SkillRegistryManager(SkillRegistryInterface):
                 "crystallized": False,
                 "rejected_unsafe": True,
                 "violations": test_violations,
+            }
+
+        # V5.2 M3 Branch A: Explicit directed refactoring against an already-staged VALIDATED baseline
+        if isinstance(skill_refactor_target, dict) and skill_refactor_target:
+            if self.evolution_engine is None:
+                return {
+                    "crystallized": False,
+                    "evolved": False,
+                    "explicit_refactor": True,
+                    "reason": "skill_evolution_engine_unavailable",
+                }
+            base = await self.resolve_validated_skill(skill_refactor_target)
+            if base is None:
+                logger.warning("skill.refactor_target_not_found", target=skill_refactor_target)
+                await self.repo.log_event(
+                    "skill.refactor_target_not_found",
+                    message="Explicit skill refactor target not found or unvalidated",
+                    payload={"target": skill_refactor_target},
+                )
+                return {
+                    "crystallized": False,
+                    "evolved": False,
+                    "explicit_refactor": True,
+                    "reason": "target_validated_skill_not_found",
+                }
+            change_summary = (
+                str(skill_refactor_target.get("target_generalization") or "").strip()
+                or str(skill_refactor_target.get("reason") or "").strip()
+                or f"Explicit directed skill refactor ({description[:120]})"
+            )
+            evo = await self.evolution_engine.evolve_skill(
+                base["id"],
+                new_artifact_code=art_code,
+                new_test_code=test_code,
+                change_type="minor",
+                change_summary=change_summary[:300],
+                description=description[:500] or str(base.get("description") or ""),
+                new_input_schema=meta_in_schema,
+                new_output_schema=meta_out_schema,
+                new_permission_level=permission_level,
+                source_task_id=source_task_id,
+                source_execution_id=source_execution_id,
+            )
+            return {
+                "explicit_refactor": True,
+                "crystallized": evo.promoted,
+                "evolved": True,
+                "promoted": evo.promoted,
+                "rolled_back": evo.rolled_back,
+                "skill_id": evo.new_skill_id or evo.base_skill_id,
+                "skill_key": base["skill_key"],
+                "canonical_name": evo.canonical_name,
+                "version": evo.new_version or evo.base_version,
+                "status": SkillStatus.VALIDATED.value if evo.promoted else SkillStatus.DEPRECATED.value,
+                "passed": evo.regression_passed and evo.new_tests_passed,
+                "awaiting_human_approval": evo.awaiting_human_approval,
+                "reason": evo.reason,
             }
 
         from app.skills.evolution import canonicalize_skill_name
@@ -614,7 +773,7 @@ class SkillRegistryManager(SkillRegistryInterface):
         is_truncated_sentence = len(raw_slug) > 40 or raw_slug.startswith(("create_", "build_"))
         slug = canonical_name.replace(".", "_")[:64] if (not raw_slug or is_truncated_sentence) else raw_slug[:64]
 
-        # V4.0 M2: If an active VALIDATED duplicate exists, evolve vNext instead of creating a duplicate row!
+        # V4.0 M2 + V5.2 M3 Branch B: Duplicate collision check
         if self.evolution_engine is not None:
             dup = await self.evolution_engine.find_duplicate_skill(
                 canonical_name=canonical_name,
@@ -622,6 +781,40 @@ class SkillRegistryManager(SkillRegistryInterface):
                 description=description,
             )
             if dup is not None:
+                if self.explicit_skill_refactor_enabled:
+                    logger.info(
+                        "skill.crystallize_skipped_existing_validated",
+                        proposed_key=slug,
+                        proposed_canonical=canonical_name,
+                        matched_skill_id=dup.matched_skill_id,
+                        matched_skill_key=dup.matched_skill_key,
+                        matched_canonical=dup.matched_canonical_name,
+                    )
+                    await self.repo.log_event(
+                        "skill.crystallize_skipped_existing_validated",
+                        message=(
+                            f"Skipped blind evolution of existing VALIDATED skill "
+                            f"{dup.matched_canonical_name or dup.matched_skill_key}"
+                        ),
+                        payload={
+                            "proposed_key": slug,
+                            "proposed_canonical": canonical_name,
+                            "matched_skill_id": dup.matched_skill_id,
+                            "matched_skill_key": dup.matched_skill_key,
+                            "matched_canonical": dup.matched_canonical_name,
+                            "reason": dup.reason,
+                        },
+                    )
+                    return {
+                        "crystallized": False,
+                        "evolved": False,
+                        "skipped_existing_validated": True,
+                        "matched_skill_id": dup.matched_skill_id,
+                        "matched_skill_key": dup.matched_skill_key,
+                        "canonical_name": dup.matched_canonical_name,
+                        "match_reason": dup.reason,
+                        "reason": "Skipped blind overwrite of existing VALIDATED skill; set skill_refactor_target for directed evolution",
+                    }
                 evo = await self.evolution_engine.evolve_skill(
                     dup.matched_skill_id,
                     new_artifact_code=art_code,
@@ -629,6 +822,8 @@ class SkillRegistryManager(SkillRegistryInterface):
                     change_type="minor",
                     change_summary=f"Auto-evolved from workspace task ({description[:120]})",
                     description=description[:500],
+                    new_input_schema=meta_in_schema,
+                    new_output_schema=meta_out_schema,
                     new_permission_level=permission_level,
                     source_task_id=source_task_id,
                     source_execution_id=source_execution_id,
@@ -659,6 +854,8 @@ class SkillRegistryManager(SkillRegistryInterface):
                 artifact_filename=art_file.name,
                 test_spec={"kind": "python_assertions", "code": test_code, "expected_exit_code": 0},
                 permission_level=permission_level,
+                input_schema=meta_in_schema,
+                output_schema=meta_out_schema,
                 source_task_id=source_task_id,
                 source_execution_id=source_execution_id,
             )
@@ -676,6 +873,57 @@ class SkillRegistryManager(SkillRegistryInterface):
         except SkillGovernanceError as exc:
             logger.warning("skill.crystallize_governance_blocked", skill_key=slug, error=str(exc))
             return {"crystallized": False, "rejected_unsafe": True, "error": str(exc)}
+
+    async def expire_stale_draft_skills(
+        self,
+        *,
+        expiry_hours: int = 48,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Deprecate unvalidated DRAFT skills older than `expiry_hours` (preserves L2 skills awaiting approval)."""
+        ref_now = _ensure_utc_dt(now or utcnow()) or utcnow()
+        hours_cap = max(1, int(expiry_hours))
+        cutoff = ref_now - timedelta(hours=hours_cap)
+
+        drafts = await self.repo.list_skills(status=SkillStatus.DRAFT.value, limit=200)
+        expired_ids: list[str] = []
+        for sk in drafts:
+            ref_dt = _ensure_utc_dt(sk.get("updated_at")) or _ensure_utc_dt(sk.get("created_at"))
+            if ref_dt is None or ref_dt >= cutoff:
+                continue
+            sid = uuid.UUID(str(sk["id"]))
+            validations = await self.repo.list_skill_validations(sid, limit=5)
+            # Keep L2 skills whose tests already passed and are merely awaiting human approval
+            if any(bool(v.get("passed")) for v in validations):
+                continue
+            await self.repo.update_skill_metadata(
+                sid,
+                status=SkillStatus.DEPRECATED.value,
+                evolution_meta={
+                    "cleanup_reason": "stale_draft_expired",
+                    "expired_at": ref_now.isoformat(),
+                    "expiry_hours": hours_cap,
+                },
+            )
+            await self.repo.log_event(
+                "skill.stale_draft_expired",
+                message=f"Expired stale unvalidated DRAFT skill {sk['skill_key']}@{sk['version']}",
+                payload={
+                    "skill_id": str(sid),
+                    "skill_key": sk["skill_key"],
+                    "version": sk["version"],
+                    "expiry_hours": hours_cap,
+                },
+            )
+            expired_ids.append(str(sid))
+
+        if expired_ids:
+            await self._notify_skills_changed()
+        return {
+            "expired_count": len(expired_ids),
+            "expired_skill_ids": expired_ids,
+            "expiry_hours": hours_cap,
+        }
 
     async def count_validated_skills(
         self,

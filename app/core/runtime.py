@@ -12,6 +12,7 @@ from app.agents.registry import AgentRegistry
 from app.cognition.brain import CognitionBrain
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import BrainInterface
+from app.cognition.meta_reflection import MetaReflectionManager
 from app.core.config import (
     EmbeddingSettings,
     LifecycleSettings,
@@ -378,7 +379,10 @@ class OrganismRuntime:
             workspace_root=self.settings.governance.workspace_root,
             allowed_domains=allowed_domains,
             allowed_git_roots=allowed_git_roots,
-            open_public_https=self.settings.kernel_v3.open_public_perception_enabled,
+            open_public_https=bool(
+                self.settings.kernel_v3.open_public_perception_enabled
+                or self.settings.kernel_v3.brain_research_enabled
+            ),
             blocked_hosts=blocked_hosts,
             searxng_url=self.settings.kernel_v3.searxng_url,
         )
@@ -393,6 +397,7 @@ class OrganismRuntime:
         self.playbook_manager: PlaybookManager | None = None
         self.exploration_manager: ExplorationManager | None = None
         self.investigation_manager: InvestigationManager | None = None
+        self.meta_reflection_manager: MetaReflectionManager | None = None
         self.affect: AffectModulator | None = None
 
         self.loop: AutonomousLoop | None = None
@@ -422,7 +427,13 @@ class OrganismRuntime:
             repo=self.repo,
             governance=self.governance,
             config=sm_cfg,
+            explicit_skill_refactor_enabled=self.settings.kernel_v3.explicit_skill_refactor_enabled,
         )
+        if self.orchestrator is not None:
+            self.orchestrator.skill_registry = self.skill_registry
+            self.orchestrator.explicit_skill_refactor_enabled = bool(
+                self.settings.kernel_v3.explicit_skill_refactor_enabled
+            )
         self.self_model = SelfModelManager(
             organism_id=self.organism_id,
             repo=self.repo,
@@ -461,6 +472,10 @@ class OrganismRuntime:
         self.exploration_manager = ExplorationManager(
             repo=self.repo,
             max_internal_curiosity_ratio=self.settings.kernel_v3.max_internal_curiosity_ratio,
+            interest_portfolio_enabled=self.settings.kernel_v3.interest_portfolio_enabled,
+            max_same_domain_streak=self.settings.kernel_v3.max_same_domain_streak,
+            max_same_topic_streak=self.settings.kernel_v3.max_same_topic_streak,
+            portfolio_starvation_cycles=self.settings.kernel_v3.portfolio_starvation_cycles,
         )
         if self.settings.kernel_v3.investigations_enabled:
             self.investigation_manager = InvestigationManager(
@@ -481,6 +496,17 @@ class OrganismRuntime:
             organism_id=self.organism_id,
             repo=self.repo,
             config=eff_affect_cfg,
+        )
+        self.meta_reflection_manager = MetaReflectionManager(
+            repo=self.repo,
+            brain=self.brain,
+            playbook_manager=self.playbook_manager,
+            human_bridge=self.human_bridge,
+            llm_gateway=self.llm_gateway,
+            enabled=self.settings.kernel_v3.meta_reflection_enabled,
+            interval_hours=self.settings.kernel_v3.meta_reflection_interval_hours,
+            failure_threshold=self.settings.kernel_v3.meta_reflection_failure_threshold,
+            l2_cooldown_hours=self.settings.kernel_v3.meta_reflection_l2_cooldown_hours,
         )
 
         self.finalizer = TaskFinalizer(
@@ -503,6 +529,7 @@ class OrganismRuntime:
             human_bridge=self.human_bridge,
             investigation_manager=self.investigation_manager,
             world_pipeline=self.world_pipeline,
+            meta_reflection_manager=self.meta_reflection_manager,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -573,6 +600,7 @@ class OrganismRuntime:
             entropy_sensor=self.entropy_sensor,
             culling_gc=self.culling_gc,
             telegram_notifier=self.telegram_notifier,
+            meta_reflection_manager=self.meta_reflection_manager,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error

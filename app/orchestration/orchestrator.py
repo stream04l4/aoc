@@ -108,6 +108,8 @@ class AgentOrchestrator:
         backend: ExecutionBackendInterface | None = None,
         state_machine: TaskStateMachine | None = None,
         router: AgentRouter | None = None,
+        skill_registry: Any = None,
+        explicit_skill_refactor_enabled: bool = False,
     ) -> None:
         self.registry = registry
         self.governance = governance
@@ -118,6 +120,8 @@ class AgentOrchestrator:
         self.backend: ExecutionBackendInterface = backend or LocalSubprocessBackend()
         self.state_machine = state_machine or TaskStateMachine(repo)
         self.router = router or AgentRouter(registry, repo)
+        self.skill_registry = skill_registry
+        self.explicit_skill_refactor_enabled = bool(explicit_skill_refactor_enabled)
         self._approval_locks: dict[str, asyncio.Lock] = {}
 
     def _approval_lock(self, task_id: str) -> asyncio.Lock:
@@ -374,6 +378,39 @@ class AgentOrchestrator:
             "retry_backoff_multiplier": round(safe_backoff_mult, 4),
         }
 
+        effective_description = plan.description
+        if (
+            self.explicit_skill_refactor_enabled
+            and self.skill_registry is not None
+            and isinstance(plan.skill_refactor_target, dict)
+            and plan.skill_refactor_target
+        ):
+            try:
+                staged = await self.skill_registry.stage_base_skill_in_workspace(
+                    workspace, plan.skill_refactor_target
+                )
+                if staged is not None:
+                    res_budget["skill_refactor_target"] = staged
+                    refactor_note = (
+                        "\n\n[Explicit Skill Refactoring Instructions]\n"
+                        f"- Baseline skill '{staged['canonical_name']}' (v{staged['base_version']}) has been "
+                        "staged read-only inside `./.aoc_base_skill/` (`skill.py`, `test_skill.py`, `metadata.json`).\n"
+                        "- You MUST read `./.aoc_base_skill/skill.py`, `./.aoc_base_skill/test_skill.py`, and `./.aoc_base_skill/metadata.json` first.\n"
+                        f"- Target generalization: {staged.get('target_generalization') or staged.get('reason') or 'preserve existing contracts while improving edge-case handling and reusability'}.\n"
+                        "- Preserve ALL existing public entrypoint signatures (`execute`/`run`/etc.) and backward-compatible input/output contracts.\n"
+                        "- Write updated `./skill.py` so ALL assertions in `./.aoc_base_skill/test_skill.py` pass unchanged (Gate A), AND expand `./test_skill.py` with new boundary assertions (Gate B).\n"
+                        "- Optionally write `./skill_meta.json` (`{\"input_schema\": ..., \"output_schema\": ...}`) so AOC publishes crisp parameter schemas for `skill_first` reuse."
+                    )
+                    effective_description = f"{(plan.description or '').strip()}{refactor_note}".strip()
+                    await self.repo.log_event(
+                        "orchestrator.skill_refactor_staged",
+                        message=f"Staged baseline skill {staged['canonical_name']}@{staged['base_version']} in {task_id}",
+                        payload={"task_id": task_id, **staged},
+                        cycle_id=cycle_id,
+                    )
+            except Exception as exc:
+                logger.warning("orchestrator.skill_refactor_stage_degraded", task_id=task_id, error=str(exc))
+
         adapter, _routing_dec = await self.router.select(
             preferred_agent=plan.assigned_agent,
             required_capability=plan.required_capability,
@@ -388,7 +425,7 @@ class AgentOrchestrator:
                 goal_id=goal_id,
                 cycle_id=cycle_id,
                 objective=plan.objective,
-                description=plan.description,
+                description=effective_description,
                 assigned_agent=plan.assigned_agent,
                 expected_output=plan.expected_output,
                 workspace=workspace,
@@ -417,7 +454,7 @@ class AgentOrchestrator:
             goal_id=goal_id,
             cycle_id=cycle_id,
             objective=plan.objective,
-            description=plan.description,
+            description=effective_description,
             assigned_agent=chosen_id,
             expected_output=plan.expected_output,
             workspace=workspace,
