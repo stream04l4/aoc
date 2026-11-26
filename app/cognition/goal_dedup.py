@@ -19,8 +19,13 @@ from pydantic import BaseModel, Field
 
 from app.cognition.interfaces import GoalProposal
 from app.memory.embedding import cosine_similarity
+from app.observability.topic_diversity import extract_topic_bucket
 from app.perception.interfaces import utcnow
-from app.perception.world.exploration import classify_exploration_scope
+from app.perception.world.exploration import (
+    classify_exploration_scope,
+    infer_topic_domain,
+    match_interest_portfolio_item,
+)
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]")
 _STOPWORDS = frozenset(
@@ -324,6 +329,8 @@ class GoalCandidateScore(BaseModel):
     predicted_ig: float = 0.0
     dedup_decision: str = "ACCEPT"
     dedup_reason: str | None = None
+    domain: str | None = None
+    pivot_bias: float = 0.0
     score: float = 0.0
     selected: bool = False
 
@@ -345,6 +352,10 @@ def select_best_goal_candidate(
     affect_state: dict[str, Any] | None = None,
     prefer_external: bool = False,
     has_human_guidance: bool = False,
+    must_pivot_domain: bool = False,
+    cooldown_domains: Sequence[str] | None = None,
+    cooldown_topic: str | None = None,
+    interest_portfolio: Sequence[dict[str, Any]] | None = None,
 ) -> GoalSelectionResult:
     """Evaluate primary + up to 2 alternative_goals through GoalDedupEngine and deterministically pick best.
 
@@ -384,6 +395,9 @@ def select_best_goal_candidate(
 
     boredom = float((affect_state or {}).get("boredom", 0.0) or 0.0)
     frustration = float((affect_state or {}).get("frustration", 0.0) or 0.0)
+    cooldown_set = {str(d).strip().lower() for d in (cooldown_domains or []) if str(d).strip()}
+    cooldown_topic_norm = str(cooldown_topic or "").strip().lower()
+    portfolio_items = [dict(it) for it in (interest_portfolio or []) if isinstance(it, dict)]
 
     scored: list[tuple[float, int, str, GoalProposal, GoalDedupDecision]] = []
     audit_rows: list[GoalCandidateScore] = []
@@ -399,6 +413,37 @@ def select_best_goal_candidate(
         )
         if first_dedup is None:
             first_dedup = dec
+
+        exp = prop.expected_outcome if isinstance(prop.expected_outcome, dict) else {}
+        et = prop.exploration_topic if isinstance(prop.exploration_topic, dict) else {}
+        cand_domain = infer_topic_domain(
+            prop.title,
+            prop.description,
+            explicit_domain=et.get("domain") or exp.get("exploration_domain"),
+        )
+        topic_exp = {k: v for k, v in exp.items() if k != "exploration_domain"}
+        cand_bucket = extract_topic_bucket(
+            title=prop.title,
+            related_key=prop.related_key,
+            expected_outcome=topic_exp,
+        )
+        pivot_bias = 0.0
+        if must_pivot_domain:
+            pivot_bias += -0.45 if cand_domain in cooldown_set else 0.25
+            if cooldown_topic_norm and cand_bucket == cooldown_topic_norm:
+                pivot_bias -= 0.30
+        if portfolio_items and cand_domain not in cooldown_set:
+            matched_it = match_interest_portfolio_item(
+                portfolio_items,
+                title=prop.title,
+                description=prop.description,
+                related_key=prop.related_key,
+                portfolio_key=exp.get("interest_portfolio_key"),
+                domain=cand_domain,
+            )
+            if matched_it is not None and str(matched_it.get("origin") or "") == "human_seeded":
+                pivot_bias += 0.30 if matched_it.get("starved") else 0.15
+        pivot_bias = round(pivot_bias, 4)
 
         pred_ig = max(0.0, min(1.0, float(prop.predicted_ig or 0.0)))
         if dec.decision == "ACCEPT":
@@ -417,7 +462,16 @@ def select_best_goal_candidate(
                 external_bias = 0.25 if scope == "external_exploration" else -0.30
             score = max(
                 0.0,
-                round(0.50 * pred_ig + 0.25 * novelty_term + specificity + affect_fit + primary_bonus + external_bias, 4),
+                round(
+                    0.50 * pred_ig
+                    + 0.25 * novelty_term
+                    + specificity
+                    + affect_fit
+                    + primary_bonus
+                    + external_bias
+                    + pivot_bias,
+                    4,
+                ),
             )
             scored.append((score, -idx, src, prop, dec))
         else:
@@ -432,6 +486,8 @@ def select_best_goal_candidate(
                 predicted_ig=round(pred_ig, 4),
                 dedup_decision=dec.decision,
                 dedup_reason=dec.reason_code,
+                domain=cand_domain,
+                pivot_bias=pivot_bias,
                 score=score,
                 selected=False,
             )

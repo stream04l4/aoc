@@ -303,5 +303,25 @@ def compact_channels(channels: list[dict[str, Any]], *, max_items: int = 6) -> l
     return out
 
 
+def compact_interest_portfolio(items: list[dict[str, Any]], *, max_items: int = 6) -> list[dict[str, Any]]:
+    """Keep active cross-cycle human/self-seeded interest portfolio entries compact for `generate_goal()`."""
+    out: list[dict[str, Any]] = []
+    for it in (items or [])[: max(1, int(max_items))]:
+        if not isinstance(it, dict):
+            continue
+        out.append(
+            {
+                "topic_key": it.get("topic_key") or it.get("key"),
+                "domain": it.get("domain") or "general_tech",
+                "prompt": _trim_text(it.get("prompt"), 180),
+                "origin": it.get("origin") or "human_seeded",
+                "priority": round(float(it.get("priority", 0.5) or 0.5), 2),
+                "touched_count": int(it.get("touched_count") or 0),
+                "starved": bool(it.get("starved", False)),
+            }
+        )
+    return out
+
+
 def estimate_payload_chars(payload: Any) -> int:
     return len(json.dumps(payload, ensure_ascii=False, default=str))

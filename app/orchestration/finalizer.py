@@ -765,7 +765,7 @@ class TaskFinalizer:
                 except Exception as exc:
                     logger.warning("finalizer.playbook_evolution_degraded", execution_id=exec_key, error=str(exc))
 
-            # V4.0 M3: Mark Curiosity exploration topic as verified on verified achievement
+            # V4.0 M3 + V5.2 M2: Mark Curiosity exploration topic verified & update persistent interest portfolio
             if self.exploration_manager is not None and eval_res.goal_achieved and verification_passed:
                 try:
                     exp_out = goal_dict.get("expected_outcome") or {}
@@ -787,11 +787,27 @@ class TaskFinalizer:
                             verified_fact=fact_txt,
                             information_gain=measured_info_gain,
                         )
+                    if getattr(self.exploration_manager, "interest_portfolio_enabled", False):
+                        ip_upd = await self.exploration_manager.mark_interest_explored(
+                            goal_title=str(goal_dict.get("title") or ""),
+                            goal_description=str(goal_dict.get("description") or ""),
+                            related_key=goal_dict.get("related_key"),
+                            portfolio_key=exp_out.get("interest_portfolio_key"),
+                            domain=exp_out.get("exploration_domain"),
+                        )
+                        if ip_upd is not None:
+                            updated_outcome["interest_portfolio_updated"] = {
+                                "key": ip_upd.get("key"),
+                                "domain": ip_upd.get("domain"),
+                                "touched_count": ip_upd.get("touched_count"),
+                                "last_explored_at": ip_upd.get("last_explored_at"),
+                            }
                 except Exception as exc:
                     logger.warning("finalizer.exploration_topic_degraded", execution_id=exec_key, error=str(exc))
 
-            if playbook_evolution:
-                updated_outcome["playbook_evolution"] = playbook_evolution
+            if playbook_evolution or "interest_portfolio_updated" in updated_outcome:
+                if playbook_evolution:
+                    updated_outcome["playbook_evolution"] = playbook_evolution
                 await self.repo.update_task(task_uuid, outcome=updated_outcome)
 
             # V4.2: Emergent multi-hop investigation progression, feed subscription & stall bounds

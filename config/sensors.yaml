@@ -7,7 +7,10 @@ max_redirects: 3
 importance_threshold: 0.45
 dedup_window_hours: 168
 
-# Strict domain allowlist for RSS & Web Change sensors (SSRF + DNS Rebinding protected)
+# Strict domain allowlist for passive periodic RSS & Web Change polling sensors (SSRF + DNS Rebinding protected).
+# Note: Active L0 research via `web_search` (SearXNG) and `web_fetch_readonly` when `brain_research_enabled=true`
+# permits public HTTPS retrieval across open domains (blocking private/loopback/metadata IPs & prompt injections),
+# keeping cross-domain exploration unbound by this static 7-domain RSS list.
 allowed_domains:
   - "www.postgresql.org"
   - "blog.python.org"
@@ -40,6 +43,11 @@ interest_keywords:
   - "linux"
   - "database"
   - "llm"
+  - "cognition"
+  - "psychology"
+  - "neuroscience"
+  - "science"
+  - "reasoning"
 
 # Default configured sources (can be toggled via POST /v2/world/sources/{id}/enable|disable)
 sources:
@@ -107,3 +115,22 @@ sources:
     config:
       url: "https://github.com/letta-ai/letta/releases.atom"
       max_items: 5
+  # V5.2 M2: Cross-domain arXiv preset slots (disabled by default; allowlisted via export.arxiv.org)
+  - source_id: "rss-arxiv-q-bio-nc"
+    sensor_type: "rss"
+    name: "arXiv q-bio.NC Neurons & Cognition Feed"
+    enabled: false
+    reliability_score: 0.85
+    poll_interval_seconds: 7200
+    config:
+      url: "https://export.arxiv.org/rss/q-bio.NC"
+      max_items: 8
+  - source_id: "rss-arxiv-cs-cy"
+    sensor_type: "rss"
+    name: "arXiv cs.CY Computers & Society Feed"
+    enabled: false
+    reliability_score: 0.85
+    poll_interval_seconds: 7200
+    config:
+      url: "https://export.arxiv.org/rss/cs.CY"
+      max_items: 8

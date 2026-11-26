@@ -13,6 +13,7 @@ from app.cognition.context_compactor import (
     compact_channels,
     compact_drives,
     compact_hypotheses,
+    compact_interest_portfolio,
     compact_investigations,
     compact_memories,
     compact_observation_dict,
@@ -146,6 +147,15 @@ class CognitionBrain(BrainInterface):
             "({source_id, sensor_type, url, name}) for a public HTTPS RSS/Web feed (SSRF/internal IPs are blocked). "
             "Check exploration_guidance: if must_explore_external is true, AVOID internal self-diagnostics/ledgers "
             "and propose genuine external learning or problem-solving exploration. "
+            "INTEREST PORTFOLIO & DOMAIN-FATIGUE PIVOTING (V5.2 M2): `interest_portfolio` holds persistent cross-cycle "
+            "topics seeded by creator Joel (`human_seeded`) or earlier exploration. When `exploration_guidance.must_pivot_domain` "
+            "is true, you MUST STOP proposing goals in `exploration_guidance.cooldown_domains` (especially `security_audit` "
+            "comfort-zone loops) or repeating `exploration_guidance.cooldown_topic`, and instead pivot immediately to an "
+            "active `human_portfolio_candidates` / `interest_portfolio` topic or one of `recommended_pivot_domains` "
+            "(e.g. `ai_industry`, `psychology_cognition`, `sports_health`, `science_general`, `humanities_society`). "
+            "Always provide 1-2 `alternative_goals` spanning DIFFERENT non-cooldown domains with explicit "
+            "`exploration_topic: {topic_key, domain, question}` so kernel arbitration can avoid stagnation; cross-domain "
+            "reading/research goals do NOT require writing code (they can run directly in `brain_research`). "
             "AUTONOMOUS CAPABILITY EXPANSION: Your survival and growth depend on continuously expanding capabilities "
             "outside the immutable kernel via self-directed investigation and validated reusable skills/playbooks. "
             "EMERGENT EPISTEMIC FORAGING (MULTI-HOP THREADS): You have NO preset domain syllabus. When driven by "
@@ -206,6 +216,7 @@ class CognitionBrain(BrainInterface):
                 max_chars=480,
             ),
             "exploration_guidance": context.exploration_guidance,
+            "interest_portfolio": compact_interest_portfolio(context.interest_portfolio, max_items=6),
             "active_investigations": compact_investigations(context.active_investigations, max_items=2),
             "discovered_channels": compact_channels(context.discovered_channels, max_items=6),
             "human_guidance": context.human_guidance[:5],

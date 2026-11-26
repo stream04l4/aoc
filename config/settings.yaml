@@ -97,3 +97,7 @@ social:
 kernel_v3:
   brain_research_enabled: false     # V5.2 M1: Brain-native research/synthesis path (0 Codex for pure research)
   max_brain_research_mcp_calls: 4   # max bounded L0 read-only MCP calls per brain_research execution
+  interest_portfolio_enabled: false # V5.2 M2: Persistent interest_portfolio, cross-domain quotas & fatigue pivoting
+  max_same_domain_streak: 3         # force pivot after N consecutive curiosity goals in same domain/comfort zone
+  max_same_topic_streak: 3          # force pivot after N consecutive curiosity goals in same normalized topic bucket
+  portfolio_starvation_cycles: 6    # flag human_seeded interest starved after N untouched curiosity cycles

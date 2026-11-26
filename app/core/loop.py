@@ -77,6 +77,11 @@ from app.orchestration.finalizer import TaskFinalizer
 from app.orchestration.orchestrator import AgentOrchestrator, compute_params_digest, compute_plan_hash
 from app.perception.interfaces import Observation, utcnow
 from app.perception.manager import SensorManager
+from app.perception.world.exploration import (
+    infer_topic_domain,
+    is_substantive_interest_guidance,
+    match_interest_portfolio_item,
+)
 from app.perception.world.security import detect_prompt_injection, sanitize_external_text, wrap_untrusted_world_event
 from app.storage.outbox import OutboxDispatcher, OutboxEventType
 from app.storage.repository import StateRepository, day_start
@@ -617,12 +622,51 @@ class AutonomousLoop:
             recent_goals = await self.repo.list_recent_goals(
                 since=now - timedelta(hours=lookback_h), limit=80
             )
+            pending_human_guidance: list[dict[str, Any]] = []
+            if self.human_bridge is not None:
+                try:
+                    pending_human_guidance = await self.human_bridge.list_pending_guidance(limit=5)
+                except Exception as exc:
+                    logger.warning("cycle.human_guidance_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+            outreach_avail = bool(self.human_bridge is not None and getattr(self.human_bridge, "enabled", False))
+
+            interest_portfolio_items: list[dict[str, Any]] = []
+            if self.exploration_manager is not None and kv3.interest_portfolio_enabled:
+                for hg in pending_human_guidance:
+                    hg_txt = str(hg.get("text") or "").strip()
+                    if is_substantive_interest_guidance(hg_txt):
+                        try:
+                            await self.exploration_manager.upsert_interest_item(
+                                prompt=hg_txt,
+                                origin="human_seeded",
+                                priority=0.90,
+                                status="active",
+                                source=f"human_guidance:{hg.get('sender') or 'joel'}",
+                                sender=str(hg.get("sender") or "joel"),
+                            )
+                        except Exception as exc:
+                            logger.warning("cycle.interest_portfolio_seed_degraded", cycle_id=str(cycle_id), error=str(exc))
+                try:
+                    interest_portfolio_items = await self.exploration_manager.list_interest_portfolio(
+                        statuses=("active",),
+                        limit=8,
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.interest_portfolio_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             exploration_guidance: dict[str, Any] | None = None
             if self.exploration_manager is not None:
                 try:
                     exploration_guidance = await self.exploration_manager.build_guidance(recent_goals)
                 except Exception as exc:
                     logger.warning("cycle.exploration_guidance_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+            if interest_portfolio_items and exploration_guidance:
+                starved_keys = set(exploration_guidance.get("starved_human_portfolio_keys") or [])
+                interest_portfolio_items = [
+                    {**it, "starved": (it.get("key") in starved_keys)}
+                    for it in interest_portfolio_items
+                ]
 
             external_playbooks: list[dict[str, Any]] = []
             if self.playbook_manager is not None:
@@ -633,14 +677,6 @@ class AutonomousLoop:
                     )
                 except Exception as exc:
                     logger.warning("cycle.playbooks_load_degraded", cycle_id=str(cycle_id), error=str(exc))
-
-            pending_human_guidance: list[dict[str, Any]] = []
-            if self.human_bridge is not None:
-                try:
-                    pending_human_guidance = await self.human_bridge.list_pending_guidance(limit=5)
-                except Exception as exc:
-                    logger.warning("cycle.human_guidance_load_degraded", cycle_id=str(cycle_id), error=str(exc))
-            outreach_avail = bool(self.human_bridge is not None and getattr(self.human_bridge, "enabled", False))
 
             active_investigations: list[dict[str, Any]] = []
             discovered_channels: list[dict[str, Any]] = []
@@ -693,6 +729,7 @@ class AutonomousLoop:
                 discovered_channels=discovered_channels,
                 social_goal_hints=pending_social_hints,
                 brain_research_enabled=bool(self.settings.kernel_v3.brain_research_enabled),
+                interest_portfolio=interest_portfolio_items,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -756,9 +793,24 @@ class AutonomousLoop:
             )
             goal_candidates_audit: list[dict[str, Any]] = []
             if kv3.goal_dedup_enabled and not bool(decision.constraints.get("emergency_mode")):
+                is_curiosity = decision.selected_drive == DriveType.CURIOSITY.value
                 prefer_external = bool(
-                    decision.selected_drive == DriveType.CURIOSITY.value
-                    and (exploration_guidance or {}).get("must_explore_external")
+                    is_curiosity and (exploration_guidance or {}).get("must_explore_external")
+                )
+                must_pivot_domain = bool(
+                    kv3.interest_portfolio_enabled
+                    and is_curiosity
+                    and (exploration_guidance or {}).get("must_pivot_domain")
+                )
+                cooldown_domains = (
+                    list((exploration_guidance or {}).get("cooldown_domains") or [])
+                    if kv3.interest_portfolio_enabled and is_curiosity
+                    else []
+                )
+                cooldown_topic = (
+                    (exploration_guidance or {}).get("cooldown_topic")
+                    if kv3.interest_portfolio_enabled and is_curiosity
+                    else None
                 )
                 sel_res = select_best_goal_candidate(
                     primary=goal_proposal,
@@ -769,6 +821,12 @@ class AutonomousLoop:
                     affect_state=affect_state_snapshot,
                     prefer_external=prefer_external,
                     has_human_guidance=bool(pending_human_guidance),
+                    must_pivot_domain=must_pivot_domain,
+                    cooldown_domains=cooldown_domains,
+                    cooldown_topic=cooldown_topic,
+                    interest_portfolio=(
+                        interest_portfolio_items if kv3.interest_portfolio_enabled and is_curiosity else None
+                    ),
                 )
                 goal_candidates_audit = [c.model_dump(mode="json") for c in sel_res.candidates]
                 dedup_res = sel_res.selected_dedup
@@ -959,6 +1017,25 @@ class AutonomousLoop:
                         expected_outcome_payload["exploration_domain"] = tracked["domain"]
                     except Exception as exc:
                         logger.warning("cycle.exploration_topic_upsert_degraded", error=str(exc))
+
+            if kv3.interest_portfolio_enabled and decision.selected_drive == DriveType.CURIOSITY.value:
+                et_dict = goal_proposal.exploration_topic if isinstance(goal_proposal.exploration_topic, dict) else {}
+                resolved_dom = expected_outcome_payload.get("exploration_domain") or infer_topic_domain(
+                    goal_proposal.title,
+                    goal_proposal.description,
+                    explicit_domain=et_dict.get("domain"),
+                )
+                expected_outcome_payload["exploration_domain"] = resolved_dom
+                if interest_portfolio_items and not expected_outcome_payload.get("interest_portfolio_key"):
+                    matched_ip = match_interest_portfolio_item(
+                        interest_portfolio_items,
+                        title=goal_proposal.title,
+                        description=goal_proposal.description,
+                        related_key=goal_proposal.related_key,
+                        domain=resolved_dom,
+                    )
+                    if matched_ip is not None:
+                        expected_outcome_payload["interest_portfolio_key"] = matched_ip["key"]
 
             # V4.2: Apply multi-hop investigation action or link explicit inv:<key>
             if self.investigation_manager is not None:
@@ -3062,6 +3139,19 @@ class AutonomousLoop:
                     status="active",
                     source="telegram:social",
                 )
+                if (
+                    self.exploration_manager is not None
+                    and self.settings.kernel_v3.interest_portfolio_enabled
+                    and is_substantive_interest_guidance(adopted_hint_clean)
+                ):
+                    await self.exploration_manager.upsert_interest_item(
+                        prompt=adopted_hint_clean[:400],
+                        origin="human_seeded",
+                        priority=0.85,
+                        status="active",
+                        source="telegram:social",
+                        sender=target_sender,
+                    )
             except Exception as exc:
                 logger.warning("cycle.social_goal_hint_store_degraded", cycle_id=str(cycle_id), error=str(exc))
 

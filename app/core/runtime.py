@@ -378,7 +378,10 @@ class OrganismRuntime:
             workspace_root=self.settings.governance.workspace_root,
             allowed_domains=allowed_domains,
             allowed_git_roots=allowed_git_roots,
-            open_public_https=self.settings.kernel_v3.open_public_perception_enabled,
+            open_public_https=bool(
+                self.settings.kernel_v3.open_public_perception_enabled
+                or self.settings.kernel_v3.brain_research_enabled
+            ),
             blocked_hosts=blocked_hosts,
             searxng_url=self.settings.kernel_v3.searxng_url,
         )
@@ -461,6 +464,10 @@ class OrganismRuntime:
         self.exploration_manager = ExplorationManager(
             repo=self.repo,
             max_internal_curiosity_ratio=self.settings.kernel_v3.max_internal_curiosity_ratio,
+            interest_portfolio_enabled=self.settings.kernel_v3.interest_portfolio_enabled,
+            max_same_domain_streak=self.settings.kernel_v3.max_same_domain_streak,
+            max_same_topic_streak=self.settings.kernel_v3.max_same_topic_streak,
+            portfolio_starvation_cycles=self.settings.kernel_v3.portfolio_starvation_cycles,
         )
         if self.settings.kernel_v3.investigations_enabled:
             self.investigation_manager = InvestigationManager(

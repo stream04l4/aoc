@@ -2448,6 +2448,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="llm.timeout_seconds", label="单次推理超时 (s)", description="HTTP 请求超时阈值", effective_value=s.llm.timeout_seconds, yaml_value=_nested_get(settings_yaml, "llm", "timeout_seconds"), default_value=180.0, env_var="AOC_LLM__TIMEOUT_SECONDS"),
                     item(key="llm.max_schema_retries", label="Schema 重试次数", description="JSON/Pydantic 校验失败后的最大重试次数", effective_value=s.llm.max_schema_retries, yaml_value=_nested_get(settings_yaml, "llm", "max_schema_retries"), default_value=2, env_var="AOC_LLM__MAX_SCHEMA_RETRIES"),
                     item(key="kernel_v3.brain_research_enabled", label="大脑原生研究综合开关", description="纯调研/跨界阅读直接由大脑配合 L0 MCP 完成综合，免走 Codex 写脚本", effective_value=s.kernel_v3.brain_research_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "brain_research_enabled"), default_value=False, env_var="AOC_KERNEL_V3__BRAIN_RESEARCH_ENABLED"),
+                    item(key="kernel_v3.interest_portfolio_enabled", label="动态兴趣组合与跨界配额开关", description="启用持久化 interest_portfolio、舒适区/同题疲劳检测与强制跨界探索仲裁", effective_value=s.kernel_v3.interest_portfolio_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "interest_portfolio_enabled"), default_value=False, env_var="AOC_KERNEL_V3__INTEREST_PORTFOLIO_ENABLED"),
                 ],
             },
             {

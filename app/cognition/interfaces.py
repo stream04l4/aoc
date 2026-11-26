@@ -176,6 +176,8 @@ class CognitiveContext(BaseModel):
     social_goal_hints: list[dict[str, Any]] = Field(default_factory=list)
     # V5.2 M1: Feature flag informing CognitionBrain.plan() that brain_research mode is enabled
     brain_research_enabled: bool = False
+    # V5.2 M2: Persistent cross-cycle interest portfolio seeded by creator Joel or exploration
+    interest_portfolio: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 

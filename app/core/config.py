@@ -235,6 +235,11 @@ class KernelV3Settings(BaseModel):
     # V5.2 M1: Brain-Native Research & Synthesis path (bypasses Codex for pure research/synthesis)
     brain_research_enabled: bool = False
     max_brain_research_mcp_calls: int = 4
+    # V5.2 M2: Dynamic Interest Portfolio, cross-domain quotas & topic-fatigue de-weighting
+    interest_portfolio_enabled: bool = False
+    max_same_domain_streak: int = 3
+    max_same_topic_streak: int = 3
+    portfolio_starvation_cycles: int = 6
 
 
 class EvolutionSettings(BaseModel):
