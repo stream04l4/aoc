@@ -187,6 +187,7 @@ class AutonomousLoop:
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
         self._consecutive_dedup_skips: dict[str, int] = {}
+        self._last_draft_cleanup_at: datetime | None = None
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -430,6 +431,7 @@ class AutonomousLoop:
             # ── 4. SELF ASSESSMENT ──────────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="SELF_ASSESSMENT")
             await self._expire_stale_active_goals(now=now, cycle_id=cycle_id)
+            await self._expire_stale_draft_skills(now=now, cycle_id=cycle_id)
             active_goals_for_recall = await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=3)
             recall_query = build_contextual_query(
                 observation=pre_obs,
@@ -730,6 +732,7 @@ class AutonomousLoop:
                 social_goal_hints=pending_social_hints,
                 brain_research_enabled=bool(self.settings.kernel_v3.brain_research_enabled),
                 interest_portfolio=interest_portfolio_items,
+                explicit_skill_refactor_enabled=bool(self.settings.kernel_v3.explicit_skill_refactor_enabled),
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -1105,6 +1108,8 @@ class AutonomousLoop:
                 healthy_agents = self.registry.list_healthy()
                 fallback_agent = healthy_agents[0].agent_id if healthy_agents else "codex"
                 plan = plan.model_copy(update={"execution_mode": "codex", "assigned_agent": fallback_agent})
+            if not kv3.explicit_skill_refactor_enabled and plan.skill_refactor_target is not None:
+                plan = plan.model_copy(update={"skill_refactor_target": None})
             is_brain_research = bool(kv3.brain_research_enabled) and plan_wants_brain
             verdict = await self.governance.validate_plan(plan, decision.selected_drive)
             plan_hash = compute_plan_hash(plan)
@@ -1315,6 +1320,10 @@ class AutonomousLoop:
                     state_changes["brain_research"] = br_summary
 
             if task_state is None:
+                if str(plan.assigned_agent or "").strip().lower() == "skill_runtime":
+                    healthy_agents = self.registry.list_healthy()
+                    fallback_agent = healthy_agents[0].agent_id if healthy_agents else "codex"
+                    plan = plan.model_copy(update={"execution_mode": "codex", "assigned_agent": fallback_agent})
                 retry_backoff_mult = float(
                     ((decision.constraints or {}).get("affect_modulation") or {}).get("retry_backoff_multiplier", 1.0) or 1.0
                 )
@@ -2417,6 +2426,23 @@ class AutonomousLoop:
             return expired
         except Exception as exc:
             logger.warning("loop.stale_active_goal_expire_degraded", cycle_id=str(cycle_id), error=str(exc))
+            return 0
+
+    async def _expire_stale_draft_skills(self, *, now: datetime, cycle_id: uuid.UUID) -> int:
+        """Periodically deprecate stale unvalidated DRAFT skills (throttled to <= once per 60 minutes)."""
+        if self.skill_registry is None or not hasattr(self.skill_registry, "expire_stale_draft_skills"):
+            return 0
+        if self._last_draft_cleanup_at is not None and (now - self._last_draft_cleanup_at).total_seconds() < 3600.0:
+            return 0
+        self._last_draft_cleanup_at = now
+        try:
+            res = await self.skill_registry.expire_stale_draft_skills(
+                expiry_hours=self.settings.kernel_v3.draft_skill_expiry_hours,
+                now=now,
+            )
+            return int((res or {}).get("expired_count") or 0)
+        except Exception as exc:
+            logger.warning("loop.stale_draft_skills_expire_degraded", cycle_id=str(cycle_id), error=str(exc))
             return 0
 
     @staticmethod

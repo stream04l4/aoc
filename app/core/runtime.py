@@ -425,7 +425,13 @@ class OrganismRuntime:
             repo=self.repo,
             governance=self.governance,
             config=sm_cfg,
+            explicit_skill_refactor_enabled=self.settings.kernel_v3.explicit_skill_refactor_enabled,
         )
+        if self.orchestrator is not None:
+            self.orchestrator.skill_registry = self.skill_registry
+            self.orchestrator.explicit_skill_refactor_enabled = bool(
+                self.settings.kernel_v3.explicit_skill_refactor_enabled
+            )
         self.self_model = SelfModelManager(
             organism_id=self.organism_id,
             repo=self.repo,

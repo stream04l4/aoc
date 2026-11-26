@@ -240,6 +240,9 @@ class KernelV3Settings(BaseModel):
     max_same_domain_streak: int = 3
     max_same_topic_streak: int = 3
     portfolio_starvation_cycles: int = 6
+    # V5.2 M3: Explicit directed skill refactoring, skill_first routing enrichment & stale DRAFT expiry
+    explicit_skill_refactor_enabled: bool = False
+    draft_skill_expiry_hours: int = 48
 
 
 class EvolutionSettings(BaseModel):

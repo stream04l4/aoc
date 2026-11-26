@@ -101,3 +101,5 @@ kernel_v3:
   max_same_domain_streak: 3         # force pivot after N consecutive curiosity goals in same domain/comfort zone
   max_same_topic_streak: 3          # force pivot after N consecutive curiosity goals in same normalized topic bucket
   portfolio_starvation_cycles: 6    # flag human_seeded interest starved after N untouched curiosity cycles
+  explicit_skill_refactor_enabled: false # V5.2 M3: Block blind duplicate evolution; require explicit skill_refactor_target staging
+  draft_skill_expiry_hours: 48      # Auto-deprecate unvalidated DRAFT skills older than N hours

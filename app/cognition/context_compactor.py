@@ -89,6 +89,8 @@ def rank_and_compact_skills(
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     out: list[dict[str, Any]] = []
     for _, _, sk in scored[: max(1, int(top_k))]:
+        in_schema = sk.get("input_schema") if isinstance(sk.get("input_schema"), dict) else {}
+        out_schema = sk.get("output_schema") if isinstance(sk.get("output_schema"), dict) else {}
         compact: dict[str, Any] = {
             "skill_key": sk.get("skill_key"),
             "canonical_name": sk.get("canonical_name") or sk.get("skill_key"),
@@ -96,11 +98,26 @@ def rank_and_compact_skills(
             "capability_key": sk.get("capability_key") or "coding",
             "permission_level": sk.get("permission_level") or "L1",
             "description": _trim_text(sk.get("description"), max_desc_chars),
+            "reuse_count": int(sk.get("reuse_count") or 0),
         }
-        if sk.get("input_schema"):
-            compact["input_schema"] = sk["input_schema"]
-        if sk.get("reuse_count"):
-            compact["reuse_count"] = int(sk["reuse_count"])
+        if in_schema:
+            compact["input_schema"] = in_schema
+        if out_schema:
+            compact["output_schema"] = out_schema
+        target_ref = str(compact["canonical_name"] or compact["skill_key"] or "").strip()
+        props = in_schema.get("properties") if isinstance(in_schema.get("properties"), dict) else {}
+        if props:
+            param_preview = ", ".join(f"{k!r}: ..." for k in list(props.keys())[:4])
+            hint_raw = (
+                f"execution_mode='skill_first', skill_invocation={{'skill_key': '{target_ref}', "
+                f"'input_data': {{{param_preview}}}}}"
+            )
+        else:
+            hint_raw = (
+                f"execution_mode='skill_first', skill_invocation={{'skill_key': '{target_ref}', "
+                "'input_data': {}}}"
+            )
+        compact["invocation_hint"] = _trim_text(hint_raw, 180)
         out.append(compact)
     return out
 

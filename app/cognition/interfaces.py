@@ -116,6 +116,8 @@ class ActionPlan(BaseModel):
     mcp_prefetch_calls: list[dict[str, Any]] = Field(default_factory=list)
     # V4.0 M1: optional Skill-first direct invocation ({skill_key, version?, input_data}) bypassing Codex
     skill_invocation: dict[str, Any] | None = None
+    # V5.2 M3: optional explicit directed skill refactoring target ({skill_key, canonical_name?, skill_id?, reason?, target_generalization?})
+    skill_refactor_target: dict[str, Any] | None = None
     # Advisory prediction ONLY — never directly updates drive satisfaction (task book 9.1)
     expected_improvement: float = 0.0
     rationale: str = ""
@@ -178,6 +180,8 @@ class CognitiveContext(BaseModel):
     brain_research_enabled: bool = False
     # V5.2 M2: Persistent cross-cycle interest portfolio seeded by creator Joel or exploration
     interest_portfolio: list[dict[str, Any]] = Field(default_factory=list)
+    # V5.2 M3: Feature flag informing CognitionBrain.plan() that explicit skill refactoring staging is enabled
+    explicit_skill_refactor_enabled: bool = False
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 

@@ -714,6 +714,15 @@ class TaskFinalizer:
                         if effective_cap_key and effective_cap_key != "general_task"
                         else (task_row.get("required_capability") or "coding")
                     )
+                    res_budget = (
+                        task_row.get("resource_budget")
+                        if isinstance(task_row.get("resource_budget"), dict)
+                        else {}
+                    )
+                    refactor_target = res_budget.get("skill_refactor_target")
+                    if not isinstance(refactor_target, dict):
+                        exp_ref = (goal_dict.get("expected_outcome") or {}).get("skill_refactor_target")
+                        refactor_target = exp_ref if isinstance(exp_ref, dict) else None
                     skill_crystallized = await self.skill_registry.crystallize_from_workspace(
                         workspace=str(task_row["workspace"]),
                         skill_key=str(raw_skey),
@@ -722,6 +731,7 @@ class TaskFinalizer:
                         permission_level=str(task_row.get("permission_level") or "L1"),
                         source_task_id=task_uuid,
                         source_execution_id=exec_uuid,
+                        skill_refactor_target=refactor_target if isinstance(refactor_target, dict) else None,
                     )
                     if skill_crystallized is not None:
                         updated_outcome["skill_crystallized"] = skill_crystallized

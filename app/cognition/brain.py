@@ -257,19 +257,34 @@ class CognitionBrain(BrainInterface):
             if context.brain_research_enabled
             else ""
         )
+        explicit_refactor_rule = (
+            "\n- EXPLICIT SKILL REFACTORING MODE (`skill_refactor_target`): If the goal explicitly requests fixing, "
+            "generalizing, adding edge-case/schema support to, or upgrading an existing skill listed in `validated_skills`, "
+            "set execution_mode='codex', assigned_agent='codex', permission_level='L1', AND set "
+            "`skill_refactor_target={'skill_key': '<skill_key>', 'canonical_name': '<canonical_name>', "
+            "'reason': '<concise reason>', 'target_generalization': '<desired backward-compatible upgrade>'}` so the kernel "
+            "stages `./.aoc_base_skill/` (`skill.py` + `test_skill.py`) before Codex starts. For unrelated exploratory "
+            "tasks, NEVER overwrite existing skills blindly."
+            if context.explicit_skill_refactor_enabled
+            else ""
+        )
         system_prompt = (
             "You are the action planner of AOC. Turn the proposed goal into ONE bounded, "
             "verifiable task for an available external AI agent. "
             "Rules:\n"
             "- Pick assigned_agent strictly from available_agents (prefer enabled & healthy agents"
             + (", or `brain_research` when using execution_mode='brain_research'" if context.brain_research_enabled else "")
+            + ", or `skill_runtime` when using execution_mode='skill_first'"
             + ").\n"
             "- Use the minimum permission_level needed: L0 (STRICTLY read-only: NEVER ask to write/create/save "
             "files or use file_exists verification under L0!) or L1 (workspace-write: use L1 whenever the task "
             "writes result.md, skill.py, tests, or any file inside the isolated workspace). NEVER request L3.\n"
-            "- SKILL-FIRST RULE: Before dispatching Codex to write a new script, inspect validated_skills; "
-            "if an existing validated skill matches the goal, set skill_invocation={skill_key, input_data} "
-            "(matching its input_schema) so AOC executes it directly via SkillRuntime (zero Codex tokens!). "
+            "- SKILL-FIRST RULE (PREFERRED WHEN MATCHED): Before dispatching Codex to write a new script, inspect "
+            "`validated_skills` (`description`, `input_schema`, `output_schema`, `invocation_hint`, `reuse_count`). "
+            "If an existing validated skill matches or covers the task, set execution_mode='skill_first', "
+            "assigned_agent='skill_runtime', permission_level='L0' (or the skill's permission_level), and set "
+            "`skill_invocation={'skill_key': '<canonical_name or skill_key>', 'input_data': {...}}` strictly matching "
+            "its `input_schema` (follow `invocation_hint`) so AOC executes it directly via SkillRuntime (zero Codex tokens!). "
             "Only dispatch Codex to write code when no existing validated skill covers the task.\n"
             "- Apply relevant proven tips from external_playbooks (versioned external strategy guides), "
             "without ever violating Governance or L0-L2 permission boundaries.\n"
@@ -288,6 +303,7 @@ class CognitionBrain(BrainInterface):
             "- Keep timeout_seconds realistic (180-500s; use 420-500s for coding/test or multi-source synthesis tasks) and within budget.\n"
             "- Never delegate open-ended infinite exploration."
             + brain_research_rule
+            + explicit_refactor_rule
         )
         plan_query = " ".join(
             [
@@ -315,12 +331,14 @@ class CognitionBrain(BrainInterface):
             "assessment": context.assessment.model_dump(mode="json") if context.assessment else None,
             "available_agents": context.available_agents,
             "available_tools": context.available_tools[:12],
-            "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=plan_query, top_k=5),
+            "validated_skills": rank_and_compact_skills(context.validated_skills, query_text=plan_query, top_k=6),
             "budget_remaining": context.budget_remaining,
             "memories": compact_memories(context.memories, max_items=5, max_summary_chars=220),
         }
         if context.brain_research_enabled:
             payload["brain_research_enabled"] = True
+        if context.explicit_skill_refactor_enabled:
+            payload["explicit_skill_refactor_enabled"] = True
         return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
