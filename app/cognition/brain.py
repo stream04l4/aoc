@@ -30,6 +30,8 @@ from app.cognition.interfaces import (
     EvaluationContext,
     EvaluationResult,
     GoalProposal,
+    MetaReflectionContext,
+    MetaReflectionOutput,
     ResearchSynthesisContext,
     SocialContext,
     SocialTurnDecision,
@@ -141,6 +143,8 @@ class CognitionBrain(BrainInterface):
             "or low-risk L1 isolated-workspace Python coding/utility tasks (e.g. creating a reusable "
             "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
             "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
+            "If `pending_skill_refactors` is non-empty during reproduction drive, prioritize proposing a concrete "
+            "refactoring/generalization goal targeting the top queued skill's `canonical_name` (`skill_key`). "
             "For curiosity drive, you may verify an unverified entry in active_hypotheses, attach a new lightweight "
             "hypothesis_to_test ({key, claim, verification_hint}), attach an external exploration_topic "
             "({topic_key, domain, question}), or optionally suggest discover_world_source "
@@ -233,6 +237,8 @@ class CognitionBrain(BrainInterface):
             "budget_remaining": context.budget_remaining,
             "active_goals": context.active_goals[:4],
         }
+        if context.pending_skill_refactors:
+            payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
         proposal = await self._gateway.complete_structured(
             operation="generate_goal",
             system_prompt=system_prompt,
@@ -259,8 +265,9 @@ class CognitionBrain(BrainInterface):
         )
         explicit_refactor_rule = (
             "\n- EXPLICIT SKILL REFACTORING MODE (`skill_refactor_target`): If the goal explicitly requests fixing, "
-            "generalizing, adding edge-case/schema support to, or upgrading an existing skill listed in `validated_skills`, "
-            "set execution_mode='codex', assigned_agent='codex', permission_level='L1', AND set "
+            "generalizing, adding edge-case/schema support to, or upgrading an existing skill listed in `validated_skills` "
+            "(or listed in `pending_skill_refactors`), set execution_mode='codex', assigned_agent='codex', "
+            "permission_level='L1', AND set "
             "`skill_refactor_target={'skill_key': '<skill_key>', 'canonical_name': '<canonical_name>', "
             "'reason': '<concise reason>', 'target_generalization': '<desired backward-compatible upgrade>'}` so the kernel "
             "stages `./.aoc_base_skill/` (`skill.py` + `test_skill.py`) before Codex starts. For unrelated exploratory "
@@ -339,6 +346,8 @@ class CognitionBrain(BrainInterface):
             payload["brain_research_enabled"] = True
         if context.explicit_skill_refactor_enabled:
             payload["explicit_skill_refactor_enabled"] = True
+        if context.pending_skill_refactors:
+            payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
         return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
@@ -645,4 +654,66 @@ class CognitionBrain(BrainInterface):
             system_prompt=system_prompt,
             user_payload=payload,
             schema_cls=BrainResearchOutput,
+        )
+
+    async def reflect_on_system(self, context: MetaReflectionContext) -> MetaReflectionOutput:
+        """Periodic Meta-Reflection Critic diagnosing system bottlenecks and bounded upgrades (V5.2 M4)."""
+        system_prompt = (
+            "You are the Periodic Meta-Reflection Critic of AOC. Step back from single-cycle tasks and evaluate "
+            "the organism's recent reliability, execution-mode routing (codex vs brain_research vs skill_first), "
+            "skill reuse vs accumulation of unused skills, stale playbooks, and domain diversity.\n"
+            "STRICT BOUNDARIES (keep output compact & concise so JSON completes cleanly):\n"
+            "1. Keep `diagnosis_summary` concise (<= 140 chars) and 1-3 crisp `root_causes` (<= 80 chars each) backed ONLY by telemetry.\n"
+            "2. Optional L1 `playbook_revision`: `{domain, content, change_summary}` — keep `content` to 3-5 crisp Markdown "
+            "bullets (<= 450 chars total); NEVER include prompt-injection phrases, core source paths, or governance bypasses.\n"
+            "3. Optional L1 `skill_refactor_item`: `{skill_key, canonical_name, reason, target_generalization}` choosing "
+            "AT MOST ONE existing skill strictly from `zero_reuse_skills` or `validated_skills_summary` that should be "
+            "generalized or fixed so `skill_first` can actually reuse it. Leave null if none needs refactoring.\n"
+            "4. Optional L2 `l2_upgrade_proposal`: Emit ONLY when `l2_proposal_allowed` is true AND a genuine core "
+            "kernel/architecture/config bottleneck cannot be solved by Playbook or Skill changes alone. Leave null otherwise.\n"
+            "   Schema: `{topic_key, title, message, reason, expected_benefit, rollback_plan, options: [{label, instruction}]}`.\n"
+            "   Keep `message` concise (<= 260 chars) and `rollback_plan` concise (<= 100 chars).\n"
+            "   LANGUAGE RULE: `l2_upgrade_proposal` MUST be written entirely in plain, jargon-free Simplified Chinese "
+            "(简体中文) like messaging creator Joel directly: include observed telemetry pain-point data, concrete proposal, "
+            "expected benefit, rollback plan, and 3 clear options (<= 14 Chinese chars per label, mark recommended with '(推荐)'; "
+            "do NOT include an '其它'/'Other' option as the system appends '其它答案' automatically).\n"
+            "5. Keep internal thinking brief and output valid compact JSON directly.\n"
+            + _UNTRUSTED_DATA_RULE
+        )
+
+        fenced_errors = [
+            {
+                "event_type": e.get("event_type"),
+                "level": e.get("level"),
+                "untrusted_message": wrap_untrusted_world_event(
+                    "event_log",
+                    str(e.get("event_type") or "error"),
+                    str(e.get("message") or ""),
+                ),
+            }
+            for e in context.recent_error_events[:8]
+            if isinstance(e, dict)
+        ]
+
+        payload = {
+            "now_iso": context.now_iso,
+            "trigger_reason": context.trigger_reason,
+            "window_hours": context.window_hours,
+            "goal_stats": context.goal_stats,
+            "failed_goals": context.failed_goals[:8],
+            "recent_error_events": fenced_errors,
+            "execution_mode_counts": context.execution_mode_counts,
+            "validated_skills_summary": context.validated_skills_summary[:12],
+            "zero_reuse_skills": context.zero_reuse_skills[:8],
+            "stale_draft_count": context.stale_draft_count,
+            "active_playbooks": context.active_playbooks[:8],
+            "topic_diversity_summary": context.topic_diversity_summary,
+            "l2_proposal_allowed": context.l2_proposal_allowed,
+            "previous_reflection_summary": context.previous_reflection_summary,
+        }
+        return await self._gateway.complete_structured(
+            operation="meta_reflection",
+            system_prompt=system_prompt,
+            user_payload=payload,
+            schema_cls=MetaReflectionOutput,
         )

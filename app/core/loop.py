@@ -65,7 +65,7 @@ from app.core.enums import (
 )
 from app.core.lifecycle import LifecycleManager
 from app.drives.engine import DriveEngine
-from app.drives.interfaces import DriveContext, DriveDecision, DriveState, KnowledgeGap
+from app.drives.interfaces import DriveContext, DriveDecision, DriveState, KnowledgeGap, clamp01
 from app.governance.interfaces import GovernanceInterface
 from app.memory.experience_manager import ExperienceManager
 from app.memory.interfaces import MemoryItem
@@ -155,6 +155,7 @@ class AutonomousLoop:
         entropy_sensor: Any = None,
         culling_gc: Any = None,
         telegram_notifier: Any = None,
+        meta_reflection_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -183,6 +184,7 @@ class AutonomousLoop:
         self.entropy_sensor = entropy_sensor
         self.culling_gc = culling_gc
         self.telegram_notifier = telegram_notifier
+        self.meta_reflection_manager = meta_reflection_manager
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -230,6 +232,7 @@ class AutonomousLoop:
             human_bridge=human_bridge,
             investigation_manager=investigation_manager,
             world_pipeline=world_pipeline,
+            meta_reflection_manager=meta_reflection_manager,
         )
         if hasattr(self.finalizer, "register_hook"):
             existing_hooks = getattr(self.finalizer, "_hooks", ())
@@ -466,6 +469,20 @@ class AutonomousLoop:
                     anomalies=["llm_unavailable"],
                     confidence=0.3,
                 )
+
+            # ── 4b. RULE-GATED PERIODIC META-REFLECTION CRITIC (V5.2 M4) ────
+            if (
+                self.meta_reflection_manager is not None
+                and self.settings.kernel_v3.meta_reflection_enabled
+                and llm_available_for_brain
+                and not emergency_llm
+            ):
+                try:
+                    meta_res = await self.meta_reflection_manager.run_if_due(now=now, cycle_id=cycle_id)
+                    if isinstance(meta_res, dict) and meta_res.get("triggered"):
+                        state_changes["meta_reflection"] = meta_res
+                except Exception as exc:
+                    logger.warning("cycle.meta_reflection_degraded", cycle_id=str(cycle_id), error=str(exc))
 
             # ── 5. DRIVE SATISFACTION CALCULATION ───────────────────────────
             await self.repo.update_cycle(cycle_id, phase="DRIVE_SATISFACTION_CALCULATION")
@@ -708,6 +725,23 @@ class AutonomousLoop:
                 except Exception as exc:
                     logger.warning("cycle.social_goal_hints_load_degraded", cycle_id=str(cycle_id), error=str(exc))
 
+            pending_skill_refactors: list[dict[str, Any]] = []
+            if kv3.meta_reflection_enabled or kv3.explicit_skill_refactor_enabled:
+                try:
+                    if self.meta_reflection_manager is not None and hasattr(
+                        self.meta_reflection_manager, "list_pending_skill_refactors"
+                    ):
+                        pending_skill_refactors = await self.meta_reflection_manager.list_pending_skill_refactors(limit=3)
+                    else:
+                        q_items = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
+                        pending_skill_refactors = [
+                            dict(it["value"])
+                            for it in q_items[:3]
+                            if isinstance(it.get("value"), dict)
+                        ]
+                except Exception as exc:
+                    logger.warning("cycle.skill_refactors_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -733,6 +767,7 @@ class AutonomousLoop:
                 brain_research_enabled=bool(self.settings.kernel_v3.brain_research_enabled),
                 interest_portfolio=interest_portfolio_items,
                 explicit_skill_refactor_enabled=bool(self.settings.kernel_v3.explicit_skill_refactor_enabled),
+                pending_skill_refactors=pending_skill_refactors,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -1517,6 +1552,56 @@ class AutonomousLoop:
             except Exception as exc:
                 logger.warning("cycle.entropy_sensor_degraded", error=str(exc))
 
+        quality_enabled = bool(self.settings.kernel_v3.reproduction_quality_scoring_enabled)
+        skill_reuse_ratio_recent: float | None = None
+        execution_reliability_recent: float | None = None
+        playbook_freshness_score: float | None = None
+        pending_skill_refactor_count = 0
+        if quality_enabled:
+            try:
+                val_skills = await self.repo.list_skills(status="VALIDATED", limit=200)
+                if val_skills:
+                    reused_cnt = sum(1 for sk in val_skills if int(sk.get("reuse_count") or 0) > 0)
+                    recent_invs = await self.repo.list_skill_invocations(limit=100)
+                    cross_recent = sum(
+                        1
+                        for iv in recent_invs
+                        if iv.get("is_cross_task_reuse")
+                        and iv.get("passed")
+                        and (self._parse_social_dt(iv.get("created_at")) or since_7d) >= since_7d
+                    )
+                    base_ratio = reused_cnt / len(val_skills)
+                    recent_ratio = cross_recent / len(val_skills)
+                    skill_reuse_ratio_recent = clamp01(max(base_ratio, min(1.0, recent_ratio)))
+
+                term_statuses = [
+                    st for st in recent_statuses if st in {"SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED"}
+                ]
+                if term_statuses:
+                    execution_reliability_recent = clamp01(
+                        sum(1 for st in term_statuses if st == "SUCCEEDED") / len(term_statuses)
+                    )
+
+                pb_rows = await self.repo.list_world_items(kind="external_playbook")
+                now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+                pb_dates = [
+                    self._parse_social_dt((r.get("value") or {}).get("updated_at"))
+                    or self._parse_social_dt(r.get("updated_at"))
+                    for r in pb_rows
+                ]
+                pb_dates = [d for d in pb_dates if d is not None]
+                if pb_dates:
+                    newest_pb = max(pb_dates)
+                    age_days = max(0.0, (now_utc - newest_pb).total_seconds() / 86400.0)
+                    playbook_freshness_score = clamp01(1.0 - age_days / 14.0)
+                else:
+                    playbook_freshness_score = 0.15
+
+                refactor_rows = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
+                pending_skill_refactor_count = len(refactor_rows)
+            except Exception as exc:
+                logger.warning("cycle.reproduction_quality_telemetry_degraded", error=str(exc))
+
         return DriveContext(
             now=now,
             observation=obs,
@@ -1536,6 +1621,11 @@ class AutonomousLoop:
             memory_available=self.memory.backend_available,
             identity_persisted=True,
             knowledge_transfer_readiness=1.0 if sem_recent > 0 else 0.5,
+            reproduction_quality_scoring_enabled=quality_enabled,
+            skill_reuse_ratio_recent=skill_reuse_ratio_recent,
+            execution_reliability_recent=execution_reliability_recent,
+            playbook_freshness_score=playbook_freshness_score,
+            pending_skill_refactor_count=pending_skill_refactor_count,
             open_knowledge_gaps=list(gaps_by_topic.values()),
             unknown_topics=env_topics,
             exploration_attempted_recent=cur_done + cur_failed,

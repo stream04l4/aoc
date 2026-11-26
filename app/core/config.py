@@ -243,6 +243,12 @@ class KernelV3Settings(BaseModel):
     # V5.2 M3: Explicit directed skill refactoring, skill_first routing enrichment & stale DRAFT expiry
     explicit_skill_refactor_enabled: bool = False
     draft_skill_expiry_hours: int = 48
+    # V5.2 M4: Unfreeze reproduction quality drive, periodic meta-reflection critic & self-evolution observability
+    reproduction_quality_scoring_enabled: bool = False
+    meta_reflection_enabled: bool = False
+    meta_reflection_interval_hours: int = 12
+    meta_reflection_failure_threshold: int = 5
+    meta_reflection_l2_cooldown_hours: int = 24
 
 
 class EvolutionSettings(BaseModel):

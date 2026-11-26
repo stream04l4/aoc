@@ -146,6 +146,7 @@ class TaskFinalizer:
         human_bridge: Any = None,
         investigation_manager: Any = None,
         world_pipeline: Any = None,
+        meta_reflection_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -168,6 +169,7 @@ class TaskFinalizer:
         self.human_bridge = human_bridge
         self.investigation_manager = investigation_manager
         self.world_pipeline = world_pipeline
+        self.meta_reflection_manager = meta_reflection_manager
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -736,6 +738,43 @@ class TaskFinalizer:
                     if skill_crystallized is not None:
                         updated_outcome["skill_crystallized"] = skill_crystallized
                         await self.repo.update_task(task_uuid, outcome=updated_outcome)
+                        if skill_crystallized.get("status") == "VALIDATED" and (
+                            isinstance(refactor_target, dict) or skill_crystallized.get("evolved")
+                        ):
+                            c_target = str(
+                                (refactor_target or {}).get("canonical_name")
+                                or (refactor_target or {}).get("skill_key")
+                                or skill_crystallized.get("canonical_name")
+                                or skill_crystallized.get("skill_key")
+                                or ""
+                            ).strip()
+                            if c_target:
+                                if self.meta_reflection_manager is not None and hasattr(
+                                    self.meta_reflection_manager, "mark_skill_refactor_consumed"
+                                ):
+                                    await self.meta_reflection_manager.mark_skill_refactor_consumed(
+                                        c_target, execution_id=exec_key
+                                    )
+                                else:
+                                    q_rows = await self.repo.list_world_items(
+                                        kind="skill_refactor_queue", status="open"
+                                    )
+                                    for qr in q_rows:
+                                        qv = dict(qr.get("value") or {}) if isinstance(qr.get("value"), dict) else {}
+                                        if (
+                                            qr.get("key") == f"refactor:{c_target}"
+                                            or qv.get("skill_key") == c_target
+                                            or qv.get("canonical_name") == c_target
+                                        ):
+                                            qv["consumed_at"] = utcnow().isoformat()
+                                            qv["consumed_execution_id"] = exec_key
+                                            await self.repo.upsert_world_item(
+                                                kind="skill_refactor_queue",
+                                                key=str(qr["key"]),
+                                                value=qv,
+                                                status="completed",
+                                                source="skill_refactor_consumed",
+                                            )
                 except Exception as exc:
                     logger.warning("finalizer.skill_crystallize_degraded", execution_id=exec_key, error=str(exc))
 

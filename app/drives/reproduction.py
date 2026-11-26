@@ -96,6 +96,53 @@ class ReproductionDriveEvaluator(DriveEvaluator):
                 "expansion_readiness": 0.15,
             },
         )
+        base_u = float(self.cfg.get("base_urgency", 0.1))
+        u_gain = float(self.cfg.get("urgency_deficit_gain", 0.5))
+        urgency_boost = 0.0
+
+        if ctx.reproduction_quality_scoring_enabled:
+            eff_cnt = int(effective_skill_count or 0)
+            reuse_q = (
+                clamp01(ctx.skill_reuse_ratio_recent)
+                if ctx.skill_reuse_ratio_recent is not None
+                else (0.0 if eff_cnt >= 3 else 0.5)
+            )
+            rel_q = (
+                clamp01((float(ctx.execution_reliability_recent) - 0.60) / 0.40)
+                if ctx.execution_reliability_recent is not None
+                else 1.0
+            )
+            pb_q = (
+                clamp01(ctx.playbook_freshness_score)
+                if ctx.playbook_freshness_score is not None
+                else 0.25
+            )
+            dimensions["skill_reuse_quality"] = reuse_q
+            dimensions["execution_reliability"] = rel_q
+            dimensions["playbook_freshness"] = pb_q
+            weights = self.cfg.get(
+                "quality_dimension_weights",
+                {
+                    "capability_coverage": 0.03,
+                    "reusable_skills": 0.06,
+                    "capability_goals": 0.04,
+                    "resource_reserve": 0.03,
+                    "expansion_readiness": 0.02,
+                    "skill_reuse_quality": 0.45,
+                    "execution_reliability": 0.25,
+                    "playbook_freshness": 0.12,
+                },
+            )
+            if eff_cnt >= 3 and reuse_q < 0.20:
+                urgency_boost += 0.30 * clamp01((0.20 - reuse_q) / 0.20)
+                notes.append(f"low skill reuse quality ({reuse_q:.2f}) across {eff_cnt} validated skills")
+            if int(ctx.pending_skill_refactor_count or 0) > 0:
+                urgency_boost += 0.18
+                notes.append(f"pending skill refactors: {int(ctx.pending_skill_refactor_count)}")
+            if ctx.execution_reliability_recent is not None and float(ctx.execution_reliability_recent) < 0.92:
+                urgency_boost += 0.14
+                notes.append(f"execution reliability below target ({float(ctx.execution_reliability_recent):.2f})")
+
         satisfaction, data_conf, w_notes = weighted_dimensions(
             dimensions, weights, default_when_all_missing=0.40
         )
@@ -103,9 +150,7 @@ class ReproductionDriveEvaluator(DriveEvaluator):
         confidence = clamp01(data_conf * max(0.2, obs.confidence)) if data_conf > 0 else 0.0
 
         deficit = 1.0 - satisfaction
-        base_u = float(self.cfg.get("base_urgency", 0.1))
-        u_gain = float(self.cfg.get("urgency_deficit_gain", 0.5))
-        urgency = clamp01(base_u + u_gain * deficit)
+        urgency = clamp01(base_u + u_gain * deficit + urgency_boost)
 
         return DriveEvaluation(
             drive_type=self.drive_type,

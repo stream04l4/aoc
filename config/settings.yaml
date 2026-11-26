@@ -103,3 +103,8 @@ kernel_v3:
   portfolio_starvation_cycles: 6    # flag human_seeded interest starved after N untouched curiosity cycles
   explicit_skill_refactor_enabled: false # V5.2 M3: Block blind duplicate evolution; require explicit skill_refactor_target staging
   draft_skill_expiry_hours: 48      # Auto-deprecate unvalidated DRAFT skills older than N hours
+  reproduction_quality_scoring_enabled: false # V5.2 M4: Unfreeze reproduction drive with skill reuse, execution reliability & playbook freshness
+  meta_reflection_enabled: false    # V5.2 M4: Rule-triggered periodic self-diagnosis & L1/L2 upgrade proposals
+  meta_reflection_interval_hours: 12
+  meta_reflection_failure_threshold: 5
+  meta_reflection_l2_cooldown_hours: 24
