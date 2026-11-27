@@ -79,6 +79,81 @@ EVOLVABLE_ALLOWLIST: frozenset[str] = frozenset(
     }
 )
 
+WIDE_OPEN_LOCKED_FILES: tuple[str, ...] = (
+    "app/api/auth.py",
+    "app/core/lifecycle.py",
+)
+
+FORBIDDEN_SECRET_YAML_KEYS: frozenset[str] = frozenset(
+    {
+        "admin_key",
+        "api_key",
+        "bot_token",
+        "webhook_secret",
+        "internal_token",
+        "auth_enabled",
+        "secret",
+        "password",
+    }
+)
+
+_WIDE_OPEN_LOCKED_DIRS: frozenset[str] = frozenset({".git", ".ssh", ".venv", ".cache", "backups"})
+_WIDE_OPEN_SECRET_EXACT_NAMES: frozenset[str] = frozenset({".env", ".git-credentials", "auth.json"})
+_WIDE_OPEN_PY_DANGER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"auth_enabled\s*=\s*False\b"), "auth_disable_forbidden"),
+    (re.compile(r"""(?:open|Path)\([^)]*['"]\.env(?:\.[^'"]+)?['"]"""), "env_secret_file_access_forbidden"),
+)
+
+
+def _strip_rel_prefix(raw_path: str) -> str:
+    text = str(raw_path or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def is_hard_locked_path(raw_path: str) -> tuple[bool, str]:
+    """Return (locked, reason) for paths that can NEVER be edited even in wide_open mode."""
+    text = str(raw_path or "").strip()
+    if not text:
+        return True, "empty_path"
+    if text.startswith("/") or "\\" in text:
+        return True, "unsafe_path_syntax"
+    cleaned = _strip_rel_prefix(text)
+    parts = [p for p in cleaned.split("/") if p]
+    if not parts or ".." in parts:
+        return True, "path_traversal_forbidden"
+    norm = "/".join(parts)
+    if norm in WIDE_OPEN_LOCKED_FILES:
+        return True, f"hard_locked_file_forbidden:{norm}"
+    if parts[0] in _WIDE_OPEN_LOCKED_DIRS:
+        return True, f"locked_directory_forbidden:{parts[0]}"
+    base = parts[-1].lower()
+    if (
+        base in _WIDE_OPEN_SECRET_EXACT_NAMES
+        or base.startswith(".env.")
+        or base.startswith("id_rsa")
+        or base.endswith(".pem")
+        or base.endswith(".key")
+    ):
+        return True, f"secret_credential_file_forbidden:{norm}"
+    return False, ""
+
+
+def _scan_yaml_forbidden_keys(obj: Any, prefix: str = "") -> list[str]:
+    violations: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).strip().lower()
+            full = f"{prefix}.{kl}" if prefix else kl
+            if kl in FORBIDDEN_SECRET_YAML_KEYS:
+                violations.append(f"forbidden_secret_yaml_key:{full}")
+            violations.extend(_scan_yaml_forbidden_keys(v, prefix=full))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            violations.extend(_scan_yaml_forbidden_keys(item, prefix=f"{prefix}[{idx}]"))
+    return violations
+
 DRIVE_EVOLVABLE_FILES: frozenset[str] = frozenset(
     {
         "app/drives/survival.py",
@@ -225,14 +300,17 @@ def _sha256_file(path: Path) -> str | None:
 
 
 def _normalize_rel_path(raw: str) -> str:
-    cleaned = raw.strip().lstrip("./").replace("\\", "/")
-    if not cleaned or cleaned.startswith("/") or ".." in Path(cleaned).parts:
+    raw_s = raw.strip()
+    if not raw_s or raw_s.startswith("/") or "\\" in raw_s:
+        raise ValueError(f"Unsafe relative path in genome_delta: {raw!r}")
+    cleaned = _strip_rel_prefix(raw_s)
+    if not cleaned or ".." in Path(cleaned).parts:
         raise ValueError(f"Unsafe relative path in genome_delta: {raw!r}")
     return cleaned
 
 
 class ConstitutionGuard:
-    """Four-layer deterministic gatekeeper for V5.0 Stage 1 screening."""
+    """Four-layer deterministic gatekeeper for V5.0 Stage 1 screening (zero production tokens)."""
 
     def __init__(
         self,
@@ -240,21 +318,30 @@ class ConstitutionGuard:
         *,
         max_changed_files: int = 12,
         max_net_loc_delta: int = 800,
+        policy_mode: str = "strict",
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.max_changed_files = max_changed_files
         self.max_net_loc_delta = max_net_loc_delta
+        self.policy_mode = "wide_open" if str(policy_mode or "").strip().lower() == "wide_open" else "strict"
         self.baseline_hashes: dict[str, str] = {}
         for rel in CONSTITUTIONAL_FILES:
             digest = _sha256_file(self.repo_root / rel)
             if digest is not None:
                 self.baseline_hashes[rel] = digest
+        self.wide_open_hashes: dict[str, str] = {}
+        for rel in WIDE_OPEN_LOCKED_FILES:
+            digest = _sha256_file(self.repo_root / rel)
+            if digest is not None:
+                self.wide_open_hashes[rel] = digest
 
     def constitutional_manifest(self) -> dict[str, Any]:
         """Return baseline constitutional SHA-256 hashes and evolvable file allowlist."""
         return {
+            "policy_mode": self.policy_mode,
             "constitutional_file_count": len(self.baseline_hashes),
             "constitutional_files": dict(self.baseline_hashes),
+            "wide_open_locked_files": list(WIDE_OPEN_LOCKED_FILES),
             "evolvable_allowlist": sorted(EVOLVABLE_ALLOWLIST),
             "drive_evolvable_files": sorted(DRIVE_EVOLVABLE_FILES),
             "limits": {
@@ -319,12 +406,18 @@ class ConstitutionGuard:
                 f"too many modified files ({len(changed_files)} > limit {self.max_changed_files})"
             )
 
-        const_set = set(CONSTITUTIONAL_FILES)
-        for rel in changed_files:
-            if rel in const_set:
-                violations.append(f"forbidden constitutional file modification: {rel}")
-            elif rel not in EVOLVABLE_ALLOWLIST:
-                violations.append(f"file outside EVOLVABLE_ALLOWLIST: {rel}")
+        if self.policy_mode == "wide_open":
+            for rel in changed_files:
+                locked, lock_reason = is_hard_locked_path(rel)
+                if locked:
+                    violations.append(lock_reason)
+        else:
+            const_set = set(CONSTITUTIONAL_FILES)
+            for rel in changed_files:
+                if rel in const_set:
+                    violations.append(f"forbidden constitutional file modification: {rel}")
+                elif rel not in EVOLVABLE_ALLOWLIST:
+                    violations.append(f"file outside EVOLVABLE_ALLOWLIST: {rel}")
 
         net_loc_delta = 0
         for rel, new_text in overrides.items():
@@ -339,7 +432,8 @@ class ConstitutionGuard:
 
         if candidate_root is not None:
             cand_root_r = candidate_root.resolve()
-            for rel, expected_hash in self.baseline_hashes.items():
+            hashes_to_check = self.wide_open_hashes if self.policy_mode == "wide_open" else self.baseline_hashes
+            for rel, expected_hash in hashes_to_check.items():
                 actual_hash = _sha256_file(cand_root_r / rel)
                 if actual_hash != expected_hash:
                     violations.append(f"constitutional file hash mismatch in candidate_root: {rel}")
@@ -348,7 +442,7 @@ class ConstitutionGuard:
             layer="layer1_path_and_hash",
             passed=len(violations) == 0,
             violations=violations,
-            details={"changed_files": changed_files, "net_loc_delta": net_loc_delta},
+            details={"changed_files": changed_files, "net_loc_delta": net_loc_delta, "policy_mode": self.policy_mode},
         )
 
     def _check_layer2_ast(
@@ -377,6 +471,11 @@ class ConstitutionGuard:
             except SyntaxError as exc:
                 violations.append(f"syntax error in {rel}: {exc.msg} (line {exc.lineno})")
                 continue
+
+            if self.policy_mode == "wide_open" and not rel.startswith("tests/"):
+                for pat, code in _WIDE_OPEN_PY_DANGER_PATTERNS:
+                    if pat.search(source):
+                        violations.append(f"{code} in {rel}")
 
             if not rel.startswith("app/drives/"):
                 continue
@@ -418,6 +517,26 @@ class ConstitutionGuard:
         candidate_root: Path | None,
     ) -> ConstitutionLayerResult:
         violations: list[str] = []
+        if self.policy_mode == "wide_open":
+            for rel in changed_files:
+                if not rel.endswith((".yaml", ".yml")):
+                    continue
+                yml_raw: str | None = overrides.get(rel)
+                if yml_raw is None:
+                    src_y = (candidate_root or self.repo_root) / rel
+                    if src_y.is_file():
+                        yml_raw = src_y.read_text(encoding="utf-8")
+                if yml_raw is None:
+                    continue
+                try:
+                    parsed_y = yaml.safe_load(yml_raw) or {}
+                    if not isinstance(parsed_y, dict):
+                        violations.append(f"YAML root in {rel} must be a mapping")
+                    else:
+                        violations.extend(_scan_yaml_forbidden_keys(parsed_y))
+                except Exception as exc:
+                    violations.append(f"invalid YAML in {rel}: {exc}")
+
         raw_yaml: str | None = overrides.get("config/drives.yaml")
         if raw_yaml is None:
             src = (candidate_root or self.repo_root) / "config/drives.yaml"
@@ -458,8 +577,9 @@ class ConstitutionGuard:
             shutil.copytree(src_root / "app", tmp_dir / "app", dirs_exist_ok=True)
             shutil.copytree(src_root / "config", tmp_dir / "config", dirs_exist_ok=True)
 
-            # Constitutional files ALWAYS stay anchored to baseline repo_root
-            for rel in CONSTITUTIONAL_FILES:
+            # Locked files ALWAYS stay anchored to baseline repo_root
+            locked_anchor = WIDE_OPEN_LOCKED_FILES if self.policy_mode == "wide_open" else CONSTITUTIONAL_FILES
+            for rel in locked_anchor:
                 base_src = self.repo_root / rel
                 dst = tmp_dir / rel
                 if base_src.is_file() and (tmp_dir / rel.split("/", 1)[0]).exists():
@@ -467,7 +587,11 @@ class ConstitutionGuard:
                     shutil.copy2(base_src, dst)
 
             for rel, content in overrides.items():
-                if rel in CONSTITUTIONAL_FILES or rel not in EVOLVABLE_ALLOWLIST:
+                if self.policy_mode == "wide_open":
+                    locked, _ = is_hard_locked_path(rel)
+                    if locked:
+                        continue
+                elif rel in CONSTITUTIONAL_FILES or rel not in EVOLVABLE_ALLOWLIST:
                     continue
                 target = (tmp_dir / rel).resolve()
                 if tmp_dir.resolve() not in target.parents:

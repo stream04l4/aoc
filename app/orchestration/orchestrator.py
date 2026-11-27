@@ -388,18 +388,33 @@ class AgentOrchestrator:
         plan_id: uuid.UUID | None = None,
         cycle_id: uuid.UUID | None = None,
         retry_backoff_multiplier: float = 1.0,
+        workspace_override: str | None = None,
+        resource_budget_extra: dict[str, Any] | None = None,
+        description_suffix: str = "",
     ) -> dict[str, Any]:
         """Persist a task from an approved ActionPlan and dispatch it asynchronously."""
         task_uuid = uuid.uuid4()
         task_id = str(task_uuid)
-        workspace = self.governance.prepare_workspace(task_id)
+        if workspace_override:
+            ws_root = Path(str(getattr(self.governance, "workspace_root", "/home/ubuntu/aoc-workspaces"))).resolve()
+            ws_cand = Path(str(workspace_override)).resolve()
+            if ws_cand != ws_root and ws_root not in ws_cand.parents:
+                raise PermissionError(f"workspace_override escape blocked: {ws_cand}")
+            ws_cand.mkdir(parents=True, exist_ok=True)
+            workspace = str(ws_cand)
+        else:
+            workspace = self.governance.prepare_workspace(task_id)
         safe_backoff_mult = max(1.0, min(1.15, float(retry_backoff_multiplier or 1.0)))
         res_budget: dict[str, Any] = {
             "sandbox_mode": verdict.sandbox_mode,
             "retry_backoff_multiplier": round(safe_backoff_mult, 4),
         }
+        if isinstance(resource_budget_extra, dict) and resource_budget_extra:
+            res_budget.update(resource_budget_extra)
 
         effective_description = plan.description
+        if description_suffix and description_suffix.strip():
+            effective_description = f"{(effective_description or '').strip()}\n\n{description_suffix.strip()}".strip()
         if (
             self.explicit_skill_refactor_enabled
             and self.skill_registry is not None

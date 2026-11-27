@@ -148,6 +148,7 @@ class TaskFinalizer:
         world_pipeline: Any = None,
         meta_reflection_manager: Any = None,
         reproduction_quality_scoring_enabled: bool = False,
+        self_edit_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -172,6 +173,7 @@ class TaskFinalizer:
         self.world_pipeline = world_pipeline
         self.meta_reflection_manager = meta_reflection_manager
         self.reproduction_quality_scoring_enabled = bool(reproduction_quality_scoring_enabled)
+        self.self_edit_manager = self_edit_manager
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -381,6 +383,50 @@ class TaskFinalizer:
                         "investigation_update": safe_inv_upd,
                     }
                 )
+
+            # V5.4: Autonomous Self-Edit verification, self-approval & evo/auto commit gate
+            res_budget_task = (
+                task_row.get("resource_budget")
+                if isinstance(task_row.get("resource_budget"), dict)
+                else {}
+            )
+            se_meta = res_budget_task.get("self_edit") if isinstance(res_budget_task.get("self_edit"), dict) else None
+            is_self_edit_task = se_meta is not None
+            self_edit_outcome: dict[str, Any] | None = None
+            if is_self_edit_task and self.self_edit_manager is not None:
+                try:
+                    self_edit_outcome = await self.self_edit_manager.review_and_finalize_worktree(
+                        self_edit_meta=se_meta,
+                        execution_succeeded=verification_passed,
+                        execution_summary=str((exec_row.get("result") or {}).get("summary") or eval_res.summary or "")[:600],
+                        cycle_id=cycle_uuid,
+                    )
+                except Exception as exc:
+                    logger.warning("finalizer.self_edit_review_degraded", execution_id=exec_key, error=str(exc))
+                    self_edit_outcome = {
+                        "ok": False,
+                        "committed": False,
+                        "stage": "STAGE1_FAILED",
+                        "violations": [f"self_edit_review_error:{exc}"],
+                    }
+                if not bool((self_edit_outcome or {}).get("committed")):
+                    verification_passed = False
+                    rej_reasons = (
+                        (self_edit_outcome or {}).get("violations")
+                        or (self_edit_outcome or {}).get("concerns")
+                        or [(self_edit_outcome or {}).get("stage") or "self_edit_rejected"]
+                    )
+                    eval_res = eval_res.model_copy(
+                        update={
+                            "goal_achieved": False,
+                            "resolved_topic": None,
+                            "resolved_topics": [],
+                            "acquired_skill": None,
+                            "hypothesis_verdict": None,
+                            "playbook_update": None,
+                            "summary": f"自主代码自改未通过验收（{', '.join(str(x) for x in rej_reasons[:3])}）",
+                        }
+                    )
 
             # 3b. Compute deterministic Four-Factor Information Gain (V2.0 P1-4, Task Book 5.4.3)
             measured_info_gain = 0.0
@@ -683,6 +729,8 @@ class TaskFinalizer:
                 )
                 updated_outcome["goal_achieved"] = eval_res.goal_achieved
                 updated_outcome["finalized_at"] = now.isoformat()
+                if self_edit_outcome is not None:
+                    updated_outcome["self_edit_outcome"] = self_edit_outcome
                 if info_gain_details:
                     updated_outcome["info_gain_breakdown"] = info_gain_details
                 if self_model_evidence is not None:
@@ -701,6 +749,7 @@ class TaskFinalizer:
             if (
                 eval_res.goal_achieved
                 and verification_passed
+                and not is_self_edit_task
                 and self.skill_registry is not None
                 and self.skill_auto_crystallize
                 and task_row.get("workspace")

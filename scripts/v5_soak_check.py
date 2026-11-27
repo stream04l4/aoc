@@ -33,6 +33,7 @@ from app.storage.database import Database
 from app.storage.models import (
     ActiveGoal,
     AgentExecutionRow,
+    AgentTaskRow,
     EventLog,
     InstanceRegistryRow,
     LineageRecordRow,
@@ -120,6 +121,7 @@ async def run_v5_soak_check(
 
     # 3. Optional DB control-plane check
     active_candidate_keys: set[str] = set()
+    active_task_workspaces: set[str] = set()
     db_tables_present = False
     if (db_url or "").strip():
         db = Database(db_url.strip())
@@ -322,10 +324,50 @@ async def run_v5_soak_check(
                     "attempt_failed_24h": attempt_fail_24h,
                     "l2_bridge_state_recorded": bridge_state_recorded,
                 }
+                se_pending_restart = False
+                se_pending_commits_cnt = 0
+                if "world_states" in tbls:
+                    async with db.session() as s:
+                        se_row = (
+                            await s.execute(
+                                select(WorldState).where(
+                                    WorldState.kind == "self_edit_state",
+                                    WorldState.key == "primary",
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        if se_row and isinstance(se_row.value, dict):
+                            se_pending_restart = bool(se_row.value.get("pending_restart", False))
+                            se_pending_commits_cnt = len(list(se_row.value.get("pending_commits") or []))
+                if "agent_tasks" in tbls:
+                    async with db.session() as s:
+                        t_ws_rows = (
+                            await s.execute(
+                                select(AgentTaskRow.workspace).where(
+                                    AgentTaskRow.status.in_(
+                                        ["QUEUED", "PENDING", "DISPATCHING", "DISPATCHED", "RUNNING", "RETRY_WAIT"]
+                                    )
+                                )
+                            )
+                        ).all()
+                        active_task_workspaces = {
+                            str(Path(str(row[0])).resolve())
+                            for row in t_ws_rows
+                            if row and row[0]
+                        }
+                v5_4_obs: dict[str, Any] = {
+                    "ok": True,
+                    "skipped": False,
+                    "pending_restart": se_pending_restart,
+                    "pending_commits_count": se_pending_commits_cnt,
+                    "orphan_self_edit_worktrees": [],
+                }
             else:
                 v5_3_obs = {"ok": True, "skipped": True}
+                v5_4_obs = {"ok": True, "skipped": True}
             checks["v5_2_observability"] = v5_2_obs
             checks["v5_3_observability"] = v5_3_obs
+            checks["v5_4_self_edit"] = v5_4_obs
         finally:
             await db.dispose()
     else:
@@ -333,12 +375,15 @@ async def run_v5_soak_check(
         checks["v5_1_observability"] = {"ok": True, "skipped": True}
         checks["v5_2_observability"] = {"ok": True, "skipped": True}
         checks["v5_3_observability"] = {"ok": True, "skipped": True}
+        checks["v5_4_self_edit"] = {"ok": True, "skipped": True}
 
-    # 4. Orphan directory hygiene under instances_root (excluding `snapshots` and `l2-worktrees`)
+    # 4. Orphan directory hygiene under instances_root (excluding `snapshots`, `l2-worktrees`, `self-edit`)
     dirs_on_disk: list[str] = []
     if inst_path.exists():
         dirs_on_disk = sorted(
-            p.name for p in inst_path.iterdir() if p.is_dir() and p.name not in {"snapshots", "l2-worktrees"}
+            p.name
+            for p in inst_path.iterdir()
+            if p.is_dir() and p.name not in {"snapshots", "l2-worktrees", "self-edit"}
         )
     orphan_l2_worktrees: list[str] = []
     for l2_root in (inst_path / "l2-worktrees", Path("/home/ubuntu/aoc-workspaces/l2-worktrees")):
@@ -352,6 +397,18 @@ async def run_v5_soak_check(
         checks["v5_3_observability"]["orphan_l2_worktrees"] = orphan_l2_worktrees
         if orphan_l2_worktrees:
             checks["v5_3_observability"]["ok"] = False
+    orphan_se_worktrees: list[str] = []
+    for se_root in (inst_path / "self-edit", Path("/home/ubuntu/aoc-workspaces/self-edit")):
+        if se_root.is_dir():
+            for p in sorted(se_root.iterdir()):
+                if p.is_dir() and str(p.resolve()) not in active_task_workspaces:
+                    orphan_se_worktrees.append(str(p))
+    if orphan_se_worktrees:
+        failures.append(f"Orphan self-edit worktrees detected: {orphan_se_worktrees}")
+    if "v5_4_self_edit" in checks and isinstance(checks["v5_4_self_edit"], dict):
+        checks["v5_4_self_edit"]["orphan_self_edit_worktrees"] = orphan_se_worktrees
+        if orphan_se_worktrees:
+            checks["v5_4_self_edit"]["ok"] = False
     if db_tables_present and active_candidate_keys:
         unexpected_dirs = [d for d in dirs_on_disk if d not in active_candidate_keys]
     else:

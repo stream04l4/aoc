@@ -105,6 +105,10 @@ class MetaReflectionManager:
         attribution_min_cycles: int = 5,
         regression_delta: float = 0.08,
         l2_bridge_enabled: bool = False,
+        self_edit_manager: Any = None,
+        self_edit_enabled: bool = False,
+        self_edit_auto_approve_enabled: bool = False,
+        self_edit_policy_mode: str = "strict",
     ) -> None:
         self.repo = repo
         self.brain = brain
@@ -121,6 +125,10 @@ class MetaReflectionManager:
         self.attribution_min_cycles = max(1, int(attribution_min_cycles))
         self.regression_delta = max(0.01, float(regression_delta))
         self.l2_bridge_enabled = bool(l2_bridge_enabled)
+        self.self_edit_manager = self_edit_manager
+        self.self_edit_enabled = bool(self_edit_enabled)
+        self.self_edit_auto_approve_enabled = bool(self_edit_auto_approve_enabled)
+        self.self_edit_policy_mode = str(self_edit_policy_mode or "strict").strip().lower() or "strict"
 
     async def get_state(self) -> dict[str, Any]:
         rows = await self.repo.list_world_items(kind="meta_reflection_state")
@@ -650,6 +658,8 @@ class MetaReflectionManager:
             previous_reflection_impact=eff_impact,
             l2_evolution_bridge_enabled=self.l2_bridge_enabled,
             evolvable_allowlist_sample=allowlist_sample,
+            self_edit_auto_approve_enabled=bool(self.self_edit_enabled and self.self_edit_auto_approve_enabled),
+            self_edit_policy_mode=self.self_edit_policy_mode,
         )
 
     async def run_if_due(
@@ -765,13 +775,15 @@ class MetaReflectionManager:
                         "canonical_name": canon_name,
                     }
 
-        # Outlet 3: L2 System Upgrade Proposal Card via HumanBridge (strict <= 1 per 24h)
+        # Outlet 3: L2 System Upgrade -> SelfEditManager (V5.4 autonomous) OR HumanBridge Card (strict <= 1 per 24h)
         l2_outcome: dict[str, Any] = {"sent": False, "skipped_reason": "none"}
         new_last_l2_at = prev_state.get("last_l2_proposal_at")
         if isinstance(output.l2_upgrade_proposal, dict):
             l2_title = str(output.l2_upgrade_proposal.get("title") or "").strip()
             l2_msg = str(output.l2_upgrade_proposal.get("message") or "").strip()
-            if l2_title and l2_msg:
+            l2_desired = str(output.l2_upgrade_proposal.get("desired_change") or l2_msg or "").strip()
+            has_pc = isinstance(output.l2_upgrade_proposal.get("proposed_change"), dict)
+            if l2_title and (l2_msg or l2_desired or has_pc):
                 last_l2_dt = _parse_dt(new_last_l2_at)
                 l2_allowed = (
                     last_l2_dt is None
@@ -779,6 +791,28 @@ class MetaReflectionManager:
                 )
                 if not l2_allowed:
                     l2_outcome = {"sent": False, "skipped_reason": "l2_24h_cooldown"}
+                elif (
+                    self.self_edit_manager is not None
+                    and self.self_edit_enabled
+                    and self.self_edit_auto_approve_enabled
+                ):
+                    rollback_plan = str(output.l2_upgrade_proposal.get("rollback_plan") or "").strip()
+                    raw_pc = output.l2_upgrade_proposal.get("proposed_change")
+                    raw_files = output.l2_upgrade_proposal.get("target_files")
+                    se_res = await self.self_edit_manager.apply_direct_change_and_self_approve(
+                        title=l2_title[:160],
+                        reason=str(output.l2_upgrade_proposal.get("reason") or output.diagnosis_summary)[:400],
+                        expected_benefit=str(output.l2_upgrade_proposal.get("expected_benefit") or "")[:300],
+                        rollback_plan=rollback_plan[:300],
+                        proposed_change=raw_pc if isinstance(raw_pc, dict) else None,
+                        desired_change=(l2_desired or l2_title)[:1000],
+                        target_files=list(raw_files) if isinstance(raw_files, list) else None,
+                        test_plan=str(output.l2_upgrade_proposal.get("test_plan") or "")[:400],
+                        cycle_id=cycle_id,
+                    )
+                    l2_outcome = {"sent": False, "self_edit": True, **dict(se_res or {})}
+                    if l2_outcome.get("ok") or l2_outcome.get("enqueued"):
+                        new_last_l2_at = cur_now.isoformat()
                 elif self.human_bridge is None:
                     l2_outcome = {"sent": False, "skipped_reason": "human_bridge_unavailable"}
                 else:

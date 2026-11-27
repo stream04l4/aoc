@@ -265,6 +265,17 @@ class KernelV3Settings(BaseModel):
     meta_reflection_regression_delta: float = 0.08
     # V5.3 M4: L2 Evolution Bridge (Meta-Reflection L2 cards -> V5.0 ProposalManager + ConstitutionGuard)
     l2_evolution_bridge_enabled: bool = False
+    # V5.4: Autonomous Self-Editing, Self-Approval & Evolution Branch Landing
+    self_edit_enabled: bool = False
+    self_edit_auto_approve_enabled: bool = False
+    self_edit_policy_mode: str = "strict"  # strict | wide_open
+    self_edit_branch: str = "evo/auto"
+    self_edit_cooldown_minutes: int = 60
+    self_edit_max_commits_per_day: int = 6
+    self_edit_max_changed_files: int = 8
+    self_edit_max_loc_delta: int = 600
+    self_edit_pytest_timeout_seconds: int = 180
+    self_edit_llm_review_enabled: bool = True
 
 
 class EvolutionSettings(BaseModel):

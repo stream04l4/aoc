@@ -16,10 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-install-project
 
 COPY . .
-RUN uv sync --frozen --no-dev && chmod +x /app/docker/entrypoint.sh \
+RUN uv sync --frozen && chmod +x /app/docker/entrypoint.sh \
     && chown -R 1000:1000 /app
 
 USER 1000:1000
