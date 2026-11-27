@@ -757,26 +757,63 @@ class TaskFinalizer:
                                     await self.meta_reflection_manager.mark_skill_refactor_consumed(
                                         c_target, execution_id=exec_key
                                     )
-                                else:
-                                    q_rows = await self.repo.list_world_items(
-                                        kind="skill_refactor_queue", status="open"
-                                    )
-                                    for qr in q_rows:
-                                        qv = dict(qr.get("value") or {}) if isinstance(qr.get("value"), dict) else {}
-                                        if (
-                                            qr.get("key") == f"refactor:{c_target}"
-                                            or qv.get("skill_key") == c_target
-                                            or qv.get("canonical_name") == c_target
-                                        ):
-                                            qv["consumed_at"] = utcnow().isoformat()
-                                            qv["consumed_execution_id"] = exec_key
-                                            await self.repo.upsert_world_item(
-                                                kind="skill_refactor_queue",
-                                                key=str(qr["key"]),
-                                                value=qv,
-                                                status="completed",
-                                                source="skill_refactor_consumed",
-                                            )
+                                merge_ids: list[str] = [
+                                    str(x)
+                                    for x in list((refactor_target or {}).get("merge_candidate_ids") or [])
+                                    if x
+                                ]
+                                merge_keys: list[str] = [
+                                    str(x)
+                                    for x in list((refactor_target or {}).get("merge_candidates") or [])
+                                    if x
+                                ]
+                                q_rows = await self.repo.list_world_items(
+                                    kind="skill_refactor_queue", status="open"
+                                )
+                                for qr in q_rows:
+                                    qv = dict(qr.get("value") or {}) if isinstance(qr.get("value"), dict) else {}
+                                    if (
+                                        qr.get("key") in {f"refactor:{c_target}", f"consolidate:{c_target}"}
+                                        or qv.get("skill_key") == c_target
+                                        or qv.get("canonical_name") == c_target
+                                        or qv.get("primary_skill_key") == c_target
+                                    ):
+                                        for x in list(qv.get("merge_candidate_ids") or []):
+                                            if x and str(x) not in merge_ids:
+                                                merge_ids.append(str(x))
+                                        for x in list(qv.get("merge_candidates") or []):
+                                            if x and str(x) not in merge_keys:
+                                                merge_keys.append(str(x))
+                                        qv["consumed_at"] = utcnow().isoformat()
+                                        qv["consumed_execution_id"] = exec_key
+                                        await self.repo.upsert_world_item(
+                                            kind="skill_refactor_queue",
+                                            key=str(qr["key"]),
+                                            value=qv,
+                                            status="completed",
+                                            source="skill_refactor_consumed",
+                                        )
+                                new_sid_str = str(skill_crystallized.get("skill_id") or "").strip()
+                                if new_sid_str and (merge_ids or merge_keys):
+                                    try:
+                                        sup_uuid = uuid.UUID(new_sid_str)
+                                        val_rows = await self.repo.list_skills(status="VALIDATED", limit=300)
+                                        for vr in val_rows:
+                                            vid = str(vr.get("id") or "")
+                                            if not vid or vid == new_sid_str:
+                                                continue
+                                            if vid in merge_ids or vr.get("skill_key") in merge_keys or vr.get("canonical_name") in merge_keys:
+                                                await self.repo.update_skill_metadata(
+                                                    uuid.UUID(vid),
+                                                    status="DEPRECATED",
+                                                    superseded_by=sup_uuid,
+                                                    evolution_meta={
+                                                        "deprecated_reason": "consolidated_superseded",
+                                                        "superseded_at": utcnow().isoformat(),
+                                                    },
+                                                )
+                                    except Exception as exc:
+                                        logger.warning("finalizer.consolidate_supersede_degraded", error=str(exc))
                 except Exception as exc:
                     logger.warning("finalizer.skill_crystallize_degraded", execution_id=exec_key, error=str(exc))
 
@@ -1146,12 +1183,13 @@ class TaskFinalizer:
         now: datetime,
         since_7d: datetime,
         recent_statuses: list[str],
-    ) -> tuple[float | None, float | None, float | None, int]:
-        """Collect reproduction quality metrics identically to pre-cycle evaluation (V5.2.2)."""
+    ) -> tuple[float | None, float | None, float | None, int, float]:
+        """Collect reproduction quality metrics identically to pre-cycle evaluation (V5.2.2 + V5.3 M3)."""
         skill_reuse_ratio_recent: float | None = None
         execution_reliability_recent: float | None = None
         playbook_freshness_score: float | None = None
         pending_skill_refactor_count = 0
+        unresolved_pain_score = 0.0
         try:
             val_skills = await self.repo.list_skills(status="VALIDATED", limit=200)
             if val_skills:
@@ -1200,6 +1238,10 @@ class TaskFinalizer:
 
             refactor_rows = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
             pending_skill_refactor_count = len(refactor_rows)
+            meta_rows = await self.repo.list_world_items(kind="meta_reflection_state")
+            meta_pri = next((r for r in meta_rows if r.get("key") == "primary"), None)
+            if meta_pri and isinstance(meta_pri.get("value"), dict):
+                unresolved_pain_score = clamp01(float(meta_pri["value"].get("unresolved_pain_score") or 0.0))
         except Exception as exc:
             logger.warning("finalizer.reproduction_quality_telemetry_degraded", error=str(exc))
 
@@ -1208,6 +1250,7 @@ class TaskFinalizer:
             execution_reliability_recent,
             playbook_freshness_score,
             pending_skill_refactor_count,
+            unresolved_pain_score,
         )
 
     async def _build_post_drive_context(self, obs: Observation, now: datetime, info_gain: float = 0.0) -> DriveContext:
@@ -1266,12 +1309,14 @@ class TaskFinalizer:
         execution_reliability_recent: float | None = None
         playbook_freshness_score: float | None = None
         pending_skill_refactor_count = 0
+        unresolved_pain_score = 0.0
         if quality_enabled:
             (
                 skill_reuse_ratio_recent,
                 execution_reliability_recent,
                 playbook_freshness_score,
                 pending_skill_refactor_count,
+                unresolved_pain_score,
             ) = await self._collect_reproduction_quality_telemetry(
                 now=now,
                 since_7d=since_7d,
@@ -1301,6 +1346,7 @@ class TaskFinalizer:
             execution_reliability_recent=execution_reliability_recent,
             playbook_freshness_score=playbook_freshness_score,
             pending_skill_refactor_count=pending_skill_refactor_count,
+            unresolved_pain_score=unresolved_pain_score,
             open_knowledge_gaps=env_topics,
             unknown_topics=env_topics,
             exploration_attempted_recent=cur_done + cur_failed,

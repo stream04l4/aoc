@@ -96,6 +96,11 @@ class LLMGateway(LLMGatewayInterface):
         self.repo = repo
         self._http_client = http_client
         self._adapter = adapter or OpenAICompatibleLLMAdapter(llm_settings, http_client=http_client)
+        self._schema_retry_counts: dict[str, int] = {}
+        if self.repo is not None and hasattr(self._adapter, "on_schema_retry") and getattr(
+            self._adapter, "on_schema_retry", None
+        ) is None:
+            self._adapter.on_schema_retry = self._record_schema_retry
 
         max_conc = max(1, int(self.budget.max_concurrent_llm_calls))
         self._semaphore = asyncio.Semaphore(max_conc)
@@ -146,6 +151,40 @@ class LLMGateway(LLMGatewayInterface):
             "calls": self._cycle_calls.get(key, 0),
             "tokens": self._cycle_tokens.get(key, 0),
         }
+
+    async def _record_schema_retry(self, info: dict[str, Any]) -> None:
+        """Persist rate-limited `llm.schema_retry` EventLog telemetry (<= 3 per cycle, V5.3 M3)."""
+        if self.repo is None:
+            return
+        scope = _CALL_SCOPE.get()
+        eff_cycle_id = scope.get("cycle_id")
+        bucket = str(eff_cycle_id) if eff_cycle_id is not None else f"global:{utcnow().strftime('%Y%m%d%H')}"
+        cur = self._schema_retry_counts.get(bucket, 0)
+        if cur >= 3:
+            return
+        self._schema_retry_counts[bucket] = cur + 1
+        if len(self._schema_retry_counts) > 100:
+            oldest_key = next(iter(self._schema_retry_counts))
+            if oldest_key != bucket:
+                self._schema_retry_counts.pop(oldest_key, None)
+        try:
+            op = str(info.get("operation") or "unknown")
+            cat = str(info.get("category") or "validation_error")
+            att = int(info.get("attempt") or 1)
+            err = str(info.get("error") or "")[:200]
+            await self.repo.log_event(
+                "llm.schema_retry",
+                level="warning",
+                message=f"LLM schema retry ({cat}) on {op} attempt {att}: {err}",
+                payload={
+                    **info,
+                    "purpose": scope.get("purpose") or op,
+                    "goal_id": scope.get("goal_id"),
+                },
+                cycle_id=eff_cycle_id,
+            )
+        except Exception as exc:
+            logger.warning("llm_gateway.schema_retry_event_failed", error=str(exc))
 
     @property
     def circuit_open(self) -> bool:

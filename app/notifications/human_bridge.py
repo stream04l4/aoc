@@ -66,11 +66,13 @@ class HumanBridge:
         enabled: bool = True,
         cooldown_minutes: int = 120,
         topic_dedup_hours: float = 24.0,
+        l2_bridge: Any = None,
     ) -> None:
         self.repo = repo
         self.enabled = bool(enabled)
         self.cooldown_minutes = max(1, int(cooldown_minutes))
         self.topic_dedup_hours = max(0.25, float(topic_dedup_hours))
+        self.l2_bridge = l2_bridge
 
     @staticmethod
     def _slugify(topic_key: str, title: str) -> str:
@@ -122,6 +124,7 @@ class HumanBridge:
         options: list[Any] | None = None,
         cycle_id: uuid.UUID | None = None,
         force: bool = False,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Enqueue a rate-limited interactive outreach card to Joel via Outbox."""
         clean_msg = str(message or "").strip()
@@ -162,22 +165,26 @@ class HumanBridge:
         card_id = uuid.uuid4().hex[:8]
         norm_options = self._normalize_options(norm_kind, options)
 
+        card_value: dict[str, Any] = {
+            "card_id": card_id,
+            "kind": norm_kind,
+            "topic_key": slug,
+            "title": clean_title,
+            "message": clean_msg[:1500],
+            "reason": clean_reason,
+            "expected_benefit": clean_benefit,
+            "options": norm_options,
+            "created_at": now.isoformat(),
+            "answered_at": None,
+            "selected_option": None,
+        }
+        if isinstance(extra_metadata, dict) and extra_metadata:
+            card_value["meta"] = dict(extra_metadata)
+
         await self.repo.upsert_world_item(
             kind="human_outreach_card",
             key=card_id,
-            value={
-                "card_id": card_id,
-                "kind": norm_kind,
-                "topic_key": slug,
-                "title": clean_title,
-                "message": clean_msg[:1500],
-                "reason": clean_reason,
-                "expected_benefit": clean_benefit,
-                "options": norm_options,
-                "created_at": now.isoformat(),
-                "answered_at": None,
-                "selected_option": None,
-            },
+            value=card_value,
             status="open",
             source=f"human_bridge:{norm_kind}",
         )
@@ -293,7 +300,24 @@ class HumanBridge:
             status="answered",
             source=str(item.get("source") or "human_bridge:ask_human"),
         )
-        return {
+        bridge_res: dict[str, Any] | None = None
+        if self.l2_bridge is not None and getattr(self.l2_bridge, "enabled", False):
+            meta = val.get("meta") if isinstance(val.get("meta"), dict) else {}
+            b_stage = str(meta.get("bridge_stage") or "").strip().lower()
+            try:
+                if b_stage == "stage0_candidate" and option_index == 0:
+                    bridge_res = await self.l2_bridge.on_proposal_adopted(
+                        card_id=card_id, card_val=val, sender=sender
+                    )
+                elif b_stage == "stage2_confirm":
+                    bridge_res = await self.l2_bridge.on_stage2_decision(
+                        card_id=card_id, option_index=option_index, card_val=val, sender=sender
+                    )
+            except Exception as exc:
+                logger.warning("human_bridge.l2_bridge_degraded", card_id=card_id, error=str(exc))
+                bridge_res = {"ok": False, "error": str(exc)}
+
+        out_res: dict[str, Any] = {
             "ok": True,
             "already_selected": False,
             "card_id": card_id,
@@ -301,6 +325,9 @@ class HumanBridge:
             "option": opt,
             "guidance": guidance,
         }
+        if bridge_res is not None:
+            out_res["l2_bridge"] = bridge_res
+        return out_res
 
     async def mark_awaiting_custom_reply(
         self,

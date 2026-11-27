@@ -52,6 +52,15 @@ def _ensure_utc_dt(raw: Any) -> datetime | None:
         return None
 
 
+def _sanitize_failure_text(raw: Any, max_len: int = 400) -> str:
+    txt = str(raw or "")
+    txt = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", txt)
+    txt = re.sub(r"postgresql(?:\+\w+)?://[^\s]+", "[REDACTED_DB_URL]", txt)
+    txt = re.sub(r"bot[0-9]{6,}:[A-Za-z0-9_-]{10,}", "[REDACTED_BOT_TOKEN]", txt)
+    txt = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED_KEY]", txt)
+    return txt.strip()[:max_len]
+
+
 def compute_file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -554,6 +563,7 @@ class SkillRegistryManager(SkillRegistryInterface):
                     "version": sk["version"],
                     "capability_key": sk["capability_key"],
                     "description": str(sk.get("description") or "")[:240],
+                    "applicable_scenarios": list(sk.get("applicable_scenarios") or [])[:5],
                     "artifact_path": sk.get("artifact_path"),
                     "input_schema": sk.get("input_schema") or {},
                     "output_schema": sk.get("output_schema") or {},
@@ -613,10 +623,11 @@ class SkillRegistryManager(SkillRegistryInterface):
             (base_test_code + "\n") if base_test_code else "",
             encoding="utf-8",
         )
+        cname = str(base.get("canonical_name") or base["skill_key"])
         meta_payload = {
             "skill_id": base["id"],
             "skill_key": base["skill_key"],
-            "canonical_name": base.get("canonical_name") or base["skill_key"],
+            "canonical_name": cname,
             "version": base["version"],
             "capability_key": base["capability_key"],
             "permission_level": base.get("permission_level") or "L1",
@@ -630,18 +641,104 @@ class SkillRegistryManager(SkillRegistryInterface):
             json.dumps(meta_payload, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        return {
+
+        # V5.3 M1: Inject real historical invocation failures + queue context into ./.aoc_base_skill/failure_cases.json
+        queue_reason = meta_payload["reason"]
+        queue_gen = meta_payload["target_generalization"]
+        queue_action = str(target.get("action") or "").strip()
+        merge_candidates = list(target.get("merge_candidates") or []) if isinstance(target.get("merge_candidates"), list) else []
+        merge_candidate_ids = (
+            list(target.get("merge_candidate_ids") or [])
+            if isinstance(target.get("merge_candidate_ids"), list)
+            else []
+        )
+        try:
+            q_rows = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
+            for qr in q_rows:
+                qv = qr.get("value") if isinstance(qr.get("value"), dict) else {}
+                matched_q = (
+                    str(qv.get("skill_id") or "") == str(base["id"])
+                    or str(qv.get("skill_key") or "") in {base["skill_key"], cname}
+                    or str(qv.get("canonical_name") or "") in {base["skill_key"], cname}
+                    or str(qv.get("primary_skill_key") or "") in {base["skill_key"], cname}
+                )
+                if matched_q:
+                    if not queue_reason and qv.get("reason"):
+                        queue_reason = _sanitize_failure_text(qv.get("reason"), 300)
+                    if not queue_gen and qv.get("target_generalization"):
+                        queue_gen = _sanitize_failure_text(qv.get("target_generalization"), 300)
+                    if not queue_action and qv.get("action"):
+                        queue_action = str(qv.get("action")).strip()
+                    if not merge_candidates and isinstance(qv.get("merge_candidates"), list):
+                        merge_candidates = [str(x) for x in qv["merge_candidates"] if x]
+                    if not merge_candidate_ids and isinstance(qv.get("merge_candidate_ids"), list):
+                        merge_candidate_ids = [str(x) for x in qv["merge_candidate_ids"] if x]
+                    break
+        except Exception as exc:
+            logger.warning("skill.stage_queue_lookup_degraded", skill_id=base["id"], error=str(exc))
+
+        failure_cases: list[dict[str, Any]] = []
+        try:
+            invs = await self.repo.list_skill_invocations(skill_id=uuid.UUID(str(base["id"])), limit=20)
+            for iv in invs:
+                if iv.get("passed", True):
+                    continue
+                failure_cases.append(
+                    {
+                        "invocation_id": iv.get("id"),
+                        "invocation_source": iv.get("invocation_source"),
+                        "input_digest": iv.get("input_digest"),
+                        "error": _sanitize_failure_text(iv.get("error"), 400),
+                        "output_excerpt": _sanitize_failure_text(iv.get("output_excerpt"), 300),
+                        "created_at": (
+                            iv["created_at"].isoformat()
+                            if isinstance(iv.get("created_at"), datetime)
+                            else str(iv.get("created_at") or "")
+                        ),
+                    }
+                )
+                if len(failure_cases) >= 5:
+                    break
+        except Exception as exc:
+            logger.warning("skill.stage_failures_lookup_degraded", skill_id=base["id"], error=str(exc))
+
+        failure_payload = {
+            "skill_id": base["id"],
+            "skill_key": base["skill_key"],
+            "canonical_name": cname,
+            "base_version": base["version"],
+            "action": queue_action or "refactor",
+            "refactor_reason": queue_reason,
+            "target_generalization": queue_gen,
+            "merge_candidates": merge_candidates,
+            "failure_cases": failure_cases,
+        }
+        failure_cases_path = base_dir / "failure_cases.json"
+        failure_cases_path.write_text(
+            json.dumps(failure_payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        staged_out: dict[str, Any] = {
             "base_skill_id": base["id"],
             "skill_key": base["skill_key"],
-            "canonical_name": meta_payload["canonical_name"],
+            "canonical_name": cname,
             "base_version": base["version"],
             "capability_key": base["capability_key"],
             "permission_level": meta_payload["permission_level"],
-            "reason": meta_payload["reason"],
-            "target_generalization": meta_payload["target_generalization"],
+            "reason": queue_reason or meta_payload["reason"],
+            "target_generalization": queue_gen or meta_payload["target_generalization"],
             "staged_dir": str(base_dir),
             "has_base_tests": bool(base_test_code),
+            "failure_cases_count": len(failure_cases),
+            "failure_cases_path": str(failure_cases_path),
         }
+        if queue_action:
+            staged_out["action"] = queue_action
+        if merge_candidates:
+            staged_out["merge_candidates"] = merge_candidates
+        if merge_candidate_ids:
+            staged_out["merge_candidate_ids"] = merge_candidate_ids
+        return staged_out
 
     async def crystallize_from_workspace(
         self,
@@ -956,6 +1053,252 @@ class SkillRegistryManager(SkillRegistryInterface):
             "expired_skill_ids": expired_ids,
             "expiry_hours": hours_cap,
         }
+
+    async def audit_and_tidy_validated_skills(
+        self,
+        *,
+        consolidate_days: int = 7,
+        expiry_days: int = 14,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Consolidate (>=Nd overlapping) & archive (>=Md zero-reuse low-value) VALIDATED skills safely (V5.3 M1)."""
+        from app.skills.evolution import _clean_tokens, _jaccard_tokens
+
+        now_dt = _ensure_utc_dt(now or utcnow()) or utcnow()
+        c_days = max(1, int(consolidate_days))
+        e_days = max(c_days + 1, int(expiry_days))
+        consolidate_cutoff = now_dt - timedelta(days=c_days)
+        expiry_cutoff = now_dt - timedelta(days=e_days)
+
+        all_skills = await self.repo.list_skills(limit=500)
+        val_skills = [sk for sk in all_skills if sk.get("status") == SkillStatus.VALIDATED.value]
+
+        # Build strict protection sets so parent chains, active queue items, recent uses & sole capability anchors stay safe
+        parent_protected: set[tuple[str, str]] = set()
+        for sk in all_skills:
+            if sk.get("status") == SkillStatus.DEPRECATED.value:
+                continue
+            pver = str(sk.get("parent_version") or "").strip()
+            if not pver:
+                continue
+            skey = str(sk.get("skill_key") or "").strip()
+            cname = str(sk.get("canonical_name") or "").strip()
+            if skey:
+                parent_protected.add((skey, pver))
+            if cname:
+                parent_protected.add((cname, pver))
+
+        open_queue = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
+        queue_protected_refs: set[str] = set()
+        for qr in open_queue:
+            qv = qr.get("value") if isinstance(qr.get("value"), dict) else {}
+            for fld in ("skill_id", "skill_key", "canonical_name", "primary_skill_key"):
+                v_str = str(qv.get(fld) or "").strip()
+                if v_str:
+                    queue_protected_refs.add(v_str)
+            for mc in list(qv.get("merge_candidates") or []):
+                if mc:
+                    queue_protected_refs.add(str(mc).strip())
+            for mcid in list(qv.get("merge_candidate_ids") or []):
+                if mcid:
+                    queue_protected_refs.add(str(mcid).strip())
+
+        cap_validated_counts: dict[str, int] = {}
+        for sk in val_skills:
+            ck = str(sk.get("capability_key") or "general")
+            cap_validated_counts[ck] = cap_validated_counts.get(ck, 0) + 1
+
+        def _is_parent_protected(sk: dict[str, Any]) -> bool:
+            ver = str(sk.get("version") or "").strip()
+            return (
+                (str(sk.get("skill_key") or "").strip(), ver) in parent_protected
+                or (str(sk.get("canonical_name") or "").strip(), ver) in parent_protected
+            )
+
+        def _is_queue_protected(sk: dict[str, Any]) -> bool:
+            return any(
+                str(sk.get(fld) or "").strip() in queue_protected_refs
+                for fld in ("id", "skill_key", "canonical_name")
+            )
+
+        def _skill_age_dt(sk: dict[str, Any]) -> datetime | None:
+            return _ensure_utc_dt(sk.get("created_at")) or _ensure_utc_dt(sk.get("updated_at"))
+
+        unused_7d: list[dict[str, Any]] = []
+        unused_14d: list[dict[str, Any]] = []
+        protected_count = 0
+
+        for sk in val_skills:
+            reuse_cnt = int(sk.get("reuse_count") or 0)
+            inv_cnt = int(sk.get("invocation_count") or 0)
+            last_inv_dt = _ensure_utc_dt(sk.get("last_invoked_at"))
+            age_dt = _skill_age_dt(sk)
+            if age_dt is None:
+                continue
+
+            if reuse_cnt == 0 and age_dt <= consolidate_cutoff:
+                if last_inv_dt is None or last_inv_dt <= consolidate_cutoff:
+                    unused_7d.append(sk)
+            if reuse_cnt == 0 and inv_cnt == 0 and age_dt <= expiry_cutoff:
+                if last_inv_dt is None or last_inv_dt <= expiry_cutoff:
+                    unused_14d.append(sk)
+
+        # 1. Consolidation pass: cluster >= 2 overlapping zero-reuse >= 7d skills
+        consolidate_pool = [
+            sk for sk in unused_7d if not _is_parent_protected(sk) and not _is_queue_protected(sk)
+        ]
+
+        def _skill_tokens(sk: dict[str, Any]) -> set[str]:
+            in_props = list(((sk.get("input_schema") or {}).get("properties") or {}).keys())
+            blob = " ".join(
+                [
+                    str(sk.get("canonical_name") or "").replace(".", " "),
+                    str(sk.get("skill_key") or "").replace("_", " "),
+                    str(sk.get("description") or ""),
+                    " ".join(str(p) for p in in_props),
+                ]
+            )
+            return set(_clean_tokens(blob))
+
+        token_cache = {str(sk["id"]): _skill_tokens(sk) for sk in consolidate_pool}
+        visited_ids: set[str] = set()
+        consolidated_queued_ids: set[str] = set()
+        consolidated_enqueued: list[dict[str, Any]] = []
+
+        for sk in consolidate_pool:
+            sid = str(sk["id"])
+            if sid in visited_ids or len(consolidated_enqueued) >= 2:
+                continue
+            cluster = [sk]
+            visited_ids.add(sid)
+            toks_a = token_cache[sid]
+            for other in consolidate_pool:
+                oid = str(other["id"])
+                if oid in visited_ids:
+                    continue
+                sim = _jaccard_tokens(toks_a, token_cache[oid])
+                if sim >= 0.40:
+                    cluster.append(other)
+                    visited_ids.add(oid)
+            if len(cluster) < 2:
+                continue
+
+            cluster.sort(
+                key=lambda x: (len(str(x.get("description") or "")), str(x.get("updated_at") or x.get("created_at") or "")),
+                reverse=True,
+            )
+            primary = cluster[0]
+            candidates = cluster[1:4]
+            primary_cname = str(primary.get("canonical_name") or primary["skill_key"])
+            queue_key = f"consolidate:{primary_cname}"
+            q_val = {
+                "action": "consolidate",
+                "skill_id": str(primary["id"]),
+                "skill_key": primary["skill_key"],
+                "canonical_name": primary_cname,
+                "primary_skill_key": primary["skill_key"],
+                "current_version": primary.get("version"),
+                "merge_candidates": [c["skill_key"] for c in candidates],
+                "merge_candidate_ids": [str(c["id"]) for c in candidates],
+                "reason": (
+                    f"Consolidate {len(candidates) + 1} overlapping zero-reuse VALIDATED skills "
+                    f"(age >= {c_days}d)"
+                ),
+                "target_generalization": (
+                    "Merge overlapping capabilities into one backward-compatible reusable skill "
+                    "with clean JSON Schema and comprehensive regression tests"
+                ),
+                "priority": 2,
+                "enqueued_at": now_dt.isoformat(),
+                "created_at": now_dt.isoformat(),
+            }
+            await self.repo.upsert_world_item(
+                kind="skill_refactor_queue",
+                key=queue_key,
+                value=q_val,
+                status="open",
+                source="skill_lifecycle_gc",
+            )
+            consolidated_enqueued.append(
+                {
+                    "queue_key": queue_key,
+                    "primary_skill_key": primary["skill_key"],
+                    "merge_candidates": q_val["merge_candidates"],
+                }
+            )
+            for member in [primary, *candidates]:
+                consolidated_queued_ids.add(str(member["id"]))
+
+        # 2. Expiry GC pass: archive zero-reuse zero-invocation >= 14d low-value fragments
+        archived_skill_keys: list[str] = []
+        archived_skill_ids: list[str] = []
+        for sk in unused_14d:
+            sid_str = str(sk["id"])
+            ckey = str(sk.get("capability_key") or "general")
+            if (
+                sid_str in consolidated_queued_ids
+                or _is_parent_protected(sk)
+                or _is_queue_protected(sk)
+                or cap_validated_counts.get(ckey, 0) <= 1
+            ):
+                protected_count += 1
+                continue
+
+            new_meta = {
+                **dict(sk.get("evolution_meta") or {}),
+                "deprecated_reason": "unused_validated_gc",
+                "archived_at": now_dt.isoformat(),
+                "expiry_days": e_days,
+                "restorable_snapshot": {
+                    "skill_key": sk["skill_key"],
+                    "canonical_name": sk.get("canonical_name"),
+                    "version": sk["version"],
+                    "capability_key": sk["capability_key"],
+                    "artifact_path": sk.get("artifact_path"),
+                    "artifact_checksum": sk.get("artifact_checksum"),
+                },
+            }
+            await self.repo.update_skill_metadata(
+                uuid.UUID(sid_str),
+                status=SkillStatus.DEPRECATED.value,
+                evolution_meta=new_meta,
+            )
+            cap_validated_counts[ckey] = max(0, cap_validated_counts.get(ckey, 1) - 1)
+            archived_skill_keys.append(sk["skill_key"])
+            archived_skill_ids.append(sid_str)
+
+        audit_summary: dict[str, Any] = {
+            "audited_at": now_dt.isoformat(),
+            "consolidate_days": c_days,
+            "expiry_days": e_days,
+            "validated_total": len(val_skills),
+            "unused_7d_count": len(unused_7d),
+            "unused_14d_count": len(unused_14d),
+            "consolidated_enqueued_count": len(consolidated_enqueued),
+            "consolidated_enqueued": consolidated_enqueued,
+            "archived_count": len(archived_skill_keys),
+            "archived_skill_keys": archived_skill_keys,
+            "archived_skill_ids": archived_skill_ids,
+            "protected_count": protected_count,
+        }
+        await self.repo.upsert_world_item(
+            kind="skill_lifecycle_audit",
+            key="latest",
+            value=audit_summary,
+            status="completed",
+            source="skill_lifecycle_gc",
+        )
+        await self.repo.log_event(
+            "skills.lifecycle_audit",
+            message=(
+                f"Validated skill audit: total={len(val_skills)}, unused_7d={len(unused_7d)}, "
+                f"consolidated={len(consolidated_enqueued)}, archived={len(archived_skill_keys)}"
+            ),
+            payload=audit_summary,
+        )
+        if archived_skill_keys:
+            await self._notify_skills_changed()
+        return audit_summary
 
     async def count_validated_skills(
         self,

@@ -2435,6 +2435,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="self_model.minimum_samples", label="能力 VALIDATED 最小样本量", description="Beta-Binomial 能力晋升 VALIDATED 的最小验证样本数", effective_value=self_model_yaml.get("minimum_samples", 3), yaml_value=self_model_yaml.get("minimum_samples"), default_value=3),
                     item(key="self_model.confidence_threshold", label="能力置信下界阈值", description="90% Beta 置信下界达标阈值", effective_value=self_model_yaml.get("confidence_threshold", 0.55), yaml_value=self_model_yaml.get("confidence_threshold"), default_value=0.55),
                     item(key="kernel_v3.reproduction_quality_scoring_enabled", label="繁殖/能力质量驱动评分开关", description="按近期技能复用率、执行可靠性与 Playbook 新鲜度动态评估 Reproduction 欲望（默认关闭）", effective_value=s.kernel_v3.reproduction_quality_scoring_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "reproduction_quality_scoring_enabled"), default_value=False, env_var="AOC_KERNEL_V3__REPRODUCTION_QUALITY_SCORING_ENABLED"),
+                    item(key="kernel_v3.skill_lifecycle_gc_enabled", label="技能生命周期合并与过期清理开关", description="定期检测并合并7天重叠零复用技能、归档14天零使用碎片（V5.3 M1）", effective_value=s.kernel_v3.skill_lifecycle_gc_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "skill_lifecycle_gc_enabled"), default_value=False, env_var="AOC_KERNEL_V3__SKILL_LIFECYCLE_GC_ENABLED"),
                 ],
             },
             {
@@ -2453,6 +2454,8 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="kernel_v3.interest_portfolio_enabled", label="动态兴趣组合与跨界配额开关", description="启用持久化 interest_portfolio、舒适区/同题疲劳检测与强制跨界探索仲裁", effective_value=s.kernel_v3.interest_portfolio_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "interest_portfolio_enabled"), default_value=False, env_var="AOC_KERNEL_V3__INTEREST_PORTFOLIO_ENABLED"),
                     item(key="kernel_v3.explicit_skill_refactor_enabled", label="显式定向技能重构开关", description="禁止同名盲撞覆盖；仅在显式指定 skill_refactor_target 时预置基线源码与测试进行演进", effective_value=s.kernel_v3.explicit_skill_refactor_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "explicit_skill_refactor_enabled"), default_value=False, env_var="AOC_KERNEL_V3__EXPLICIT_SKILL_REFACTOR_ENABLED"),
                     item(key="kernel_v3.meta_reflection_enabled", label="周期性元反思自诊断开关", description="纯规则触发系统级元诊断，驱动 Playbook 热更新、技能重构排队与每日至多1次L2改进卡片", effective_value=s.kernel_v3.meta_reflection_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "meta_reflection_enabled"), default_value=False, env_var="AOC_KERNEL_V3__META_REFLECTION_ENABLED"),
+                    item(key="kernel_v3.skill_first_auto_heal_enabled", label="Skill-First 入参自愈与连败入队开关", description="支持单次别名参数自愈及连续2次失败自动加入技能重构队列（V5.3 M2）", effective_value=s.kernel_v3.skill_first_auto_heal_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "skill_first_auto_heal_enabled"), default_value=False, env_var="AOC_KERNEL_V3__SKILL_FIRST_AUTO_HEAL_ENABLED"),
+                    item(key="kernel_v3.meta_reflection_attribution_enabled", label="元反思因果归因与自动回滚开关", description="滞后评估上次反思后故障变化；恶化时自动回滚高风险 L1 Playbook（V5.3 M3）", effective_value=s.kernel_v3.meta_reflection_attribution_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "meta_reflection_attribution_enabled"), default_value=False, env_var="AOC_KERNEL_V3__META_REFLECTION_ATTRIBUTION_ENABLED"),
                 ],
             },
             {
@@ -2478,6 +2481,7 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="policy.semantic_policy.enabled", label="双语语义风控开关", description="是否经 LLMGateway 执行隐蔽意图语义分类", effective_value=bool(_nested_get(policy_yaml, "semantic_policy", "enabled")), yaml_value=_nested_get(policy_yaml, "semantic_policy", "enabled"), default_value=False, risk_note="当前未启用语义层，仅依靠确定性中英文规则" if not _nested_get(policy_yaml, "semantic_policy", "enabled") else None),
                     item(key="policy.approval.default_ttl_hours", label="审批单默认有效期 (h)", description="超时自动置 EXPIRED 防止陈旧审批被误执行", effective_value=_nested_get(policy_yaml, "approval", "default_ttl_hours") or 24, yaml_value=_nested_get(policy_yaml, "approval", "default_ttl_hours"), default_value=24),
                     item(key="telegram.enabled", label="Telegram 通知/审批开关", description="是否启用 @Joel_aoc_bot 异步通知与受控 Webhook", effective_value=s.telegram.enabled, default_value=False, env_var="AOC_TELEGRAM__ENABLED"),
+                    item(key="kernel_v3.l2_evolution_bridge_enabled", label="L2 演化提案受控桥接开关", description="将元反思 L2 建议经隔离 worktree + 四层宪法校验 + 二次人工确认落地（V5.3 M4）", effective_value=s.kernel_v3.l2_evolution_bridge_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "l2_evolution_bridge_enabled"), default_value=False, env_var="AOC_KERNEL_V3__L2_EVOLUTION_BRIDGE_ENABLED"),
                     item(key="telegram.bot_token", label="Telegram Bot Token", description="机器人 API 密钥（严格脱敏）", effective_value=bool(s.telegram.bot_token and s.telegram.bot_token.get_secret_value()), env_var="AOC_TELEGRAM__BOT_TOKEN", sensitive=True),
                     item(key="telegram.webhook_secret", label="Telegram Webhook Secret", description="回调验签密钥（严格脱敏）", effective_value=bool(s.telegram.webhook_secret and s.telegram.webhook_secret.get_secret_value()), env_var="AOC_TELEGRAM__WEBHOOK_SECRET", sensitive=True),
                 ],
@@ -2893,7 +2897,14 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 await s.execute(
                     select(WorldState).where(
                         WorldState.kind.in_(
-                            ["external_playbook", "interest_portfolio", "meta_reflection_state", "skill_refactor_queue"]
+                            [
+                                "external_playbook",
+                                "interest_portfolio",
+                                "meta_reflection_state",
+                                "skill_refactor_queue",
+                                "skill_lifecycle_audit",
+                                "l2_evolution_bridge_state",
+                            ]
                         )
                     )
                 )
@@ -2904,6 +2915,25 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     .where(DecisionLog.decision_type == "meta_reflection")
                     .order_by(desc(DecisionLog.created_at))
                     .limit(10)
+                )
+            ).scalars().all()
+            v53_events = (
+                await s.execute(
+                    select(EventLog)
+                    .where(
+                        EventLog.created_at >= since,
+                        EventLog.event_type.in_(
+                            [
+                                "llm.schema_retry",
+                                "orchestrator.attempt_failed",
+                                "skill.auto_healed",
+                                "skill_matcher.hit",
+                                "skill_matcher.override",
+                            ]
+                        ),
+                    )
+                    .order_by(desc(EventLog.created_at))
+                    .limit(400)
                 )
             ).scalars().all()
 
@@ -2957,9 +2987,52 @@ def create_control_center_router(get_runtime) -> APIRouter:
             1 for sk in draft_skills if (_utc(sk.updated_at or sk.created_at) or ref_now) < stale_draft_cutoff
         )
         dep_cnt = sum(1 for sk in skill_rows if sk.status == "DEPRECATED")
+        archived_gc_cnt = sum(
+            1
+            for sk in skill_rows
+            if sk.status == "DEPRECATED"
+            and isinstance(sk.evolution_meta, dict)
+            and sk.evolution_meta.get("deprecated_reason") == "unused_validated_gc"
+        )
+        unused_7d_cutoff = ref_now - timedelta(days=max(1, int(kv3.skill_unused_consolidate_days)))
+        unused_14d_cutoff = ref_now - timedelta(days=max(2, int(kv3.skill_unused_expiry_days)))
+        unused_7d_cnt = sum(
+            1
+            for sk in val_skills
+            if int(sk.reuse_count or 0) == 0
+            and (_utc(sk.created_at or sk.updated_at) or ref_now) <= unused_7d_cutoff
+            and (_utc(sk.last_invoked_at) is None or (_utc(sk.last_invoked_at) or ref_now) <= unused_7d_cutoff)
+        )
+        unused_14d_cnt = sum(
+            1
+            for sk in val_skills
+            if int(sk.reuse_count or 0) == 0
+            and int(sk.invocation_count or 0) == 0
+            and (_utc(sk.created_at or sk.updated_at) or ref_now) <= unused_14d_cutoff
+            and (_utc(sk.last_invoked_at) is None or (_utc(sk.last_invoked_at) or ref_now) <= unused_14d_cutoff)
+        )
         evolved_cnt = sum(1 for sk in skill_rows if sk.parent_version is not None)
         reused_val_cnt = sum(1 for sk in val_skills if int(sk.reuse_count or 0) > 0)
         w_invs = [iv for iv in inv_rows if (_utc(iv.created_at) or since_7d) >= since_7d]
+
+        retry_24h = 0
+        attempt_fail_buckets_24h: dict[str, int] = {}
+        auto_healed_24h = 0
+        matcher_hits_24h = 0
+        matcher_overrides_24h = 0
+        for ev in v53_events:
+            pl = ev.payload if isinstance(ev.payload, dict) else {}
+            if ev.event_type == "llm.schema_retry":
+                retry_24h += 1
+            elif ev.event_type == "orchestrator.attempt_failed":
+                bkt = str(pl.get("failure_bucket") or "other")
+                attempt_fail_buckets_24h[bkt] = attempt_fail_buckets_24h.get(bkt, 0) + 1
+            elif ev.event_type == "skill.auto_healed":
+                auto_healed_24h += 1
+            elif ev.event_type == "skill_matcher.hit":
+                matcher_hits_24h += 1
+            elif ev.event_type == "skill_matcher.override":
+                matcher_overrides_24h += 1
 
         playbooks_ws = [w for w in ws_rows if w.kind == "external_playbook" and w.status == "active"]
         pb_domains = sorted(str(w.key) for w in playbooks_ws)
@@ -3002,6 +3075,10 @@ def create_control_center_router(get_runtime) -> APIRouter:
 
         meta_state_row = next((w for w in ws_rows if w.kind == "meta_reflection_state" and w.key == "primary"), None)
         meta_state = dict(meta_state_row.value or {}) if (meta_state_row and isinstance(meta_state_row.value, dict)) else {}
+        audit_row = next((w for w in ws_rows if w.kind == "skill_lifecycle_audit" and w.key == "latest"), None)
+        lifecycle_audit = dict(audit_row.value or {}) if (audit_row and isinstance(audit_row.value, dict)) else None
+        bridge_row = next((w for w in ws_rows if w.kind == "l2_evolution_bridge_state" and w.key == "primary"), None)
+        bridge_state = dict(bridge_row.value or {}) if (bridge_row and isinstance(bridge_row.value, dict)) else None
 
         return {
             "read_only": True,
@@ -3013,6 +3090,12 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 "explicit_skill_refactor_enabled": bool(kv3.explicit_skill_refactor_enabled),
                 "reproduction_quality_scoring_enabled": bool(kv3.reproduction_quality_scoring_enabled),
                 "meta_reflection_enabled": bool(kv3.meta_reflection_enabled),
+            },
+            "v5_3_feature_flags": {
+                "skill_lifecycle_gc_enabled": bool(kv3.skill_lifecycle_gc_enabled),
+                "skill_first_auto_heal_enabled": bool(kv3.skill_first_auto_heal_enabled),
+                "meta_reflection_attribution_enabled": bool(kv3.meta_reflection_attribution_enabled),
+                "l2_evolution_bridge_enabled": bool(kv3.l2_evolution_bridge_enabled),
             },
             "execution_modes": {
                 "counts": mode_counts,
@@ -3052,13 +3135,20 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 "draft_count": len(draft_skills),
                 "stale_draft_count": stale_draft_cnt,
                 "deprecated_count": dep_cnt,
+                "unused_7d_count": unused_7d_cnt,
+                "unused_14d_count": unused_14d_cnt,
+                "archived_unused_gc_count": archived_gc_cnt,
                 "evolved_versions_count": evolved_cnt,
                 "reused_validated_count": reused_val_cnt,
                 "skill_reuse_ratio": round(reused_val_cnt / len(val_skills), 4) if val_skills else 0.0,
                 "recent_invocations_7d": len(w_invs),
                 "recent_invocations_succeeded_7d": sum(1 for iv in w_invs if iv.passed),
+                "auto_healed_24h": auto_healed_24h,
+                "matcher_hits_24h": matcher_hits_24h,
+                "matcher_overrides_24h": matcher_overrides_24h,
                 "pending_refactor_queue_count": len(refactor_open),
                 "pending_refactor_queue": refactor_open,
+                "lifecycle_audit": lifecycle_audit,
             },
             "playbooks": {
                 "active_count": len(playbooks_ws),
@@ -3068,7 +3158,12 @@ def create_control_center_router(get_runtime) -> APIRouter:
             },
             "meta_reflection": {
                 "enabled": bool(kv3.meta_reflection_enabled),
+                "attribution_enabled": bool(kv3.meta_reflection_attribution_enabled),
                 "state": meta_state,
+                "llm_schema_retry_24h": retry_24h,
+                "attempt_failure_buckets_24h": attempt_fail_buckets_24h,
+                "last_attribution": meta_state.get("last_attribution"),
+                "unresolved_pain_score": meta_state.get("unresolved_pain_score"),
                 "recent_decisions": [
                     {
                         "selected": d.selected,
@@ -3078,6 +3173,10 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     }
                     for d in meta_decs
                 ],
+            },
+            "l2_evolution_bridge": {
+                "enabled": bool(kv3.l2_evolution_bridge_enabled),
+                "state": bridge_state,
             },
         }
 

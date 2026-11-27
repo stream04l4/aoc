@@ -131,6 +131,7 @@ class ProposalManager:
         *,
         candidate_root: str | Path | None = None,
         pytest_runner_fn: Callable[[Path], Awaitable[tuple[bool, str]] | tuple[bool, str]] | None = None,
+        emit_outbox_notification: bool = True,
     ) -> dict[str, Any]:
         """Stage 1 (zero prod tokens): run 4-layer ConstitutionGuard & enqueue Stage 2 human approval card."""
         prop = await self.resolve_proposal(proposal_id_or_key)
@@ -168,25 +169,26 @@ class ProposalManager:
         assert updated is not None
 
         entropy_idx = (updated.get("entropy_snapshot") or {}).get("entropy_index")
-        await self.state_repo.enqueue_outbox_event(
-            event_type=OutboxEventType.NOTIFICATION_DISPATCH,
-            idempotency_key=f"notify:evo_proposal:{updated['id']}",
-            payload={
-                "kind": "evolution_proposal_approval",
-                "proposal_id": str(updated["id"]),
-                "proposal_key": updated["proposal_key"],
-                "target_generation": updated["target_generation"],
-                "trigger_type": updated["trigger_type"],
-                "trigger_reason": updated["trigger_reason"],
-                "hypothesis": updated["hypothesis"],
-                "changed_files": verdict.changed_files,
-                "mutates_drive_metrics": verdict.mutates_drive_metrics,
-                "arena_budget": updated.get("arena_budget") or {"max_tokens": 500000, "max_seconds": 1200},
-                "entropy_index": entropy_idx,
-            },
-            aggregate_type="evolution_proposal",
-            aggregate_id=updated["id"],
-        )
+        if emit_outbox_notification:
+            await self.state_repo.enqueue_outbox_event(
+                event_type=OutboxEventType.NOTIFICATION_DISPATCH,
+                idempotency_key=f"notify:evo_proposal:{updated['id']}",
+                payload={
+                    "kind": "evolution_proposal_approval",
+                    "proposal_id": str(updated["id"]),
+                    "proposal_key": updated["proposal_key"],
+                    "target_generation": updated["target_generation"],
+                    "trigger_type": updated["trigger_type"],
+                    "trigger_reason": updated["trigger_reason"],
+                    "hypothesis": updated["hypothesis"],
+                    "changed_files": verdict.changed_files,
+                    "mutates_drive_metrics": verdict.mutates_drive_metrics,
+                    "arena_budget": updated.get("arena_budget") or {"max_tokens": 500000, "max_seconds": 1200},
+                    "entropy_index": entropy_idx,
+                },
+                aggregate_type="evolution_proposal",
+                aggregate_id=updated["id"],
+            )
         logger.info("proposal.stage1_passed_pending_human", proposal_key=updated["proposal_key"])
         return updated
 

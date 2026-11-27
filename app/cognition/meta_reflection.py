@@ -12,6 +12,7 @@ Produces at most 3 strictly bounded outlets:
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -20,6 +21,7 @@ from sqlalchemy import desc, select
 
 from app.cognition.gateway import LLMGateway, LLMGatewayInterface
 from app.cognition.interfaces import BrainInterface, MetaReflectionContext, MetaReflectionOutput
+from app.drives.interfaces import clamp01
 from app.observability.logging import get_logger
 from app.observability.topic_diversity import TopicDiversityAnalyzer
 from app.perception.interfaces import utcnow
@@ -98,6 +100,11 @@ class MetaReflectionManager:
         failure_threshold: int = 5,
         l2_cooldown_hours: int = 24,
         failure_cooldown_hours: float = 2.0,
+        attribution_enabled: bool = False,
+        attribution_min_hours: float = 6.0,
+        attribution_min_cycles: int = 5,
+        regression_delta: float = 0.08,
+        l2_bridge_enabled: bool = False,
     ) -> None:
         self.repo = repo
         self.brain = brain
@@ -109,6 +116,11 @@ class MetaReflectionManager:
         self.failure_threshold = max(1, int(failure_threshold))
         self.l2_cooldown_hours = max(1, int(l2_cooldown_hours))
         self.failure_cooldown_hours = max(0.1, float(failure_cooldown_hours))
+        self.attribution_enabled = bool(attribution_enabled)
+        self.attribution_min_hours = max(0.0, float(attribution_min_hours))
+        self.attribution_min_cycles = max(1, int(attribution_min_cycles))
+        self.regression_delta = max(0.01, float(regression_delta))
+        self.l2_bridge_enabled = bool(l2_bridge_enabled)
 
     async def get_state(self) -> dict[str, Any]:
         rows = await self.repo.list_world_items(kind="meta_reflection_state")
@@ -237,11 +249,241 @@ class MetaReflectionManager:
 
         return False, "not_due", metrics
 
+    async def _collect_failure_cluster_telemetry(
+        self,
+        *,
+        since: datetime,
+        total_goals: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+        """Collect `llm.schema_retry` & `orchestrator.attempt_failed` event clusters from DB or repo (V5.3 M3)."""
+        events_window: list[dict[str, Any]] = []
+        recent_error_events: list[dict[str, Any]] = []
+        db = getattr(self.repo, "db", None)
+        if db is not None:
+            try:
+                async with db.session() as s:
+                    rows = (
+                        await s.execute(
+                            select(EventLog)
+                            .where(EventLog.created_at >= since)
+                            .order_by(desc(EventLog.created_at))
+                            .limit(300)
+                        )
+                    ).scalars().all()
+                    for er in rows:
+                        events_window.append(
+                            {
+                                "event_type": er.event_type,
+                                "level": er.level,
+                                "message": str(er.message or "")[:200],
+                                "payload": er.payload if isinstance(er.payload, dict) else {},
+                            }
+                        )
+            except Exception as exc:
+                logger.warning("meta_reflection.event_telemetry_db_degraded", error=str(exc))
+        elif hasattr(self.repo, "list_events"):
+            try:
+                raw_evs = await self.repo.list_events(limit=200)
+                for ev in raw_evs:
+                    ev_dt = _parse_dt(ev.get("at") or ev.get("created_at"))
+                    if ev_dt is not None and ev_dt < since:
+                        continue
+                    events_window.append(
+                        {
+                            "event_type": ev.get("event_type"),
+                            "level": ev.get("level", "info"),
+                            "message": str(ev.get("message") or "")[:200],
+                            "payload": ev.get("payload") if isinstance(ev.get("payload"), dict) else {},
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("meta_reflection.event_telemetry_repo_degraded", error=str(exc))
+
+        retry_total = 0
+        retry_by_cat: dict[str, int] = {}
+        retry_by_op: dict[str, int] = {}
+        attempt_total = 0
+        attempt_by_bucket: dict[str, int] = {}
+        attempt_by_agent: dict[str, int] = {}
+
+        for ev in events_window:
+            etype = str(ev.get("event_type") or "")
+            lvl = str(ev.get("level") or "").lower()
+            pl = ev.get("payload") or {}
+            if lvl in {"error", "warning"} and len(recent_error_events) < 12:
+                recent_error_events.append(
+                    {
+                        "event_type": etype,
+                        "level": ev.get("level"),
+                        "message": ev.get("message", ""),
+                    }
+                )
+            if etype == "llm.schema_retry":
+                retry_total += 1
+                cat = str(pl.get("category") or "validation_error")
+                op = str(pl.get("operation") or "unknown")
+                retry_by_cat[cat] = retry_by_cat.get(cat, 0) + 1
+                retry_by_op[op] = retry_by_op.get(op, 0) + 1
+            elif etype == "orchestrator.attempt_failed":
+                attempt_total += 1
+                bkt = str(pl.get("failure_bucket") or "other")
+                ag = str(pl.get("agent_id") or "unknown")
+                attempt_by_bucket[bkt] = attempt_by_bucket.get(bkt, 0) + 1
+                attempt_by_agent[ag] = attempt_by_agent.get(ag, 0) + 1
+
+        llm_stats = {
+            "total_24h": retry_total,
+            "by_category": retry_by_cat,
+            "by_operation": retry_by_op,
+            "retry_rate": round(retry_total / max(1, int(total_goals)), 4),
+        }
+        attempt_clusters = {
+            "total_24h": attempt_total,
+            "by_bucket": attempt_by_bucket,
+            "by_agent": attempt_by_agent,
+        }
+        return llm_stats, attempt_clusters, recent_error_events
+
+    @staticmethod
+    def _build_metrics_snapshot(
+        *,
+        goal_stats: dict[str, Any],
+        execution_mode_counts: dict[str, int],
+        llm_schema_retry_stats: dict[str, Any],
+        attempt_failure_clusters: dict[str, Any],
+        validated_count: int,
+        zero_reuse_count: int,
+        now_dt: datetime,
+    ) -> dict[str, Any]:
+        ach = int(goal_stats.get("achieved") or 0)
+        fld = int(goal_stats.get("failed") or 0)
+        abn = int(goal_stats.get("abandoned") or 0)
+        term = ach + fld + abn
+        fail_rate = round((fld + abn) / term, 4) if term > 0 else 0.0
+        reused = max(0, validated_count - zero_reuse_count)
+        reuse_ratio = round(reused / validated_count, 4) if validated_count > 0 else 0.0
+        total_modes = sum(int(v or 0) for v in execution_mode_counts.values())
+        br_cnt = int(execution_mode_counts.get("brain_research") or 0)
+        br_ratio = round(br_cnt / total_modes, 4) if total_modes > 0 else 0.0
+        retry_cnt = int(llm_schema_retry_stats.get("total_24h") or 0)
+        retry_rate = float(llm_schema_retry_stats.get("retry_rate") or 0.0)
+        timeout_cnt = int((attempt_failure_clusters.get("by_bucket") or {}).get("timeout") or 0)
+        return {
+            "goal_failure_rate": fail_rate,
+            "terminal_goals_count": term,
+            "llm_schema_retry_count": retry_cnt,
+            "llm_schema_retry_rate": retry_rate,
+            "attempt_timeout_count": timeout_cnt,
+            "skill_reuse_ratio": reuse_ratio,
+            "brain_research_ratio": br_ratio,
+            "recorded_at": now_dt.isoformat(),
+        }
+
+    async def evaluate_previous_reflection_impact(
+        self,
+        state: dict[str, Any],
+        current_metrics: dict[str, Any],
+        *,
+        now: datetime | None = None,
+        cycle_id: uuid.UUID | None = None,
+    ) -> dict[str, Any] | None:
+        """Compare post-reflection metrics against prior baseline; auto-revert degraded L1 playbook (V5.3 M3)."""
+        if not self.attribution_enabled:
+            return None
+        prev_baseline = state.get("baseline_metrics")
+        prev_at_raw = state.get("last_reflection_at")
+        prev_at = _parse_dt(prev_at_raw)
+        if not isinstance(prev_baseline, dict) or prev_at is None:
+            return None
+        if prev_at_raw and state.get("last_attribution_for") == prev_at_raw:
+            cached = state.get("last_attribution")
+            return dict(cached) if isinstance(cached, dict) else None
+
+        cur_now = _ensure_utc(now or utcnow())
+        elapsed_h = max(0.0, (cur_now - prev_at).total_seconds() / 3600.0)
+        since_goals = await self.repo.list_recent_goals(since=prev_at, limit=120)
+        term_since_prev = sum(
+            1 for g in since_goals if str(g.get("status") or "").upper() in {"ACHIEVED", "FAILED", "ABANDONED"}
+        )
+        if elapsed_h < self.attribution_min_hours and term_since_prev < self.attribution_min_cycles:
+            return {
+                "verdict": "pending",
+                "elapsed_hours": round(elapsed_h, 2),
+                "terminal_goals_since_prev": term_since_prev,
+            }
+
+        prev_fail = float(prev_baseline.get("goal_failure_rate") or 0.0)
+        cur_fail = float(current_metrics.get("goal_failure_rate") or 0.0)
+        delta_fail = round(cur_fail - prev_fail, 4)
+
+        prev_reuse = float(prev_baseline.get("skill_reuse_ratio") or 0.0)
+        cur_reuse = float(current_metrics.get("skill_reuse_ratio") or 0.0)
+        delta_reuse = round(cur_reuse - prev_reuse, 4)
+
+        prev_retry_rate = float(prev_baseline.get("llm_schema_retry_rate") or 0.0)
+        cur_retry_rate = float(current_metrics.get("llm_schema_retry_rate") or 0.0)
+        prev_retry_cnt = int(prev_baseline.get("llm_schema_retry_count") or 0)
+        cur_retry_cnt = int(current_metrics.get("llm_schema_retry_count") or 0)
+        if prev_retry_rate > 0:
+            retry_ratio = round(cur_retry_rate / prev_retry_rate, 3)
+        elif prev_retry_cnt > 0:
+            retry_ratio = round(cur_retry_cnt / prev_retry_cnt, 3)
+        else:
+            retry_ratio = 2.0 if cur_retry_cnt >= 6 else 1.0
+
+        regressed = (
+            delta_fail > self.regression_delta
+            or (retry_ratio >= 2.0 and cur_retry_cnt >= 5)
+        )
+        improved = (not regressed) and (delta_fail <= -0.05 or (delta_reuse >= 0.05 and delta_fail <= 0.02))
+        verdict = "regressed" if regressed else ("improved" if improved else "neutral")
+
+        reverted_playbook: dict[str, Any] | None = None
+        pb_dom = str(state.get("last_applied_playbook_domain") or "").strip()
+        if verdict == "regressed" and pb_dom and self.playbook_manager is not None and hasattr(
+            self.playbook_manager, "rollback_to_parent"
+        ):
+            try:
+                rb = await self.playbook_manager.rollback_to_parent(
+                    pb_dom,
+                    reason=(
+                        f"meta_reflection_regression (fail_rate {prev_fail:.2f}->{cur_fail:.2f}, "
+                        f"retry_ratio={retry_ratio:.2f})"
+                    ),
+                )
+                reverted_playbook = rb
+                if rb.get("rolled_back"):
+                    await self.repo.log_event(
+                        "meta_reflection.playbook_auto_reverted",
+                        level="warning",
+                        message=(
+                            f"Auto-reverted playbook '{pb_dom}' v{rb.get('from_version')}->"
+                            f"v{rb.get('to_version')} due to meta-reflection regression"
+                        ),
+                        payload=rb,
+                        cycle_id=cycle_id,
+                    )
+            except Exception as exc:
+                logger.warning("meta_reflection.auto_revert_degraded", domain=pb_dom, error=str(exc))
+
+        return {
+            "verdict": verdict,
+            "evaluated_at": cur_now.isoformat(),
+            "prev_reflection_at": prev_at_raw,
+            "elapsed_hours": round(elapsed_h, 2),
+            "terminal_goals_since_prev": term_since_prev,
+            "delta_goal_failure_rate": delta_fail,
+            "delta_skill_reuse_ratio": delta_reuse,
+            "retry_ratio": retry_ratio,
+            "reverted_playbook": reverted_playbook,
+        }
+
     async def build_diagnostic_bundle(
         self,
         *,
         now: datetime | None = None,
         trigger_reason: str = "interval_elapsed",
+        previous_reflection_impact: dict[str, Any] | None = None,
     ) -> MetaReflectionContext:
         cur_now = _ensure_utc(now or utcnow())
         win_hours = max(24, self.interval_hours)
@@ -276,34 +518,20 @@ class MetaReflectionManager:
                     }
                 )
 
-        recent_error_events: list[dict[str, Any]] = []
         execution_mode_counts: dict[str, int] = {"codex": 0, "brain_research": 0, "skill_first": 0}
         recent_invocations_7d = 0
+
+        llm_schema_retry_stats, attempt_failure_clusters, recent_error_events = (
+            await self._collect_failure_cluster_telemetry(
+                since=since,
+                total_goals=max(len(recent_goals), 1),
+            )
+        )
 
         db = getattr(self.repo, "db", None)
         if db is not None:
             try:
                 async with db.session() as s:
-                    err_rows = (
-                        await s.execute(
-                            select(EventLog)
-                            .where(
-                                EventLog.created_at >= since,
-                                EventLog.level.in_(["error", "warning", "ERROR", "WARNING"]),
-                            )
-                            .order_by(desc(EventLog.created_at))
-                            .limit(10)
-                        )
-                    ).scalars().all()
-                    for er in err_rows:
-                        recent_error_events.append(
-                            {
-                                "event_type": er.event_type,
-                                "level": er.level,
-                                "message": str(er.message or "")[:200],
-                            }
-                        )
-
                     plan_rows = (
                         await s.execute(
                             select(ActionPlanRow)
@@ -382,6 +610,21 @@ class MetaReflectionManager:
             or (cur_now - last_l2_dt).total_seconds() >= self.l2_cooldown_hours * 3600.0
         )
 
+        allowlist_sample: list[str] = []
+        if self.l2_bridge_enabled:
+            try:
+                from app.evolution.constitution_guard import EVOLVABLE_ALLOWLIST
+
+                allowlist_sample = sorted(EVOLVABLE_ALLOWLIST)[:12]
+            except Exception:
+                allowlist_sample = []
+
+        eff_impact = (
+            previous_reflection_impact
+            if previous_reflection_impact is not None
+            else (state.get("last_attribution") if isinstance(state.get("last_attribution"), dict) else None)
+        )
+
         return MetaReflectionContext(
             now_iso=cur_now.isoformat(),
             trigger_reason=trigger_reason,
@@ -402,6 +645,11 @@ class MetaReflectionManager:
             topic_diversity_summary=topic_summary,
             l2_proposal_allowed=l2_allowed,
             previous_reflection_summary=str(state.get("last_diagnosis_summary") or "")[:300],
+            llm_schema_retry_stats=llm_schema_retry_stats,
+            attempt_failure_clusters=attempt_failure_clusters,
+            previous_reflection_impact=eff_impact,
+            l2_evolution_bridge_enabled=self.l2_bridge_enabled,
+            evolvable_allowlist_sample=allowlist_sample,
         )
 
     async def run_if_due(
@@ -423,6 +671,23 @@ class MetaReflectionManager:
 
         ctx = await self.build_diagnostic_bundle(now=cur_now, trigger_reason=reason)
         prev_state = await self.get_state()
+        current_metrics = self._build_metrics_snapshot(
+            goal_stats=ctx.goal_stats,
+            execution_mode_counts=ctx.execution_mode_counts,
+            llm_schema_retry_stats=ctx.llm_schema_retry_stats,
+            attempt_failure_clusters=ctx.attempt_failure_clusters,
+            validated_count=int(ctx.goal_stats.get("validated_skill_count") or 0),
+            zero_reuse_count=int(ctx.goal_stats.get("zero_reuse_skill_count") or 0),
+            now_dt=cur_now,
+        )
+        attribution_impact = await self.evaluate_previous_reflection_impact(
+            prev_state,
+            current_metrics,
+            now=cur_now,
+            cycle_id=cycle_id,
+        )
+        if attribution_impact is not None:
+            ctx = ctx.model_copy(update={"previous_reflection_impact": attribution_impact})
 
         if isinstance(self.llm_gateway, LLMGateway):
             with self.llm_gateway.scope(cycle_id=cycle_id, purpose="meta_reflection"):
@@ -525,21 +790,61 @@ class MetaReflectionManager:
                         output.l2_upgrade_proposal.get("topic_key")
                         or f"meta_l2_{cur_now.strftime('%Y%m%d_%H%M')}"
                     )[:96]
-                    outreach_res = await self.human_bridge.maybe_send_outreach(
-                        kind="ask_human",
-                        topic_key=topic_key,
-                        title=l2_title[:160],
-                        message=l2_msg[:1200],
-                        reason=str(output.l2_upgrade_proposal.get("reason") or output.diagnosis_summary)[:300],
-                        expected_benefit=str(output.l2_upgrade_proposal.get("expected_benefit") or "")[:300],
-                        options=options,
-                        cycle_id=cycle_id,
-                    )
+                    outreach_kwargs: dict[str, Any] = {
+                        "kind": "ask_human",
+                        "topic_key": topic_key,
+                        "title": l2_title[:160],
+                        "message": l2_msg[:1200],
+                        "reason": str(output.l2_upgrade_proposal.get("reason") or output.diagnosis_summary)[:300],
+                        "expected_benefit": str(output.l2_upgrade_proposal.get("expected_benefit") or "")[:300],
+                        "options": options,
+                        "cycle_id": cycle_id,
+                    }
+                    proposed_change = output.l2_upgrade_proposal.get("proposed_change")
+                    if self.l2_bridge_enabled and isinstance(proposed_change, dict):
+                        try:
+                            sig = inspect.signature(self.human_bridge.maybe_send_outreach)
+                            if "extra_metadata" in sig.parameters or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                            ):
+                                outreach_kwargs["extra_metadata"] = {
+                                    "bridge_stage": "stage0_candidate",
+                                    "proposed_change": proposed_change,
+                                    "rollback_plan": rollback_plan[:300],
+                                    "hypothesis": str(output.l2_upgrade_proposal.get("reason") or output.diagnosis_summary)[:300],
+                                }
+                        except Exception:
+                            pass
+                    outreach_res = await self.human_bridge.maybe_send_outreach(**outreach_kwargs)
                     l2_outcome = dict(outreach_res or {})
                     if outreach_res.get("sent"):
                         new_last_l2_at = cur_now.isoformat()
 
         reflection_count = int(prev_state.get("reflection_count") or 0) + 1
+        last_pb_domain = prev_state.get("last_applied_playbook_domain")
+        if playbook_outcome.get("saved") and playbook_outcome.get("domain"):
+            last_pb_domain = str(playbook_outcome["domain"])
+        elif isinstance(attribution_impact, dict) and (attribution_impact.get("reverted_playbook") or {}).get("rolled_back"):
+            last_pb_domain = None
+
+        last_attr_for = prev_state.get("last_attribution_for")
+        if isinstance(attribution_impact, dict) and attribution_impact.get("verdict") in {"improved", "neutral", "regressed"}:
+            last_attr_for = prev_state.get("last_reflection_at")
+
+        fail_rate_cur = float(current_metrics.get("goal_failure_rate") or 0.0)
+        retry_cnt_cur = int(current_metrics.get("llm_schema_retry_count") or 0)
+        timeout_cnt_cur = int(current_metrics.get("attempt_timeout_count") or 0)
+        regressed_pen = 0.20 if (isinstance(attribution_impact, dict) and attribution_impact.get("verdict") == "regressed") else 0.0
+        pain_score = round(
+            clamp01(
+                0.45 * fail_rate_cur
+                + 0.25 * min(1.0, retry_cnt_cur / 15.0)
+                + 0.20 * min(1.0, timeout_cnt_cur / 5.0)
+                + regressed_pen
+            ),
+            4,
+        )
+
         new_state = {
             "last_reflection_at": cur_now.isoformat(),
             "last_trigger_reason": reason,
@@ -551,6 +856,11 @@ class MetaReflectionManager:
             "last_playbook_outcome": playbook_outcome,
             "last_refactor_outcome": refactor_outcome,
             "last_l2_outcome": l2_outcome,
+            "baseline_metrics": current_metrics,
+            "last_attribution": attribution_impact if attribution_impact is not None else prev_state.get("last_attribution"),
+            "last_attribution_for": last_attr_for,
+            "last_applied_playbook_domain": last_pb_domain,
+            "unresolved_pain_score": pain_score,
         }
         await self.repo.upsert_world_item(
             kind="meta_reflection_state",
@@ -593,5 +903,7 @@ class MetaReflectionManager:
             "playbook_outcome": playbook_outcome,
             "refactor_outcome": refactor_outcome,
             "l2_outcome": l2_outcome,
+            "attribution_impact": attribution_impact,
+            "unresolved_pain_score": pain_score,
             "reflection_count": reflection_count,
         }

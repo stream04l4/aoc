@@ -25,6 +25,8 @@ _NON_INHERITABLE_WORLD_KINDS = (
     "interest_portfolio",
     "meta_reflection_state",
     "skill_refactor_queue",
+    "skill_lifecycle_audit",
+    "l2_evolution_bridge_state",
 )
 _REQUIRED_BLANK_TABLES = (
     "memory_index",

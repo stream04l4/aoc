@@ -190,6 +190,7 @@ class AutonomousLoop:
         self._last_prediction_error: float = 0.0
         self._consecutive_dedup_skips: dict[str, int] = {}
         self._last_draft_cleanup_at: datetime | None = None
+        self._last_skill_lifecycle_audit_at: datetime | None = None
 
         # In-memory recent learning signals hydrated from DB on startup
         self._last_learning_at: datetime | None = None
@@ -435,6 +436,7 @@ class AutonomousLoop:
             await self.repo.update_cycle(cycle_id, phase="SELF_ASSESSMENT")
             await self._expire_stale_active_goals(now=now, cycle_id=cycle_id)
             await self._expire_stale_draft_skills(now=now, cycle_id=cycle_id)
+            await self._run_skill_lifecycle_audit_if_due(now=now, cycle_id=cycle_id)
             active_goals_for_recall = await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=3)
             recall_query = build_contextual_query(
                 observation=pre_obs,
@@ -1118,9 +1120,58 @@ class AutonomousLoop:
 
             # ── 8. COGNITIVE PLANNING ───────────────────────────────────────
             await self.repo.update_cycle(cycle_id, phase="COGNITIVE_PLANNING")
-            plan = await self._plan_safe(
-                cog_ctx.model_copy(update={"goal": goal_proposal}), llm_available_for_brain, cycle_id, goal_id=goal_id
+            top_skill_match_cand = None
+            if kv3.skill_first_planning_enabled and reusable_skills:
+                try:
+                    from app.skills.matcher import SkillMatchPreSelector
+
+                    top_skill_match_cand = SkillMatchPreSelector().select_top_match(
+                        goal_proposal,
+                        reusable_skills,
+                        threshold=float(kv3.skill_match_hint_threshold),
+                    )
+                except Exception as exc:
+                    logger.warning("cycle.skill_matcher_degraded", cycle_id=str(cycle_id), error=str(exc))
+
+            plan_ctx = cog_ctx.model_copy(
+                update={
+                    "goal": goal_proposal,
+                    "top_skill_match": (
+                        top_skill_match_cand.model_dump(mode="json") if top_skill_match_cand is not None else None
+                    ),
+                }
             )
+            plan = await self._plan_safe(plan_ctx, llm_available_for_brain, cycle_id, goal_id=goal_id)
+            if top_skill_match_cand is not None and plan.should_execute:
+                try:
+                    chosen_mode = str(plan.execution_mode or "codex").strip().lower()
+                    if chosen_mode == "skill_first":
+                        await self.repo.log_event(
+                            "skill_matcher.hit",
+                            level="info",
+                            message=f"Skill pre-selector matched '{top_skill_match_cand.canonical_name}' ({top_skill_match_cand.match_score:.2f}) -> skill_first",
+                            payload={
+                                "matched_skill": top_skill_match_cand.canonical_name,
+                                "match_score": top_skill_match_cand.match_score,
+                                "chosen_mode": chosen_mode,
+                            },
+                            cycle_id=cycle_id,
+                        )
+                    else:
+                        await self.repo.log_event(
+                            "skill_matcher.override",
+                            level="info",
+                            message=f"Planner overrode high-confidence skill '{top_skill_match_cand.canonical_name}' ({top_skill_match_cand.match_score:.2f}) with {chosen_mode}",
+                            payload={
+                                "matched_skill": top_skill_match_cand.canonical_name,
+                                "match_score": top_skill_match_cand.match_score,
+                                "chosen_mode": chosen_mode,
+                                "rationale": str(plan.rationale or "")[:300],
+                            },
+                            cycle_id=cycle_id,
+                        )
+                except Exception as exc:
+                    logger.warning("cycle.skill_matcher_event_degraded", error=str(exc))
             await self.repo.update_cycle(
                 cycle_id,
                 brain_output={
@@ -1563,6 +1614,7 @@ class AutonomousLoop:
         execution_reliability_recent: float | None = None
         playbook_freshness_score: float | None = None
         pending_skill_refactor_count = 0
+        unresolved_pain_score = 0.0
         if quality_enabled:
             try:
                 val_skills = await self.repo.list_skills(status="VALIDATED", limit=200)
@@ -1612,6 +1664,10 @@ class AutonomousLoop:
 
                 refactor_rows = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
                 pending_skill_refactor_count = len(refactor_rows)
+                meta_rows = await self.repo.list_world_items(kind="meta_reflection_state")
+                meta_pri = next((r for r in meta_rows if r.get("key") == "primary"), None)
+                if meta_pri and isinstance(meta_pri.get("value"), dict):
+                    unresolved_pain_score = clamp01(float(meta_pri["value"].get("unresolved_pain_score") or 0.0))
             except Exception as exc:
                 logger.warning("cycle.reproduction_quality_telemetry_degraded", error=str(exc))
 
@@ -1639,6 +1695,7 @@ class AutonomousLoop:
             execution_reliability_recent=execution_reliability_recent,
             playbook_freshness_score=playbook_freshness_score,
             pending_skill_refactor_count=pending_skill_refactor_count,
+            unresolved_pain_score=unresolved_pain_score,
             open_knowledge_gaps=list(gaps_by_topic.values()),
             unknown_topics=env_topics,
             exploration_attempted_recent=cur_done + cur_failed,
@@ -2550,6 +2607,43 @@ class AutonomousLoop:
         except Exception as exc:
             logger.warning("loop.stale_draft_skills_expire_degraded", cycle_id=str(cycle_id), error=str(exc))
             return 0
+
+    async def _run_skill_lifecycle_audit_if_due(self, *, now: datetime, cycle_id: uuid.UUID) -> dict[str, Any] | None:
+        """Periodically consolidate (>=7d) & archive (>=14d) zero-reuse VALIDATED skills (V5.3 M1)."""
+        kv3 = self.settings.kernel_v3
+        if (
+            not kv3.skill_lifecycle_gc_enabled
+            or self.skill_registry is None
+            or not hasattr(self.skill_registry, "audit_and_tidy_validated_skills")
+        ):
+            return None
+        interval_sec = max(1, int(kv3.skill_lifecycle_audit_interval_hours)) * 3600.0
+        now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        if self._last_skill_lifecycle_audit_at is None:
+            try:
+                rows = await self.repo.list_world_items(kind="skill_lifecycle_audit")
+                latest = next((r for r in rows if r.get("key") == "latest"), None)
+                if latest and isinstance(latest.get("value"), dict):
+                    parsed = self._parse_social_dt(latest["value"].get("audited_at"))
+                    if parsed is not None:
+                        self._last_skill_lifecycle_audit_at = parsed
+            except Exception:
+                pass
+        if (
+            self._last_skill_lifecycle_audit_at is not None
+            and (now_utc - self._last_skill_lifecycle_audit_at).total_seconds() < interval_sec
+        ):
+            return None
+        self._last_skill_lifecycle_audit_at = now_utc
+        try:
+            return await self.skill_registry.audit_and_tidy_validated_skills(
+                consolidate_days=kv3.skill_unused_consolidate_days,
+                expiry_days=kv3.skill_unused_expiry_days,
+                now=now_utc,
+            )
+        except Exception as exc:
+            logger.warning("loop.skill_lifecycle_audit_degraded", cycle_id=str(cycle_id), error=str(exc))
+            return None
 
     @staticmethod
     def _clean_high_ig_milestone_summary(raw_sum: str) -> str | None:

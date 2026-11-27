@@ -363,7 +363,7 @@ class InvestigationManager:
                     ch_payload["registered_source_id"] = registered_source_id
                 ch_res = await self.record_discovered_channel(
                     ch_payload,
-                    source=f"investigation:{tkey}",
+                    source=f"investigation:{tkey}"[:64],
                 )
                 if ch_res is not None:
                     artifacts.append(f"channel:{ch_res['domain']}")

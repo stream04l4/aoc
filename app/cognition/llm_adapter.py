@@ -58,6 +58,19 @@ def extract_json_object(text: str) -> str:
 
 
 UsageCallback = Callable[[str, LLMUsage], Awaitable[None]]
+SchemaRetryCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def classify_schema_retry_error(exc: Exception, raw_content: str | None) -> str:
+    """Classify structured LLM validation failures into coarse diagnostic categories (V5.3 M3)."""
+    if not str(raw_content or "").strip():
+        return "empty_content"
+    msg = str(exc or "").lower()
+    if "expecting value: line 1 column 1" in msg:
+        return "empty_content"
+    if isinstance(exc, json.JSONDecodeError) or "unterminated string" in msg or "eof" in msg:
+        return "unterminated_json"
+    return "validation_error"
 
 
 class OpenAICompatibleLLMAdapter:
@@ -68,10 +81,12 @@ class OpenAICompatibleLLMAdapter:
         settings: LLMSettings,
         http_client: httpx.AsyncClient | None = None,
         on_usage: UsageCallback | None = None,
+        on_schema_retry: SchemaRetryCallback | None = None,
     ) -> None:
         self.settings = settings
         self._http_client = http_client
         self._on_usage = on_usage
+        self.on_schema_retry = on_schema_retry
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -134,14 +149,31 @@ class OpenAICompatibleLLMAdapter:
                 return parsed
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 last_error = str(exc)
+                category = classify_schema_retry_error(exc, raw_text)
                 LLM_CALLS.labels(operation=operation, result="schema_error").inc()
                 logger.warning(
                     "llm.schema_retry",
                     operation=operation,
                     attempt=attempt,
                     max_attempts=max_attempts,
+                    category=category,
                     error=last_error[:300],
                 )
+                if self.on_schema_retry is not None:
+                    try:
+                        await self.on_schema_retry(
+                            {
+                                "operation": operation,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "category": category,
+                                "error": last_error[:300],
+                                "raw_chars": len(raw_text or ""),
+                                "model": self.settings.model,
+                            }
+                        )
+                    except Exception:
+                        pass
                 if attempt < max_attempts:
                     messages.append({"role": "assistant", "content": raw_text[:2000]})
                     messages.append(

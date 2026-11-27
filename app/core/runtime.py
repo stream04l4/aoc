@@ -457,6 +457,8 @@ class OrganismRuntime:
                 skill_registry=self.skill_registry,
                 governance=self.governance,
                 default_timeout_seconds=self.settings.kernel_v3.skill_exec_timeout_seconds,
+                auto_heal_enabled=self.settings.kernel_v3.skill_first_auto_heal_enabled,
+                consecutive_fail_refactor_threshold=self.settings.kernel_v3.skill_consecutive_fail_refactor_threshold,
             )
             if self.settings.kernel_v3.skill_mcp_bridge_enabled and self.mcp_manager is not None:
                 self.mcp_manager.attach_skill_runtime(self.skill_runtime)
@@ -497,6 +499,22 @@ class OrganismRuntime:
             repo=self.repo,
             config=eff_affect_cfg,
         )
+        self.l2_evolution_bridge: Any = None
+        if self.settings.kernel_v3.l2_evolution_bridge_enabled:
+            from app.evolution.l2_bridge import L2EvolutionBridge
+
+            self.l2_evolution_bridge = L2EvolutionBridge(
+                evo_repo=self.evolution_repo,
+                state_repo=self.repo,
+                proposal_manager=self.proposal_manager,
+                constitution_guard=self.constitution_guard,
+                human_bridge=self.human_bridge,
+                repo_root=self.settings.evolution.repo_root,
+                instances_root=self.settings.evolution.instances_root,
+                workspace_root=self.settings.governance.workspace_root,
+                enabled=self.settings.kernel_v3.l2_evolution_bridge_enabled,
+            )
+            self.human_bridge.l2_bridge = self.l2_evolution_bridge
         self.meta_reflection_manager = MetaReflectionManager(
             repo=self.repo,
             brain=self.brain,
@@ -507,6 +525,11 @@ class OrganismRuntime:
             interval_hours=self.settings.kernel_v3.meta_reflection_interval_hours,
             failure_threshold=self.settings.kernel_v3.meta_reflection_failure_threshold,
             l2_cooldown_hours=self.settings.kernel_v3.meta_reflection_l2_cooldown_hours,
+            attribution_enabled=self.settings.kernel_v3.meta_reflection_attribution_enabled,
+            attribution_min_hours=self.settings.kernel_v3.meta_reflection_attribution_min_hours,
+            attribution_min_cycles=self.settings.kernel_v3.meta_reflection_attribution_min_cycles,
+            regression_delta=self.settings.kernel_v3.meta_reflection_regression_delta,
+            l2_bridge_enabled=self.settings.kernel_v3.l2_evolution_bridge_enabled,
         )
 
         self.finalizer = TaskFinalizer(

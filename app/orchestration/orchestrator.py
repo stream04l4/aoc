@@ -96,6 +96,27 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def classify_attempt_failure_bucket(status: str, fail_reason: str) -> str:
+    """Classify execution attempt failures into deterministic root-cause buckets (V5.3 M3)."""
+    st_u = str(status or "").upper()
+    low = str(fail_reason or "").lower()
+    if st_u == "TIMEOUT" or "timed out" in low or "timeout" in low:
+        return "timeout"
+    if any(
+        tok in low
+        for tok in ("permission denied", "eacces", "read-only file system", "operation not permitted", "policy denied")
+    ):
+        return "permission_denied"
+    if any(tok in low for tok in ("sandbox", "bwrap", "cgroup", "runner", "socket", "broken pipe")):
+        return "sandbox_error"
+    if any(
+        tok in low
+        for tok in ("verification", "file_exists", "contains_keywords", "min_output_chars", "non_empty_output")
+    ):
+        return "verification_failed"
+    return "other"
+
+
 class AgentOrchestrator:
     def __init__(
         self,
@@ -391,12 +412,24 @@ class AgentOrchestrator:
                 )
                 if staged is not None:
                     res_budget["skill_refactor_target"] = staged
+                    failure_cases_note = (
+                        f"- {int(staged.get('failure_cases_count') or 0)} historical failure case(s) are recorded in `./.aoc_base_skill/failure_cases.json`; you MUST inspect them and add regression assertions covering those exact failure modes in `./test_skill.py` (Gate B).\n"
+                        if int(staged.get("failure_cases_count") or 0) > 0
+                        else ""
+                    )
+                    merge_note = (
+                        f"- Consolidation target: fold capabilities from overlapping candidates {staged['merge_candidates']} cleanly into `./skill.py` while keeping public signatures compatible.\n"
+                        if staged.get("merge_candidates")
+                        else ""
+                    )
                     refactor_note = (
                         "\n\n[Explicit Skill Refactoring Instructions]\n"
                         f"- Baseline skill '{staged['canonical_name']}' (v{staged['base_version']}) has been "
-                        "staged read-only inside `./.aoc_base_skill/` (`skill.py`, `test_skill.py`, `metadata.json`).\n"
-                        "- You MUST read `./.aoc_base_skill/skill.py`, `./.aoc_base_skill/test_skill.py`, and `./.aoc_base_skill/metadata.json` first.\n"
+                        "staged read-only inside `./.aoc_base_skill/` (`skill.py`, `test_skill.py`, `metadata.json`, `failure_cases.json`).\n"
+                        "- You MUST read `./.aoc_base_skill/skill.py`, `./.aoc_base_skill/test_skill.py`, `./.aoc_base_skill/metadata.json`, and `./.aoc_base_skill/failure_cases.json` first.\n"
                         f"- Target generalization: {staged.get('target_generalization') or staged.get('reason') or 'preserve existing contracts while improving edge-case handling and reusability'}.\n"
+                        f"{failure_cases_note}"
+                        f"{merge_note}"
                         "- Preserve ALL existing public entrypoint signatures (`execute`/`run`/etc.) and backward-compatible input/output contracts.\n"
                         "- Write the refactored skill code and expanded unit tests directly to workspace root `./skill.py` and `./test_skill.py` (do NOT edit only inside `./.aoc_base_skill/`, which is the staged read-only baseline) so ALL assertions in `./.aoc_base_skill/test_skill.py` pass unchanged (Gate A), AND expand `./test_skill.py` with new boundary assertions (Gate B).\n"
                         "- Keep the task focused cleanly on refactoring and testing this skill without bundling unrelated heavy external multi-hop research.\n"
@@ -781,6 +814,31 @@ class AgentOrchestrator:
             max_attempts=effective_max_attempts,
             reason=fail_reason,
         )
+        try:
+            cycle_uuid_log = uuid.UUID(task_row["cycle_id"]) if task_row.get("cycle_id") else None
+            bucket = classify_attempt_failure_bucket(execution.status, fail_reason)
+            await self.repo.log_event(
+                "orchestrator.attempt_failed",
+                level="warning",
+                message=(
+                    f"Attempt {attempt}/{effective_max_attempts} failed [{bucket}] on "
+                    f"{execution.agent_id}: {str(fail_reason or '')[:200]}"
+                ),
+                payload={
+                    "task_id": str(task_uuid),
+                    "execution_id": execution.execution_id,
+                    "agent_id": execution.agent_id,
+                    "status": execution.status,
+                    "attempt": attempt,
+                    "max_attempts": effective_max_attempts,
+                    "failure_bucket": bucket,
+                    "reason": str(fail_reason or "")[:300],
+                    "objective": str(task_row.get("objective") or "")[:160],
+                },
+                cycle_id=cycle_uuid_log,
+            )
+        except Exception:
+            pass
 
         if attempt < effective_max_attempts:
             # Prefer switching to an untried healthy agent via explainable AgentRouter; otherwise retry same healthy agent

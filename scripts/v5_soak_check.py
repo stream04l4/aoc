@@ -33,6 +33,7 @@ from app.storage.database import Database
 from app.storage.models import (
     ActiveGoal,
     AgentExecutionRow,
+    EventLog,
     InstanceRegistryRow,
     LineageRecordRow,
     SkillRegistryRow,
@@ -275,20 +276,82 @@ async def run_v5_soak_check(
                     failures.append(f"V5.2 stale DRAFT skill backlog exceeded hygiene cap ({stale_draft_cnt} > 5)")
                 if stale_active_goals_cnt > 2:
                     failures.append(f"V5.2 stale ACTIVE goals exceeded hygiene cap ({stale_active_goals_cnt} > 2)")
+                # V5.3 observability (unused 14d validated skills, llm.schema_retry / attempt_failed, bridge state)
+                unused_14d_cutoff = now_utc - timedelta(days=14)
+                unused_14d_cnt = sum(
+                    1
+                    for sk in skill_rows
+                    if sk.status == "VALIDATED"
+                    and int(sk.reuse_count or 0) == 0
+                    and int(sk.invocation_count or 0) == 0
+                    and (_norm_utc(sk.created_at or sk.updated_at) or now_utc) <= unused_14d_cutoff
+                    and (
+                        _norm_utc(sk.last_invoked_at) is None
+                        or (_norm_utc(sk.last_invoked_at) or now_utc) <= unused_14d_cutoff
+                    )
+                )
+                retry_24h = 0
+                attempt_fail_24h = 0
+                bridge_state_recorded = False
+                if "event_logs" in tbls:
+                    async with db.session() as s:
+                        ev_rows = (
+                            await s.execute(
+                                select(EventLog).where(
+                                    EventLog.created_at >= since_24h,
+                                    EventLog.event_type.in_(["llm.schema_retry", "orchestrator.attempt_failed"]),
+                                )
+                            )
+                        ).scalars().all()
+                        retry_24h = sum(1 for e in ev_rows if e.event_type == "llm.schema_retry")
+                        attempt_fail_24h = sum(1 for e in ev_rows if e.event_type == "orchestrator.attempt_failed")
+                        bridge_row = (
+                            await s.execute(
+                                select(WorldState).where(
+                                    WorldState.kind == "l2_evolution_bridge_state",
+                                    WorldState.key == "primary",
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        bridge_state_recorded = bridge_row is not None
+                v5_3_obs: dict[str, Any] = {
+                    "ok": True,
+                    "skipped": False,
+                    "unused_validated_14d_count": unused_14d_cnt,
+                    "llm_schema_retry_24h": retry_24h,
+                    "attempt_failed_24h": attempt_fail_24h,
+                    "l2_bridge_state_recorded": bridge_state_recorded,
+                }
+            else:
+                v5_3_obs = {"ok": True, "skipped": True}
             checks["v5_2_observability"] = v5_2_obs
+            checks["v5_3_observability"] = v5_3_obs
         finally:
             await db.dispose()
     else:
         checks["database"] = {"ok": True, "skipped": True, "v5_tables_present": False}
         checks["v5_1_observability"] = {"ok": True, "skipped": True}
         checks["v5_2_observability"] = {"ok": True, "skipped": True}
+        checks["v5_3_observability"] = {"ok": True, "skipped": True}
 
-    # 4. Orphan directory hygiene under instances_root (excluding `snapshots`)
+    # 4. Orphan directory hygiene under instances_root (excluding `snapshots` and `l2-worktrees`)
     dirs_on_disk: list[str] = []
     if inst_path.exists():
         dirs_on_disk = sorted(
-            p.name for p in inst_path.iterdir() if p.is_dir() and p.name != "snapshots"
+            p.name for p in inst_path.iterdir() if p.is_dir() and p.name not in {"snapshots", "l2-worktrees"}
         )
+    orphan_l2_worktrees: list[str] = []
+    for l2_root in (inst_path / "l2-worktrees", Path("/home/ubuntu/aoc-workspaces/l2-worktrees")):
+        if l2_root.is_dir():
+            for p in sorted(l2_root.iterdir()):
+                if p.is_dir() and p.name != "approved":
+                    orphan_l2_worktrees.append(str(p))
+    if orphan_l2_worktrees:
+        failures.append(f"Orphan L2 evolution worktrees detected: {orphan_l2_worktrees}")
+    if "v5_3_observability" in checks and isinstance(checks["v5_3_observability"], dict):
+        checks["v5_3_observability"]["orphan_l2_worktrees"] = orphan_l2_worktrees
+        if orphan_l2_worktrees:
+            checks["v5_3_observability"]["ok"] = False
     if db_tables_present and active_candidate_keys:
         unexpected_dirs = [d for d in dirs_on_disk if d not in active_candidate_keys]
     else:
