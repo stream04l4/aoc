@@ -530,6 +530,7 @@ class OrganismRuntime:
             investigation_manager=self.investigation_manager,
             world_pipeline=self.world_pipeline,
             meta_reflection_manager=self.meta_reflection_manager,
+            reproduction_quality_scoring_enabled=self.settings.kernel_v3.reproduction_quality_scoring_enabled,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:

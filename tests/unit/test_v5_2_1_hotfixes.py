@@ -685,3 +685,163 @@ async def test_brain_research_and_skill_first_record_valid_started_completed_tim
     finally:
         await rt.stop()
         await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_post_drive_preserves_reproduction_quality_without_false_inhibition(tmp_path: Path):
+    """V5.2.2: Completing a curiosity goal must NOT reset reproduction to legacy count-only mode in post_drives."""
+    db_path = tmp_path / "v522_finalizer_rep.db"
+    db = Database(f"sqlite+aiosqlite:///{db_path}")
+    await _init_db(db)
+
+    class _StubMCP(MCPClientManager):
+        def __init__(self, *, governance: Any, repo: Any, workspace_root: str) -> None:
+            super().__init__(governance=governance, repo=repo, workspace_root=workspace_root, searxng_url="http://mock")
+            self.register_tool(ToolSpec(tool_name="web_search", server_name="s", description="search", permission_level="L0"))
+
+        async def invoke(self, req: ToolCallRequest) -> ToolCallResult:
+            return ToolCallResult(
+                tool_name="web_search",
+                server_name="s",
+                ok=True,
+                output={"query": "q", "count": 1, "results": [{"title": "Ref", "url": "https://example.org/r", "snippet": "Detailed study."}]},
+                latency_ms=5.0,
+            )
+
+    class _CuriosityCycleBrain(BrainInterface):
+        async def assess(self, observation: Observation, memories: list[dict[str, Any]], drives: list[Any]) -> AssessmentResult:
+            return AssessmentResult(summary="ok", confidence=0.9)
+
+        async def generate_goal(self, context: Any) -> GoalProposal:
+            return GoalProposal(
+                should_act=True,
+                title="Explore external neuroscience findings",
+                description="Research external neuroscience findings",
+                drive_type=context.decision.selected_drive,
+                related_key="neuro:findings_1",
+                predicted_ig=0.6,
+            )
+
+        async def plan(self, context: Any) -> ActionPlan:
+            return ActionPlan(
+                should_execute=True,
+                goal_title=context.goal.title if context.goal else "Explore",
+                objective="Synthesize external findings",
+                execution_mode="brain_research",
+                assigned_agent="brain_research",
+                permission_level="L0",
+                verification=[VerificationSpec(kind="non_empty_output")],
+            )
+
+        async def synthesize_research(self, context: ResearchSynthesisContext) -> BrainResearchOutput:
+            return BrainResearchOutput(
+                key_findings=["Synaptic plasticity modulates attention shifts."],
+                synthesis_markdown="### Findings\nSynaptic plasticity modulates attention shifts across cortical networks.",
+                cited_sources=["https://example.org/r"],
+                confidence=0.88,
+                human_brief="突触可塑性调控注意力转移。",
+            )
+
+        async def evaluate(self, context: EvaluationContext) -> EvaluationResult:
+            return EvaluationResult(
+                goal_achieved=True,
+                summary="Achieved curiosity research goal cleanly.",
+                information_gain=0.65,
+                should_persist_memory=True,
+            )
+
+    settings = Settings(
+        api=ApiSettings(host="127.0.0.1", auth_enabled=False),
+        database=DatabaseSettings(url=f"sqlite+aiosqlite:///{db_path}"),
+        memory=MemorySettings(provider="none", embedding_dim=128),
+        embedding=EmbeddingSettings(provider="hash_fallback", dimensions=128),
+        governance=GovernanceSettings(workspace_root=str(tmp_path / "ws")),
+        perception=PerceptionSettings(llm_probe=False),
+        runner=RunnerSettings(enabled=False),
+        kernel_v3=KernelV3Settings(
+            brain_research_enabled=True,
+            reproduction_quality_scoring_enabled=True,
+        ),
+        social=SocialSettings(enabled=False),
+    )
+    rt = OrganismRuntime(
+        settings=settings,
+        db=db,
+        brain=_CuriosityCycleBrain(),
+        registry=AgentRegistry(),
+        auto_load_agents=False,
+        llm_probe_fn=_healthy_llm_probe,
+    )
+    stub_mcp = _StubMCP(governance=rt.governance, repo=rt.repo, workspace_root=str(tmp_path / "ws"))
+    rt.mcp_manager = stub_mcp
+    await rt.start(start_scheduler=False)
+    rt.loop.mcp_manager = stub_mcp
+    try:
+        assert rt.finalizer.reproduction_quality_scoring_enabled is True
+        async with db.session() as s:
+            hot_id = uuid.uuid4()
+            s.add(
+                SkillRegistryRow(
+                    id=hot_id,
+                    skill_key="hot_skill",
+                    canonical_name="repo.coding.hot_skill",
+                    version="1.0.0",
+                    capability_key="coding",
+                    description="Hot skill",
+                    status=SkillStatus.VALIDATED.value,
+                    reuse_count=10,
+                    invocation_count=10,
+                )
+            )
+            for idx in range(21):
+                s.add(
+                    SkillRegistryRow(
+                        id=uuid.uuid4(),
+                        skill_key=f"cold_skill_{idx}",
+                        canonical_name=f"repo.coding.cold_{idx}",
+                        version="1.0.0",
+                        capability_key="coding",
+                        description="Cold skill",
+                        status=SkillStatus.VALIDATED.value,
+                        reuse_count=0,
+                        invocation_count=0,
+                    )
+                )
+            await s.commit()
+
+        for i in range(4):
+            await rt.repo.upsert_world_item(
+                kind="skill_refactor_queue",
+                key=f"refactor:cold_skill_{i}",
+                value={"skill_key": f"cold_skill_{i}", "canonical_name": f"repo.coding.cold_{i}"},
+                status="open",
+                source="meta_reflection",
+            )
+        # Seed environment knowledge topics & strong curiosity deficit so curiosity wins cycle 1
+        for i in range(5):
+            await rt.repo.upsert_world_item(
+                kind="knowledge_topic",
+                key=f"world:neuro_{i}",
+                value={"title": f"Neuro topic {i}", "description": "open"},
+                status="open",
+                source="world_sensor",
+            )
+
+        res = await rt.loop.run_cycle()
+        assert res["outcome"] == "SUCCEEDED"
+
+        saved_drives = {d["drive_type"]: DriveState(**d) for d in await rt.repo.load_drive_states(rt.organism_id)}
+        post_rep = saved_drives[DriveType.REPRODUCTION.value]
+        post_cur = saved_drives[DriveType.CURIOSITY.value]
+
+        assert "skill_reuse_quality" in post_rep.dimensions
+        assert float(post_rep.dimensions["skill_reuse_quality"] or 0.0) < 0.10
+        assert post_rep.satisfaction < 0.65
+        assert post_rep.last_satisfied_at is None
+        assert post_cur.last_satisfied_at is not None
+
+        next_dec = rt.drives.arbitrate(saved_drives, now=utcnow() + timedelta(seconds=30))
+        assert next_dec.selected_drive == DriveType.REPRODUCTION.value
+    finally:
+        await rt.stop()
+        await db.dispose()

@@ -17,7 +17,7 @@ import asyncio
 import re
 import uuid
 from contextlib import nullcontext
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
@@ -35,7 +35,7 @@ from app.cognition.interfaces import (
 )
 from app.core.enums import DriveType, GoalStatus, MemoryType, TaskStatus
 from app.drives.engine import DriveEngine
-from app.drives.interfaces import DriveContext, DriveState, KnowledgeGap
+from app.drives.interfaces import DriveContext, DriveState, KnowledgeGap, clamp01
 from app.governance.interfaces import GovernanceInterface
 from app.memory.embedding import EmbeddingError, EmbeddingService
 from app.memory.experience_manager import ExperienceManager, compute_content_hash
@@ -147,6 +147,7 @@ class TaskFinalizer:
         investigation_manager: Any = None,
         world_pipeline: Any = None,
         meta_reflection_manager: Any = None,
+        reproduction_quality_scoring_enabled: bool = False,
     ) -> None:
         self.organism_id = organism_id
         self.repo = repo
@@ -170,6 +171,7 @@ class TaskFinalizer:
         self.investigation_manager = investigation_manager
         self.world_pipeline = world_pipeline
         self.meta_reflection_manager = meta_reflection_manager
+        self.reproduction_quality_scoring_enabled = bool(reproduction_quality_scoring_enabled)
         self._hooks: list[FinalizedHook] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -1126,6 +1128,88 @@ class TaskFinalizer:
             )
             return result
 
+    @staticmethod
+    def _parse_utc_dt(raw: Any) -> datetime | None:
+        if isinstance(raw, datetime):
+            return raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw.astimezone(timezone.utc)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+                return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    async def _collect_reproduction_quality_telemetry(
+        self,
+        *,
+        now: datetime,
+        since_7d: datetime,
+        recent_statuses: list[str],
+    ) -> tuple[float | None, float | None, float | None, int]:
+        """Collect reproduction quality metrics identically to pre-cycle evaluation (V5.2.2)."""
+        skill_reuse_ratio_recent: float | None = None
+        execution_reliability_recent: float | None = None
+        playbook_freshness_score: float | None = None
+        pending_skill_refactor_count = 0
+        try:
+            val_skills = await self.repo.list_skills(status="VALIDATED", limit=200)
+            if val_skills:
+                val_ids = {str(sk.get("id") or "") for sk in val_skills if sk.get("id")}
+                val_keys = {str(sk.get("skill_key") or "") for sk in val_skills if sk.get("skill_key")}
+                reused_cnt = sum(1 for sk in val_skills if int(sk.get("reuse_count") or 0) > 0)
+                recent_invs = await self.repo.list_skill_invocations(limit=200)
+                distinct_recent_reused: set[str] = set()
+                for iv in recent_invs:
+                    if not (iv.get("is_cross_task_reuse") and iv.get("passed")):
+                        continue
+                    if (self._parse_utc_dt(iv.get("created_at")) or since_7d) < since_7d:
+                        continue
+                    sid = str(iv.get("skill_id") or "")
+                    skey = str(iv.get("skill_key") or "")
+                    if sid and sid in val_ids:
+                        distinct_recent_reused.add(sid)
+                    elif skey and skey in val_keys:
+                        distinct_recent_reused.add(skey)
+                base_ratio = reused_cnt / len(val_skills)
+                recent_distinct_ratio = len(distinct_recent_reused) / len(val_skills)
+                skill_reuse_ratio_recent = clamp01(0.5 * base_ratio + 0.5 * recent_distinct_ratio)
+
+            term_statuses = [
+                st for st in recent_statuses if st in {"SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED"}
+            ]
+            if term_statuses:
+                execution_reliability_recent = clamp01(
+                    sum(1 for st in term_statuses if st == "SUCCEEDED") / len(term_statuses)
+                )
+
+            pb_rows = await self.repo.list_world_items(kind="external_playbook")
+            now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+            pb_dates = [
+                self._parse_utc_dt((r.get("value") or {}).get("updated_at"))
+                or self._parse_utc_dt(r.get("updated_at"))
+                for r in pb_rows
+            ]
+            pb_dates = [d for d in pb_dates if d is not None]
+            if pb_dates:
+                newest_pb = max(pb_dates)
+                age_days = max(0.0, (now_utc - newest_pb).total_seconds() / 86400.0)
+                playbook_freshness_score = clamp01(1.0 - age_days / 14.0)
+            else:
+                playbook_freshness_score = 0.15
+
+            refactor_rows = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
+            pending_skill_refactor_count = len(refactor_rows)
+        except Exception as exc:
+            logger.warning("finalizer.reproduction_quality_telemetry_degraded", error=str(exc))
+
+        return (
+            skill_reuse_ratio_recent,
+            execution_reliability_recent,
+            playbook_freshness_score,
+            pending_skill_refactor_count,
+        )
+
     async def _build_post_drive_context(self, obs: Observation, now: datetime, info_gain: float = 0.0) -> DriveContext:
         recent_execs = await self.repo.list_executions(limit=15)
         recent_statuses = [e["status"] for e in recent_execs]
@@ -1177,6 +1261,23 @@ class TaskFinalizer:
         if self.skill_registry is not None:
             validated_skill_count = await self.skill_registry.count_validated_skills(verify_integrity=True)
 
+        quality_enabled = bool(self.reproduction_quality_scoring_enabled)
+        skill_reuse_ratio_recent: float | None = None
+        execution_reliability_recent: float | None = None
+        playbook_freshness_score: float | None = None
+        pending_skill_refactor_count = 0
+        if quality_enabled:
+            (
+                skill_reuse_ratio_recent,
+                execution_reliability_recent,
+                playbook_freshness_score,
+                pending_skill_refactor_count,
+            ) = await self._collect_reproduction_quality_telemetry(
+                now=now,
+                since_7d=since_7d,
+                recent_statuses=recent_statuses,
+            )
+
         return DriveContext(
             now=now,
             observation=obs,
@@ -1195,6 +1296,11 @@ class TaskFinalizer:
             memory_available=self.memory.backend_available,
             identity_persisted=True,
             knowledge_transfer_readiness=1.0 if sem_recent > 0 else 0.5,
+            reproduction_quality_scoring_enabled=quality_enabled,
+            skill_reuse_ratio_recent=skill_reuse_ratio_recent,
+            execution_reliability_recent=execution_reliability_recent,
+            playbook_freshness_score=playbook_freshness_score,
+            pending_skill_refactor_count=pending_skill_refactor_count,
             open_knowledge_gaps=env_topics,
             unknown_topics=env_topics,
             exploration_attempted_recent=cur_done + cur_failed,
