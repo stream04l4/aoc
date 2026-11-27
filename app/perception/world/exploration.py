@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
@@ -263,6 +264,173 @@ def classify_exploration_scope(title: str, description: str = "", related_key: s
     if str(related_key or "").startswith("world:"):
         return "external_exploration"
     return "external_exploration"
+
+
+_COMFORT_ZONE_STEMS: tuple[str, ...] = (
+    "security",
+    "audit",
+    "safety",
+    "provenance",
+    "guardrail",
+    "triage",
+    "compliance",
+)
+
+_TOPIC_SIG_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "via",
+        "to",
+        "of",
+        "in",
+        "on",
+        "or",
+        "as",
+        "an",
+        "by",
+        "close",
+        "closed",
+        "closure",
+        "verify",
+        "verification",
+        "check",
+        "checks",
+        "read",
+        "readonly",
+        "only",
+        "public",
+        "evidence",
+        "bounded",
+        "authoritative",
+        "fail",
+        "failed",
+        "final",
+        "hop",
+        "hops",
+        "topic",
+        "open",
+        "unknown",
+        "using",
+        "complete",
+        "deterministic",
+        "drift",
+        "reconcile",
+        "triage",
+        "assess",
+        "impact",
+        "identify",
+        "fetch",
+        "fetched",
+        "kernel",
+        "prefetched",
+        "untried",
+        "leads",
+        "quarantined",
+        "trusted",
+        "smaller",
+        "page",
+        "updated",
+        "endpoint",
+        "range",
+        "delta",
+        "note",
+        "brief",
+        "report",
+        "pivot",
+        "curiosity",
+        "raw",
+        "snapshot",
+        "api",
+        "non",
+        "truncated",
+        "compare",
+        "classification",
+        "classify",
+        "generalize",
+        "generalized",
+        "skill",
+        "external",
+        "inv",
+        "world",
+        "web",
+        "rss",
+        "git",
+        "http",
+        "https",
+        "公开",
+        "只读",
+        "证据",
+        "关闭",
+        "失败",
+        "核对",
+        "验证",
+        "检查",
+        "调查",
+        "漂移",
+        "关于",
+        "进行",
+        "研究",
+        "分析",
+        "调研",
+        "探索",
+        "整理",
+    }
+)
+
+
+def _is_comfort_zone_domain(domain: str) -> bool:
+    dom = str(domain or "").strip().lower()
+    if not dom:
+        return False
+    if dom == "security_audit":
+        return True
+    return any(stem in dom for stem in _COMFORT_ZONE_STEMS)
+
+
+def extract_topic_signature_tokens(title: str, related_key: str | None = None) -> frozenset[str]:
+    """Extract normalized entity/topic signature tokens invariant to title & related_key paraphrasing."""
+    rel = str(related_key or "").strip().lower()
+    rel = re.sub(r"^(?:world:(?:rss-|git-|web-)?|inv:|sec:|tg:|social:|human:)", "", rel)
+    raw = f"{title or ''} {rel}".lower()
+    # Normalize thousands-separated integers like 5,035 -> 5035 before tokenization
+    raw = re.sub(r"(?<=\d),(?=\d)", "", raw)
+    raw = re.sub(r"[_:/\\-]+|->|→", " ", raw)
+
+    toks: set[str] = set()
+    for w in re.findall(r"[a-z0-9]+", raw):
+        if len(w) >= 2 and w not in _TOPIC_SIG_STOPWORDS:
+            toks.add(w)
+    for seg in _CJK_SEG_RE.findall(raw):
+        cur = seg
+        for filler in ("公开只读", "失败关闭", "或失败", "关于", "关闭", "失败", "公开", "只读", "证据", "核对", "验证", "检查", "调查", "漂移", "研究", "分析", "调研", "探索"):
+            cur = cur.replace(filler, " ")
+        for piece in cur.split():
+            p = piece.strip()
+            if len(p) == 2 and p not in _TOPIC_SIG_STOPWORDS:
+                toks.add(p)
+            elif len(p) > 2:
+                for i in range(len(p) - 1):
+                    bg = p[i : i + 2]
+                    if bg not in _TOPIC_SIG_STOPWORDS:
+                        toks.add(bg)
+    return frozenset(toks)
+
+
+def topic_tokens_match(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Return True when two topic signatures clearly refer to the same underlying topic."""
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    union = len(a | b)
+    jacc = (inter / union) if union else 0.0
+    if min(len(a), len(b)) <= 3:
+        return (inter >= 3) or (inter >= 2 and jacc >= 0.65)
+    return inter >= 3 or jacc >= 0.35
 
 
 def infer_topic_domain(title: str, description: str = "", explicit_domain: str | None = None) -> str:
@@ -602,12 +770,73 @@ class ExplorationManager:
         )
         return {"key": key, **val}
 
+    def _detect_stalled_topic_clusters(
+        self,
+        cur_goals: list[dict[str, Any]],
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Cluster recent Curiosity goals by entity/topic tokens and detect repeated-failure loops."""
+        now_dt = now or utcnow()
+        cutoff = now_dt - timedelta(hours=12)
+        clusters: list[dict[str, Any]] = []
+
+        for g in cur_goals[:30]:
+            g_dt = _parse_iso_dt(g.get("created_at"))
+            if g_dt is not None and g_dt < cutoff:
+                continue
+            title = str(g.get("title") or "")
+            rel = g.get("related_key")
+            toks = extract_topic_signature_tokens(title, related_key=rel)
+            if len(toks) < 2:
+                continue
+            status = str(g.get("status") or "").upper()
+            is_fail = status in {"FAILED", "REJECTED", "ABANDONED"}
+
+            matched = next(
+                (cl for cl in clusters if topic_tokens_match(toks, cl["rep_tokens"])),
+                None,
+            )
+            if matched is None:
+                clusters.append(
+                    {
+                        "rep_tokens": toks,
+                        "token_counts": Counter(toks),
+                        "total_count": 1,
+                        "failed_count": 1 if is_fail else 0,
+                        "sample_title": title[:160],
+                    }
+                )
+            else:
+                matched["total_count"] += 1
+                if is_fail:
+                    matched["failed_count"] += 1
+                matched["token_counts"].update(toks)
+                common = [t for t, _ in matched["token_counts"].most_common(8)]
+                matched["rep_tokens"] = frozenset(common)
+
+        stalled = [
+            {
+                "tokens": sorted(cl["rep_tokens"])[:12],
+                "sample_title": cl["sample_title"],
+                "failed_count": int(cl["failed_count"]),
+                "total_count": int(cl["total_count"]),
+                "reason": "repeated_failure_circuit_breaker",
+            }
+            for cl in clusters
+            if int(cl["failed_count"]) >= 3
+            or (int(cl["total_count"]) >= 5 and int(cl["failed_count"]) >= 2)
+        ]
+        stalled.sort(key=lambda c: (-c["failed_count"], -c["total_count"], c["sample_title"]))
+        return stalled[:5]
+
     def _compute_portfolio_and_fatigue(
         self,
         cur_goals: list[dict[str, Any]],
         portfolio_items: list[dict[str, Any]],
         domains_covered: list[str],
         must_explore_external: bool,
+        stalled_topic_clusters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Compute comfort-zone streak, same-domain/topic streak, human starvation & recommended pivots."""
         goal_domains: list[str] = []
@@ -630,9 +859,12 @@ class ExplorationManager:
             recent_domain_counts[dom] = recent_domain_counts.get(dom, 0) + 1
 
         comfort_zone_streak = 0
+        comfort_streak_domains: set[str] = set()
         for dom, sc in zip(goal_domains, goal_scopes):
-            if dom == "security_audit" or sc == "internal_self_check":
+            if _is_comfort_zone_domain(dom) or sc == "internal_self_check":
                 comfort_zone_streak += 1
+                if dom:
+                    comfort_streak_domains.add(dom)
             else:
                 break
 
@@ -694,6 +926,7 @@ class ExplorationManager:
 
         if comfort_zone_streak >= self.max_same_domain_streak:
             cooldown_domains_set.add("security_audit")
+            cooldown_domains_set.update(d for d in comfort_streak_domains if _is_comfort_zone_domain(d))
             pivot_reasons.append(f"comfort_zone_streak:{comfort_zone_streak}>={self.max_same_domain_streak}")
 
         if latest_domain and same_domain_streak >= self.max_same_domain_streak:
@@ -706,6 +939,10 @@ class ExplorationManager:
 
         if starved_keys:
             pivot_reasons.append(f"human_portfolio_starved:{len(starved_keys)}")
+
+        stalled_list = list(stalled_topic_clusters or [])
+        for cl in stalled_list:
+            pivot_reasons.append(f"stalled_topic_failures:{int(cl.get('failed_count') or 0)}")
 
         must_pivot_domain = bool(pivot_reasons) or must_explore_external
 
@@ -720,7 +957,7 @@ class ExplorationManager:
             ),
         ):
             d = str(it.get("domain") or "")
-            if d and d not in cooldown_domains_set and d not in rec_domains and d != "security_audit":
+            if d and d not in cooldown_domains_set and d not in rec_domains and not _is_comfort_zone_domain(d):
                 rec_domains.append(d)
 
         covered_set = set(domains_covered)
@@ -755,6 +992,7 @@ class ExplorationManager:
             "must_pivot_domain": must_pivot_domain,
             "cooldown_domains": sorted(cooldown_domains_set),
             "cooldown_topic": cooldown_topic,
+            "stalled_topic_clusters": stalled_list,
             "pivot_reasons": pivot_reasons,
             "recent_domain_counts": recent_domain_counts,
             "human_portfolio_candidates": human_candidates,
@@ -769,8 +1007,18 @@ class ExplorationManager:
             if self.interest_portfolio_enabled
             else self.lookback_goals
         )
-        all_cur_goals = [g for g in recent_goals if str(g.get("drive_type") or "").lower() == "curiosity"][:window_size]
+        curiosity_goals_stream = [g for g in recent_goals if str(g.get("drive_type") or "").lower() == "curiosity"]
+        all_cur_goals = curiosity_goals_stream[:window_size]
         cur_sample_for_ratio = all_cur_goals[: self.lookback_goals]
+        stalled_clusters = (
+            self._detect_stalled_topic_clusters(curiosity_goals_stream[:30])
+            if self.interest_portfolio_enabled
+            else []
+        )
+        stalled_token_sets = [
+            frozenset(str(t).lower() for t in (cl.get("tokens") or []) if str(t).strip())
+            for cl in stalled_clusters
+        ]
 
         internal_cnt = 0
         external_cnt = 0
@@ -811,6 +1059,16 @@ class ExplorationManager:
                 t["key"],
             )
             == "external_exploration"
+            and not any(
+                topic_tokens_match(
+                    extract_topic_signature_tokens(
+                        str((t.get("value") or {}).get("title") or ""),
+                        related_key=str(t["key"]),
+                    ),
+                    st_set,
+                )
+                for st_set in stalled_token_sets
+            )
         ][:6]
 
         base = {
@@ -838,6 +1096,7 @@ class ExplorationManager:
                 "interest_portfolio_enabled": False,
                 "must_pivot_domain": False,
                 "cooldown_domains": [],
+                "stalled_topic_clusters": [],
                 "human_portfolio_candidates": [],
             }
 
@@ -847,5 +1106,6 @@ class ExplorationManager:
             portfolio_items,
             domains_covered,
             must_explore_external,
+            stalled_topic_clusters=stalled_clusters,
         )
         return {**base, **m2_meta}

@@ -850,6 +850,11 @@ class AutonomousLoop:
                     if kv3.interest_portfolio_enabled and is_curiosity
                     else None
                 )
+                stalled_topic_clusters = (
+                    list((exploration_guidance or {}).get("stalled_topic_clusters") or [])
+                    if is_curiosity
+                    else []
+                )
                 sel_res = select_best_goal_candidate(
                     primary=goal_proposal,
                     drive_type=decision.selected_drive,
@@ -862,6 +867,7 @@ class AutonomousLoop:
                     must_pivot_domain=must_pivot_domain,
                     cooldown_domains=cooldown_domains,
                     cooldown_topic=cooldown_topic,
+                    stalled_topic_clusters=stalled_topic_clusters,
                     interest_portfolio=(
                         interest_portfolio_items if kv3.interest_portfolio_enabled and is_curiosity else None
                     ),
@@ -1561,18 +1567,25 @@ class AutonomousLoop:
             try:
                 val_skills = await self.repo.list_skills(status="VALIDATED", limit=200)
                 if val_skills:
+                    val_ids = {str(sk.get("id") or "") for sk in val_skills if sk.get("id")}
+                    val_keys = {str(sk.get("skill_key") or "") for sk in val_skills if sk.get("skill_key")}
                     reused_cnt = sum(1 for sk in val_skills if int(sk.get("reuse_count") or 0) > 0)
-                    recent_invs = await self.repo.list_skill_invocations(limit=100)
-                    cross_recent = sum(
-                        1
-                        for iv in recent_invs
-                        if iv.get("is_cross_task_reuse")
-                        and iv.get("passed")
-                        and (self._parse_social_dt(iv.get("created_at")) or since_7d) >= since_7d
-                    )
+                    recent_invs = await self.repo.list_skill_invocations(limit=200)
+                    distinct_recent_reused: set[str] = set()
+                    for iv in recent_invs:
+                        if not (iv.get("is_cross_task_reuse") and iv.get("passed")):
+                            continue
+                        if (self._parse_social_dt(iv.get("created_at")) or since_7d) < since_7d:
+                            continue
+                        sid = str(iv.get("skill_id") or "")
+                        skey = str(iv.get("skill_key") or "")
+                        if sid and sid in val_ids:
+                            distinct_recent_reused.add(sid)
+                        elif skey and skey in val_keys:
+                            distinct_recent_reused.add(skey)
                     base_ratio = reused_cnt / len(val_skills)
-                    recent_ratio = cross_recent / len(val_skills)
-                    skill_reuse_ratio_recent = clamp01(max(base_ratio, min(1.0, recent_ratio)))
+                    recent_distinct_ratio = len(distinct_recent_reused) / len(val_skills)
+                    skill_reuse_ratio_recent = clamp01(0.5 * base_ratio + 0.5 * recent_distinct_ratio)
 
                 term_statuses = [
                     st for st in recent_statuses if st in {"SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED"}
@@ -1715,6 +1728,7 @@ class AutonomousLoop:
             return None
 
         task_uuid = uuid.uuid4()
+        started_dt = utcnow()
         try:
             s_res = await self.skill_runtime.execute(
                 skill_ref,
@@ -1808,6 +1822,7 @@ class AutonomousLoop:
         )
         await self.repo.update_execution(
             exec_uuid,
+            started_at=started_dt,
             completed_at=now,
             result={"summary": f"SkillRuntime executed {s_res.canonical_name or s_res.skill_key}@{s_res.version}", "output": s_res.output},
             stdout=out_str[:8000],
@@ -2209,6 +2224,7 @@ class AutonomousLoop:
         )
         await self.repo.update_execution(
             exec_uuid,
+            started_at=started_dt,
             completed_at=completed_dt,
             result=(
                 {

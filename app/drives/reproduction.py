@@ -133,12 +133,13 @@ class ReproductionDriveEvaluator(DriveEvaluator):
                     "playbook_freshness": 0.12,
                 },
             )
-            if eff_cnt >= 3 and reuse_q < 0.20:
-                urgency_boost += 0.30 * clamp01((0.20 - reuse_q) / 0.20)
+            if eff_cnt >= 3 and reuse_q < 0.50:
+                urgency_boost += 0.25 * clamp01((0.50 - reuse_q) / 0.50)
                 notes.append(f"low skill reuse quality ({reuse_q:.2f}) across {eff_cnt} validated skills")
-            if int(ctx.pending_skill_refactor_count or 0) > 0:
-                urgency_boost += 0.18
-                notes.append(f"pending skill refactors: {int(ctx.pending_skill_refactor_count)}")
+            pending_cnt = int(ctx.pending_skill_refactor_count or 0)
+            if pending_cnt > 0:
+                urgency_boost += min(0.28, 0.18 + 0.03 * max(0, pending_cnt - 1))
+                notes.append(f"pending skill refactors: {pending_cnt}")
             if ctx.execution_reliability_recent is not None and float(ctx.execution_reliability_recent) < 0.92:
                 urgency_boost += 0.14
                 notes.append(f"execution reliability below target ({float(ctx.execution_reliability_recent):.2f})")

@@ -179,6 +179,39 @@ class WorldEventPipeline:
                     enabled=src.enabled,
                 )
                 count += 1
+
+        # V5.2.1: Rehydrate allowed_domains from persisted enabled HTTPS sources when open_public_https=True
+        if self.open_public_https:
+            import ipaddress
+            from urllib.parse import urlparse
+
+            allowed_low = {d.lower() for d in self.allowed_domains}
+            for row in await self.repo.list_world_sources():
+                if not row.get("enabled"):
+                    continue
+                stype = str(row.get("sensor_type") or "").strip().lower()
+                if stype not in {"rss", "web"}:
+                    continue
+                cfg = row.get("config") if isinstance(row.get("config"), dict) else {}
+                url = str(cfg.get("url") or "").strip()
+                parsed = urlparse(url)
+                host = (parsed.hostname or "").lower().rstrip(".")
+                if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+                    continue
+                if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".lan")):
+                    continue
+                try:
+                    ipaddress.ip_address(host)
+                    continue
+                except ValueError:
+                    pass
+                if host not in allowed_low:
+                    allowed_low.add(host)
+                    self.allowed_domains.append(host)
+                    for sensor in self._sensors.values():
+                        doms = getattr(sensor, "allowed_domains", None)
+                        if isinstance(doms, list) and host not in {d.lower() for d in doms}:
+                            doms.append(host)
         return count
 
     async def _compute_importance(self, ev: WorldEvent) -> tuple[float, float | None]:

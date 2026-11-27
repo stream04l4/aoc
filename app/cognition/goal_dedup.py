@@ -23,8 +23,10 @@ from app.observability.topic_diversity import extract_topic_bucket
 from app.perception.interfaces import utcnow
 from app.perception.world.exploration import (
     classify_exploration_scope,
+    extract_topic_signature_tokens,
     infer_topic_domain,
     match_interest_portfolio_item,
+    topic_tokens_match,
 )
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]")
@@ -272,7 +274,18 @@ class GoalDedupEngine:
             if has_human_guidance or g_drive != drive_type.lower():
                 continue
             if cand_rel and g_rel and cand_rel != g_rel:
-                continue
+                rel_tok_a = set(re.findall(r"[a-z0-9]+", re.sub(r"^[a-z]+:", "", cand_rel)))
+                rel_tok_b = set(re.findall(r"[a-z0-9]+", re.sub(r"^[a-z]+:", "", g_rel)))
+                has_distinct_counter = (
+                    any(t.isdigit() for t in (rel_tok_a ^ rel_tok_b))
+                    and len(rel_tok_a ^ rel_tok_b) <= 2
+                )
+                if (
+                    has_distinct_counter
+                    or len(rel_tok_a & rel_tok_b) < 3
+                    or _jaccard(rel_tok_a, rel_tok_b) < 0.50
+                ):
+                    continue
 
             sim = 0.0
             code = "DUPLICATE_GOAL_LEXICAL"
@@ -355,6 +368,7 @@ def select_best_goal_candidate(
     must_pivot_domain: bool = False,
     cooldown_domains: Sequence[str] | None = None,
     cooldown_topic: str | None = None,
+    stalled_topic_clusters: Sequence[dict[str, Any]] | None = None,
     interest_portfolio: Sequence[dict[str, Any]] | None = None,
 ) -> GoalSelectionResult:
     """Evaluate primary + up to 2 alternative_goals through GoalDedupEngine and deterministically pick best.
@@ -397,9 +411,16 @@ def select_best_goal_candidate(
     frustration = float((affect_state or {}).get("frustration", 0.0) or 0.0)
     cooldown_set = {str(d).strip().lower() for d in (cooldown_domains or []) if str(d).strip()}
     cooldown_topic_norm = str(cooldown_topic or "").strip().lower()
+    stalled_sets = [
+        frozenset(str(t).lower() for t in (cl.get("tokens") or []) if str(t).strip())
+        for cl in (stalled_topic_clusters or [])
+        if isinstance(cl, dict)
+    ]
+    stalled_sets = [s for s in stalled_sets if s]
     portfolio_items = [dict(it) for it in (interest_portfolio or []) if isinstance(it, dict)]
 
-    scored: list[tuple[float, int, str, GoalProposal, GoalDedupDecision]] = []
+    scored_clean: list[tuple[float, int, str, GoalProposal, GoalDedupDecision]] = []
+    scored_stalled: list[tuple[float, int, str, GoalProposal, GoalDedupDecision]] = []
     audit_rows: list[GoalCandidateScore] = []
     first_dedup: GoalDedupDecision | None = None
 
@@ -427,12 +448,18 @@ def select_best_goal_candidate(
             related_key=prop.related_key,
             expected_outcome=topic_exp,
         )
+        cand_sig = extract_topic_signature_tokens(prop.title, related_key=prop.related_key)
+        is_stalled = (not has_human_guidance) and bool(stalled_sets) and any(
+            topic_tokens_match(cand_sig, st_set) for st_set in stalled_sets
+        )
         pivot_bias = 0.0
         if must_pivot_domain:
             pivot_bias += -0.45 if cand_domain in cooldown_set else 0.25
             if cooldown_topic_norm and cand_bucket == cooldown_topic_norm:
                 pivot_bias -= 0.30
-        if portfolio_items and cand_domain not in cooldown_set:
+        if is_stalled:
+            pivot_bias -= 0.70
+        if portfolio_items and cand_domain not in cooldown_set and not is_stalled:
             matched_it = match_interest_portfolio_item(
                 portfolio_items,
                 title=prop.title,
@@ -473,7 +500,11 @@ def select_best_goal_candidate(
                     4,
                 ),
             )
-            scored.append((score, -idx, src, prop, dec))
+            entry = (score, -idx, src, prop, dec)
+            if is_stalled:
+                scored_stalled.append(entry)
+            else:
+                scored_clean.append(entry)
         else:
             score = 0.0
 
@@ -493,9 +524,9 @@ def select_best_goal_candidate(
             )
         )
 
-    if scored:
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        _, neg_idx, best_src, best_prop, best_dec = scored[0]
+    if scored_clean:
+        scored_clean.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, neg_idx, best_src, best_prop, best_dec = scored_clean[0]
         best_idx = -neg_idx
         audit_rows[best_idx].selected = True
         return GoalSelectionResult(
@@ -506,6 +537,23 @@ def select_best_goal_candidate(
         )
 
     assert first_dedup is not None
+    if scored_stalled and not has_human_guidance:
+        now_dt = now or utcnow()
+        return GoalSelectionResult(
+            selected_proposal=None,
+            selected_dedup=GoalDedupDecision(
+                decision="DEFER",
+                fingerprint=first_dedup.fingerprint,
+                reason_code="STALLED_TOPIC_CIRCUIT_BREAKER",
+                duplicate_of=None,
+                similarity=1.0,
+                cooldown_until=now_dt + timedelta(hours=6),
+                notes=["All candidate goals hit the repeated-failure circuit breaker; cooled down for 6h"],
+            ),
+            used_alternative=False,
+            candidates=audit_rows,
+        )
+
     return GoalSelectionResult(
         selected_proposal=None,
         selected_dedup=first_dedup,

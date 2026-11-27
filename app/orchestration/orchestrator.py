@@ -398,7 +398,8 @@ class AgentOrchestrator:
                         "- You MUST read `./.aoc_base_skill/skill.py`, `./.aoc_base_skill/test_skill.py`, and `./.aoc_base_skill/metadata.json` first.\n"
                         f"- Target generalization: {staged.get('target_generalization') or staged.get('reason') or 'preserve existing contracts while improving edge-case handling and reusability'}.\n"
                         "- Preserve ALL existing public entrypoint signatures (`execute`/`run`/etc.) and backward-compatible input/output contracts.\n"
-                        "- Write updated `./skill.py` so ALL assertions in `./.aoc_base_skill/test_skill.py` pass unchanged (Gate A), AND expand `./test_skill.py` with new boundary assertions (Gate B).\n"
+                        "- Write the refactored skill code and expanded unit tests directly to workspace root `./skill.py` and `./test_skill.py` (do NOT edit only inside `./.aoc_base_skill/`, which is the staged read-only baseline) so ALL assertions in `./.aoc_base_skill/test_skill.py` pass unchanged (Gate A), AND expand `./test_skill.py` with new boundary assertions (Gate B).\n"
+                        "- Keep the task focused cleanly on refactoring and testing this skill without bundling unrelated heavy external multi-hop research.\n"
                         "- Optionally write `./skill_meta.json` (`{\"input_schema\": ..., \"output_schema\": ...}`) so AOC publishes crisp parameter schemas for `skill_first` reuse."
                     )
                     effective_description = f"{(plan.description or '').strip()}{refactor_note}".strip()

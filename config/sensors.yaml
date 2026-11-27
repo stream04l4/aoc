@@ -19,6 +19,9 @@ allowed_domains:
   - "raw.githubusercontent.com"
   - "arxiv.org"
   - "export.arxiv.org"
+  - "owasp.org"
+  - "genai.owasp.org"
+  - "modelcontextprotocol.io"
 
 # Strict read-only local filesystem roots for Git Repository sensor
 allowed_git_roots:

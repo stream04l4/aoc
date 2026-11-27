@@ -661,6 +661,9 @@ class SkillRegistryManager(SkillRegistryInterface):
             return None
 
         # Locate artifact script and matching assertion test inside workspace
+        is_explicit_refactor = isinstance(skill_refactor_target, dict) and bool(skill_refactor_target)
+        used_staged_fallback = False
+
         art_file = ws / "skill.py"
         if not art_file.is_file():
             py_candidates = [
@@ -668,11 +671,21 @@ class SkillRegistryManager(SkillRegistryInterface):
                 if not p.name.startswith("test_") and not p.name.startswith("_") and not p.name.startswith(".aoc_")
             ]
             art_file = py_candidates[0] if len(py_candidates) == 1 else None  # type: ignore[assignment]
+        if art_file is None and is_explicit_refactor:
+            staged_art = ws / ".aoc_base_skill" / "skill.py"
+            if staged_art.is_file():
+                art_file = staged_art
+                used_staged_fallback = True
 
         test_file = ws / "test_skill.py"
         if not test_file.is_file():
             test_candidates = sorted(ws.glob("test_*.py"))
             test_file = test_candidates[0] if test_candidates else None  # type: ignore[assignment]
+        if test_file is None and is_explicit_refactor:
+            staged_test = ws / ".aoc_base_skill" / "test_skill.py"
+            if staged_test.is_file():
+                test_file = staged_test
+                used_staged_fallback = True
 
         if art_file is None or test_file is None:
             return None
@@ -686,6 +699,10 @@ class SkillRegistryManager(SkillRegistryInterface):
         meta_in_schema: dict[str, Any] | None = None
         meta_out_schema: dict[str, Any] | None = None
         meta_file = ws / "skill_meta.json"
+        if not meta_file.is_file() and is_explicit_refactor:
+            staged_meta = ws / ".aoc_base_skill" / "skill_meta.json"
+            if staged_meta.is_file():
+                meta_file = staged_meta
         if meta_file.is_file() and meta_file.stat().st_size <= 65536:
             try:
                 parsed_meta = json.loads(meta_file.read_text(encoding="utf-8", errors="replace"))
@@ -730,6 +747,21 @@ class SkillRegistryManager(SkillRegistryInterface):
                     "explicit_refactor": True,
                     "reason": "target_validated_skill_not_found",
                 }
+            if used_staged_fallback:
+                art_path_raw = str(base.get("artifact_path") or "").strip()
+                base_art = (
+                    Path(art_path_raw).read_text(encoding="utf-8", errors="replace").strip()
+                    if art_path_raw and Path(art_path_raw).is_file()
+                    else str(base.get("artifact_code") or "").strip()
+                )
+                base_test = str(((base.get("test_spec") or {}).get("code") or "")).strip()
+                if base_art and art_code.strip() == base_art and test_code.strip() == base_test:
+                    return {
+                        "explicit_refactor": True,
+                        "crystallized": False,
+                        "evolved": False,
+                        "reason": "staged_base_skill_unmodified",
+                    }
             change_summary = (
                 str(skill_refactor_target.get("target_generalization") or "").strip()
                 or str(skill_refactor_target.get("reason") or "").strip()
