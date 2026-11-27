@@ -20,11 +20,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +122,125 @@ def _digest_payload(data: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _ensure_utc(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=timezone.utc) if raw.tzinfo is None else raw.astimezone(timezone.utc)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+_ALIAS_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"url", "target_url", "uri", "link", "href"}),
+    frozenset({"text", "content", "body", "raw_text", "document", "markdown"}),
+    frozenset({"items", "data", "records", "rows", "entries", "list"}),
+    frozenset({"query", "q", "search_query", "keyword", "keywords", "topic"}),
+    frozenset({"path", "file_path", "filepath", "target_path"}),
+    frozenset({"payload", "input", "params", "arguments", "config"}),
+)
+
+
+def align_input_args_to_schema(
+    raw_args: dict[str, Any] | None,
+    input_schema: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Deterministic 1-shot input argument repair (unwrap/wrap, aliases, defaults, safe scalar coercions)."""
+    args = dict(raw_args or {})
+    if not isinstance(input_schema, dict) or not input_schema:
+        return args, []
+
+    props = input_schema.get("properties") if isinstance(input_schema.get("properties"), dict) else {}
+    required = [str(r) for r in (input_schema.get("required") or []) if r]
+    fixes: list[str] = []
+
+    # Step A: Single wrapper unwrap (e.g. {"payload": {"target_url": "..."}})
+    if len(args) == 1:
+        only_key = next(iter(args.keys()))
+        only_val = args[only_key]
+        if (
+            only_key in {"payload", "input", "params", "arguments", "data"}
+            and only_key not in props
+            and isinstance(only_val, dict)
+            and any(ik in props for ik in only_val.keys())
+        ):
+            args = dict(only_val)
+            fixes.append(f"unwrap:{only_key}")
+
+    # Step B: Single required object wrapper (e.g. caller sent flat dict, schema wants {"payload": {...}})
+    if len(required) == 1 and args:
+        rk = required[0]
+        r_spec = props.get(rk) if isinstance(props.get(rk), dict) else {}
+        if r_spec.get("type") == "object" and rk not in args and not any(k in props for k in args.keys()):
+            args = {rk: dict(args)}
+            fixes.append(f"wrap:{rk}")
+
+    # Step C: Alias key remap (e.g. url -> target_url, text -> content)
+    for prop_name in list(props.keys()):
+        if prop_name in args:
+            continue
+        matched_group = next((grp for grp in _ALIAS_GROUPS if prop_name.lower() in grp), None)
+        if matched_group is None:
+            continue
+        for k in list(args.keys()):
+            if k not in props and k.lower() in matched_group:
+                args[prop_name] = args.pop(k)
+                fixes.append(f"alias:{k}->{prop_name}")
+                break
+
+    # Step D: Fill explicit schema defaults for omitted required fields or explicit None values
+    for pk, pspec_raw in props.items():
+        if not isinstance(pspec_raw, dict):
+            continue
+        if pk in args and args[pk] is None:
+            if "default" in pspec_raw:
+                args[pk] = pspec_raw["default"]
+                fixes.append(f"default:{pk}")
+            elif pk not in required:
+                del args[pk]
+                fixes.append(f"drop_none:{pk}")
+        elif pk not in args and pk in required and "default" in pspec_raw:
+            args[pk] = pspec_raw["default"]
+            fixes.append(f"default:{pk}")
+
+    # Step E: Conservative scalar / array coercion matching declared JSON Schema type
+    for k in list(args.keys()):
+        if k not in props or not isinstance(props[k], dict):
+            continue
+        expected = props[k].get("type")
+        val = args[k]
+        if val is None or not expected:
+            continue
+        if expected == "integer" and isinstance(val, str) and re.fullmatch(r"-?\d+", val.strip()):
+            args[k] = int(val.strip())
+            fixes.append(f"coerce_int:{k}")
+        elif expected == "number" and isinstance(val, str):
+            try:
+                args[k] = float(val.strip())
+                fixes.append(f"coerce_float:{k}")
+            except ValueError:
+                pass
+        elif expected == "boolean" and isinstance(val, str):
+            low = val.strip().lower()
+            if low in {"true", "1", "yes"}:
+                args[k] = True
+                fixes.append(f"coerce_bool:{k}")
+            elif low in {"false", "0", "no"}:
+                args[k] = False
+                fixes.append(f"coerce_bool:{k}")
+        elif expected == "array" and isinstance(val, str):
+            args[k] = [val]
+            fixes.append(f"coerce_array:{k}")
+        elif expected == "string" and isinstance(val, (int, float, bool)):
+            args[k] = str(val)
+            fixes.append(f"coerce_str:{k}")
+
+    return args, fixes
+
+
 class SkillExecutionResult(BaseModel):
     skill_id: str | None = None
     skill_key: str = ""
@@ -128,6 +249,9 @@ class SkillExecutionResult(BaseModel):
     ok: bool = False
     denied: bool = False
     requires_approval: bool = False
+    auto_healed: bool = False
+    auto_heal_fixes: list[str] = Field(default_factory=list)
+    refactor_queued: bool = False
     output: Any = None
     stdout_excerpt: str = ""
     error: str | None = None
@@ -151,12 +275,82 @@ class SkillRuntime:
         governance: GovernanceInterface,
         default_timeout_seconds: float = 15.0,
         max_output_bytes: int = 32768,
+        auto_heal_enabled: bool = False,
+        consecutive_fail_refactor_threshold: int = 2,
     ) -> None:
         self.repo = repo
         self.skill_registry = skill_registry
         self.governance = governance
         self.default_timeout_seconds = max(1.0, float(default_timeout_seconds))
         self.max_output_bytes = max(1024, int(max_output_bytes))
+        self.auto_heal_enabled = bool(auto_heal_enabled)
+        self.consecutive_fail_refactor_threshold = max(1, int(consecutive_fail_refactor_threshold))
+
+    async def _maybe_enqueue_refactor_on_consecutive_failures(
+        self,
+        skill: dict[str, Any],
+        error_msg: str | None,
+        cycle_id: uuid.UUID | None,
+    ) -> bool:
+        """Auto-enqueue skill_refactor_queue when a VALIDATED skill hits >= N consecutive 24h failures."""
+        if not self.auto_heal_enabled or not skill.get("id"):
+            return False
+        try:
+            sid = uuid.UUID(str(skill["id"]))
+            recent = await self.repo.list_skill_invocations(skill_id=sid, limit=10)
+            now_dt = datetime.now(timezone.utc)
+            cutoff = now_dt - timedelta(hours=24)
+            streak = 0
+            for iv in recent:
+                iv_dt = _ensure_utc(iv.get("created_at"))
+                if iv_dt is not None and iv_dt < cutoff:
+                    break
+                if iv.get("passed"):
+                    break
+                streak += 1
+            if streak < self.consecutive_fail_refactor_threshold:
+                return False
+
+            skey = str(skill["skill_key"])
+            cname = str(skill.get("canonical_name") or skey)
+            q_key = f"refactor:{cname}"
+            reason = (
+                f"{streak} consecutive skill_runtime failures in 24h: "
+                f"{str(error_msg or 'execution failed')[:220]}"
+            )
+            payload = {
+                "skill_id": str(sid),
+                "skill_key": skey,
+                "canonical_name": cname,
+                "current_version": skill.get("version"),
+                "reason": reason,
+                "target_generalization": (
+                    "Inspect ./.aoc_base_skill/failure_cases.json and resolve recurring "
+                    "input schema / edge-case / runtime failures"
+                ),
+                "priority": 2,
+                "consecutive_failures": streak,
+                "enqueued_at": now_dt.isoformat(),
+                "created_at": now_dt.isoformat(),
+            }
+            await self.repo.upsert_world_item(
+                kind="skill_refactor_queue",
+                key=q_key,
+                value=payload,
+                status="open",
+                source="skill_runtime_auto_queue",
+            )
+            await self.repo.log_event(
+                "skill.refactor_auto_queued",
+                level="warning",
+                message=f"Auto-queued skill '{cname}' for refactor after {streak} consecutive failures",
+                payload={"skill_id": str(sid), "skill_key": skey, "queue_key": q_key, "streak": streak},
+                cycle_id=cycle_id,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("skill_runtime.auto_queue_degraded", error=str(exc))
+            return False
 
     async def resolve_skill(
         self, skill_ref: str | uuid.UUID, *, version: str | None = None
@@ -245,10 +439,35 @@ class SkillRuntime:
                 latency_ms=inv["latency_ms"],
             )
 
-        # 3. Validate input_schema
+        # 3. Validate input_schema (with deterministic 1-shot auto-heal when enabled, V5.3 M2)
+        auto_healed = False
+        auto_heal_fixes: list[str] = []
         in_schema = skill.get("input_schema") or {}
         if in_schema:
             in_err = _validate_json_schema(args, in_schema)
+            if in_err is not None and self.auto_heal_enabled:
+                healed_args, fixes = align_input_args_to_schema(args, in_schema)
+                if fixes and _validate_json_schema(healed_args, in_schema) is None:
+                    args = healed_args
+                    in_digest = _digest_payload(args)
+                    in_err = None
+                    auto_healed = True
+                    auto_heal_fixes = fixes
+                    await self.repo.log_event(
+                        "skill.auto_healed",
+                        level="info",
+                        message=f"Auto-healed input args for {cname or skey}@{sver}: {', '.join(fixes)}",
+                        payload={"skill_id": str(sid), "skill_key": skey, "fixes": fixes},
+                        cycle_id=cycle_uuid,
+                    )
+                else:
+                    await self.repo.log_event(
+                        "skill.auto_heal_failed",
+                        level="warning",
+                        message=f"Input schema auto-heal failed for {cname or skey}@{sver}: {in_err}",
+                        payload={"skill_id": str(sid), "skill_key": skey, "error": in_err, "fixes_attempted": fixes},
+                        cycle_id=cycle_uuid,
+                    )
             if in_err is not None:
                 err = f"Input schema validation failed: {in_err}"
                 inv = await self.repo.record_skill_invocation(
@@ -262,6 +481,7 @@ class SkillRuntime:
                     input_digest=in_digest,
                     error=err,
                 )
+                queued = await self._maybe_enqueue_refactor_on_consecutive_failures(skill, err, cycle_uuid)
                 return SkillExecutionResult(
                     skill_id=str(sid),
                     skill_key=skey,
@@ -269,6 +489,9 @@ class SkillRuntime:
                     version=sver,
                     ok=False,
                     denied=True,
+                    auto_healed=auto_healed,
+                    auto_heal_fixes=auto_heal_fixes,
+                    refactor_queued=queued,
                     error=err,
                     invocation_id=inv["id"],
                     is_cross_task_reuse=inv["is_cross_task_reuse"],
@@ -309,6 +532,8 @@ class SkillRuntime:
                 version=sver,
                 ok=False,
                 denied=True,
+                auto_healed=auto_healed,
+                auto_heal_fixes=auto_heal_fixes,
                 error=f"Governance denied skill execution ({verdict.effective_level}): {verdict.reason}",
                 policy_evaluation_id=str(eval_id),
                 latency_ms=round((time.perf_counter() - t0) * 1000.0, 2),
@@ -334,6 +559,8 @@ class SkillRuntime:
                 version=sver,
                 ok=False,
                 requires_approval=True,
+                auto_healed=auto_healed,
+                auto_heal_fixes=auto_heal_fixes,
                 error=f"Skill '{cname or skey}@{sver}' requires explicit L2 approval",
                 policy_evaluation_id=str(eval_id),
                 latency_ms=round((time.perf_counter() - t0) * 1000.0, 2),
@@ -367,12 +594,16 @@ class SkillRuntime:
                 input_digest=in_digest,
                 error=err,
             )
+            queued = await self._maybe_enqueue_refactor_on_consecutive_failures(skill, err, cycle_uuid)
             return SkillExecutionResult(
                 skill_id=str(sid),
                 skill_key=skey,
                 canonical_name=cname,
                 version=sver,
                 ok=False,
+                auto_healed=auto_healed,
+                auto_heal_fixes=auto_heal_fixes,
+                refactor_queued=queued,
                 error=err,
                 invocation_id=inv["id"],
                 policy_evaluation_id=str(eval_id),
@@ -474,6 +705,9 @@ class SkillRuntime:
             output_excerpt=out_excerpt,
             error=err_msg,
         )
+        queued = False
+        if not ok:
+            queued = await self._maybe_enqueue_refactor_on_consecutive_failures(skill, err_msg, cycle_uuid)
         await self.repo.record_usage(
             category="skill_runtime",
             amount=1.0,
@@ -486,6 +720,7 @@ class SkillRuntime:
                 "invocation_source": invocation_source,
                 "is_cross_task_reuse": inv["is_cross_task_reuse"],
                 "ok": ok,
+                "auto_healed": auto_healed,
                 "estimated_saved_tokens": inv["estimated_saved_tokens"],
             },
             cycle_id=cycle_uuid,
@@ -498,6 +733,9 @@ class SkillRuntime:
             canonical_name=cname,
             version=sver,
             ok=ok,
+            auto_healed=auto_healed,
+            auto_heal_fixes=auto_heal_fixes,
+            refactor_queued=queued,
             output=parsed_output,
             stdout_excerpt=stdout_txt[:2000],
             error=err_msg,

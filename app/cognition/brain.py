@@ -280,6 +280,15 @@ class CognitionBrain(BrainInterface):
             if context.explicit_skill_refactor_enabled
             else ""
         )
+        top_match_rule = (
+            "\n- KERNEL SKILL PRE-SELECTOR HIT (`top_skill_match`): The deterministic kernel matcher found a "
+            "high-confidence VALIDATED skill in `top_skill_match` (`canonical_name`, `match_score`, `input_schema`, "
+            "`suggested_args_template`). You SHOULD set execution_mode='skill_first', assigned_agent='skill_runtime', "
+            "and construct `skill_invocation={'skill_key': top_skill_match.canonical_name, 'input_data': ...}` strictly "
+            "matching `input_schema`, UNLESS the skill is genuinely incompatible (in which case state why clearly in `rationale`)."
+            if isinstance(context.top_skill_match, dict) and context.top_skill_match
+            else ""
+        )
         system_prompt = (
             "You are the action planner of AOC. Turn the proposed goal into ONE bounded, "
             "verifiable task for an available external AI agent. "
@@ -316,6 +325,7 @@ class CognitionBrain(BrainInterface):
             "- Never delegate open-ended infinite exploration."
             + brain_research_rule
             + explicit_refactor_rule
+            + top_match_rule
         )
         plan_query = " ".join(
             [
@@ -353,6 +363,8 @@ class CognitionBrain(BrainInterface):
             payload["explicit_skill_refactor_enabled"] = True
         if context.pending_skill_refactors:
             payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
+        if context.top_skill_match:
+            payload["top_skill_match"] = context.top_skill_match
         return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
@@ -662,11 +674,21 @@ class CognitionBrain(BrainInterface):
         )
 
     async def reflect_on_system(self, context: MetaReflectionContext) -> MetaReflectionOutput:
-        """Periodic Meta-Reflection Critic diagnosing system bottlenecks and bounded upgrades (V5.2 M4)."""
+        """Periodic Meta-Reflection Critic diagnosing system bottlenecks and bounded upgrades (V5.2 M4 + V5.3 M3/M4)."""
+        l2_bridge_rule = (
+            "\n   BRIDGE METADATA (`proposed_change`, optional when modifying an allowlisted config/heuristic): "
+            "You may attach `proposed_change: {target_file, change_type, yaml_updates?, replacements?, hypothesis}` inside "
+            "`l2_upgrade_proposal` ONLY targeting a file in `evolvable_allowlist_sample` (e.g. `config/drives.yaml`, "
+            "`config/memory.yaml`, `app/cognition/brain.py`). NEVER target governance/policy/auth/security/drive-interface "
+            "constitutional files."
+            if context.l2_evolution_bridge_enabled
+            else ""
+        )
         system_prompt = (
             "You are the Periodic Meta-Reflection Critic of AOC. Step back from single-cycle tasks and evaluate "
-            "the organism's recent reliability, execution-mode routing (codex vs brain_research vs skill_first), "
-            "skill reuse vs accumulation of unused skills, stale playbooks, and domain diversity.\n"
+            "the organism's recent reliability, `llm_schema_retry_stats`, `attempt_failure_clusters` (timeout vs "
+            "verification_failed vs sandbox_error), execution-mode routing (codex vs brain_research vs skill_first), "
+            "skill reuse vs accumulation of unused skills, stale playbooks, `previous_reflection_impact`, and domain diversity.\n"
             "STRICT BOUNDARIES (keep output compact & concise so JSON completes cleanly):\n"
             "1. Keep `diagnosis_summary` concise (<= 140 chars) and 1-3 crisp `root_causes` (<= 80 chars each) backed ONLY by telemetry.\n"
             "2. Optional L1 `playbook_revision`: `{domain, content, change_summary}` — keep `content` to 3-5 crisp Markdown "
@@ -677,7 +699,8 @@ class CognitionBrain(BrainInterface):
             "4. Optional L2 `l2_upgrade_proposal`: Emit ONLY when `l2_proposal_allowed` is true AND a genuine core "
             "kernel/architecture/config bottleneck cannot be solved by Playbook or Skill changes alone. Leave null otherwise.\n"
             "   Schema: `{topic_key, title, message, reason, expected_benefit, rollback_plan, options: [{label, instruction}]}`.\n"
-            "   Keep `message` concise (<= 260 chars) and `rollback_plan` concise (<= 100 chars).\n"
+            + l2_bridge_rule
+            + "\n   Keep `message` concise (<= 260 chars) and `rollback_plan` concise (<= 100 chars).\n"
             "   LANGUAGE RULE: `l2_upgrade_proposal` MUST be written entirely in plain, jargon-free Simplified Chinese "
             "(简体中文) like messaging creator Joel directly: include observed telemetry pain-point data, concrete proposal, "
             "expected benefit, rollback plan, and 3 clear options (<= 14 Chinese chars per label, mark recommended with '(推荐)'; "
@@ -707,6 +730,8 @@ class CognitionBrain(BrainInterface):
             "goal_stats": context.goal_stats,
             "failed_goals": context.failed_goals[:8],
             "recent_error_events": fenced_errors,
+            "llm_schema_retry_stats": context.llm_schema_retry_stats,
+            "attempt_failure_clusters": context.attempt_failure_clusters,
             "execution_mode_counts": context.execution_mode_counts,
             "validated_skills_summary": context.validated_skills_summary[:12],
             "zero_reuse_skills": context.zero_reuse_skills[:8],
@@ -715,7 +740,10 @@ class CognitionBrain(BrainInterface):
             "topic_diversity_summary": context.topic_diversity_summary,
             "l2_proposal_allowed": context.l2_proposal_allowed,
             "previous_reflection_summary": context.previous_reflection_summary,
+            "previous_reflection_impact": context.previous_reflection_impact,
         }
+        if context.l2_evolution_bridge_enabled and context.evolvable_allowlist_sample:
+            payload["evolvable_allowlist_sample"] = context.evolvable_allowlist_sample[:12]
         return await self._gateway.complete_structured(
             operation="meta_reflection",
             system_prompt=system_prompt,

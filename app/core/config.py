@@ -249,6 +249,22 @@ class KernelV3Settings(BaseModel):
     meta_reflection_interval_hours: int = 12
     meta_reflection_failure_threshold: int = 5
     meta_reflection_l2_cooldown_hours: int = 24
+    # V5.3 M1: Failure-case injection & unused VALIDATED skill lifecycle GC
+    skill_lifecycle_gc_enabled: bool = False
+    skill_unused_consolidate_days: int = 7
+    skill_unused_expiry_days: int = 14
+    skill_lifecycle_audit_interval_hours: int = 6
+    # V5.3 M2: Deterministic skill_first pre-selector, 1-shot schema auto-heal & 2-fail refactor auto-queue
+    skill_first_auto_heal_enabled: bool = False
+    skill_match_hint_threshold: float = 0.55
+    skill_consecutive_fail_refactor_threshold: int = 2
+    # V5.3 M3: Full failure-cluster telemetry & meta-reflection causal attribution / auto-rollback
+    meta_reflection_attribution_enabled: bool = False
+    meta_reflection_attribution_min_hours: float = 6.0
+    meta_reflection_attribution_min_cycles: int = 5
+    meta_reflection_regression_delta: float = 0.08
+    # V5.3 M4: L2 Evolution Bridge (Meta-Reflection L2 cards -> V5.0 ProposalManager + ConstitutionGuard)
+    l2_evolution_bridge_enabled: bool = False
 
 
 class EvolutionSettings(BaseModel):

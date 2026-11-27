@@ -143,6 +143,10 @@ class ReproductionDriveEvaluator(DriveEvaluator):
             if ctx.execution_reliability_recent is not None and float(ctx.execution_reliability_recent) < 0.92:
                 urgency_boost += 0.14
                 notes.append(f"execution reliability below target ({float(ctx.execution_reliability_recent):.2f})")
+            pain = float(ctx.unresolved_pain_score or 0.0)
+            if pain > 0.25:
+                urgency_boost += min(0.15, 0.15 * clamp01((pain - 0.25) / 0.75))
+                notes.append(f"meta-reflection unresolved pain ({pain:.2f})")
 
         satisfaction, data_conf, w_notes = weighted_dimensions(
             dimensions, weights, default_when_all_missing=0.40

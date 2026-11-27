@@ -118,6 +118,7 @@ class DriveContext(BaseModel):
     execution_reliability_recent: float | None = None
     playbook_freshness_score: float | None = None
     pending_skill_refactor_count: int = 0
+    unresolved_pain_score: float = 0.0
 
     # curiosity
     open_knowledge_gaps: list[KnowledgeGap] = Field(default_factory=list)

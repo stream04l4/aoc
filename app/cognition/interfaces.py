@@ -184,6 +184,8 @@ class CognitiveContext(BaseModel):
     explicit_skill_refactor_enabled: bool = False
     # V5.2 M4: Pending open skill refactor queue items injected from MetaReflectionManager
     pending_skill_refactors: list[dict[str, Any]] = Field(default_factory=list)
+    # V5.3 M2: Highest-scoring deterministic VALIDATED skill candidate pre-selected for plan()
+    top_skill_match: dict[str, Any] | None = None
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -394,6 +396,12 @@ class MetaReflectionContext(BaseModel):
     topic_diversity_summary: dict[str, Any] = Field(default_factory=dict)
     l2_proposal_allowed: bool = True
     previous_reflection_summary: str = ""
+    # V5.3 M3/M4: Full failure-cluster telemetry, causal attribution & allowlisted L2 bridge guidance
+    llm_schema_retry_stats: dict[str, Any] = Field(default_factory=dict)
+    attempt_failure_clusters: dict[str, Any] = Field(default_factory=dict)
+    previous_reflection_impact: dict[str, Any] | None = None
+    l2_evolution_bridge_enabled: bool = False
+    evolvable_allowlist_sample: list[str] = Field(default_factory=list)
 
 
 class MetaReflectionOutput(BaseModel):

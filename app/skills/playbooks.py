@@ -306,3 +306,69 @@ class PlaybookManager:
             "rolled_back": rolled_back,
             "restored_version": restored_version,
         }
+
+    async def rollback_to_parent(
+        self,
+        domain: str,
+        *,
+        reason: str = "meta_reflection_regression",
+    ) -> dict[str, Any]:
+        """Explicitly roll back an active Playbook domain to its SHA-256 verified parent_version (V5.3 M3)."""
+        dom = self._norm_domain(domain)
+        rec = await self._load_record(dom)
+        if rec is None or not isinstance(rec.get("value"), dict):
+            return {"rolled_back": False, "domain": dom, "reason": "playbook_not_found"}
+
+        val = dict(rec["value"])
+        active_ver = int(val.get("active_version") or 0)
+        versions: list[dict[str, Any]] = [dict(v) for v in (val.get("versions") or [])]
+        cur = next((v for v in versions if int(v.get("version", 0)) == active_ver), None)
+        if cur is None:
+            return {"rolled_back": False, "domain": dom, "reason": "active_version_missing"}
+
+        parent_ver = cur.get("parent_version")
+        if not parent_ver:
+            return {"rolled_back": False, "domain": dom, "reason": "no_parent_version"}
+
+        parent = next((v for v in versions if int(v.get("version", 0)) == int(parent_ver)), None)
+        if parent is None:
+            return {"rolled_back": False, "domain": dom, "reason": "parent_entry_not_found"}
+
+        pfp = Path(str(parent.get("file_path") or ""))
+        if not pfp.is_file():
+            return {"rolled_back": False, "domain": dom, "reason": "parent_file_missing"}
+        if _sha256_text(pfp.read_text(encoding="utf-8", errors="replace").strip()) != parent.get("checksum"):
+            return {"rolled_back": False, "domain": dom, "reason": "parent_checksum_mismatch"}
+
+        cur["status"] = "rolled_back"
+        cur["rolled_back_at"] = utcnow().isoformat()
+        cur["rollback_reason"] = str(reason or "meta_reflection_regression")[:200]
+        parent["status"] = "active"
+        val["active_version"] = int(parent["version"])
+        val["versions"] = versions
+        val["updated_at"] = utcnow().isoformat()
+        await self.repo.upsert_world_item(
+            kind="external_playbook",
+            key=dom,
+            value=val,
+            status="active",
+            source=rec.get("source") or "autonomous_evolution",
+        )
+        await self.repo.log_event(
+            "playbook.rolled_back",
+            level="warning",
+            message=f"Rolled back playbook '{dom}' v{active_ver} -> v{parent['version']}: {reason}",
+            payload={
+                "domain": dom,
+                "from_version": active_ver,
+                "to_version": int(parent["version"]),
+                "reason": str(reason or "")[:200],
+            },
+        )
+        return {
+            "rolled_back": True,
+            "domain": dom,
+            "from_version": active_ver,
+            "to_version": int(parent["version"]),
+            "reason": str(reason or "")[:200],
+        }

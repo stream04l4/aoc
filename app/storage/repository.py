@@ -314,13 +314,14 @@ class StateRepository:
             row = (
                 await s.execute(select(WorldState).where(WorldState.kind == kind, WorldState.key == safe_key))
             ).scalar_one_or_none()
+            safe_source = (str(source) if source is not None else "environment")[:64]
             if row is None:
                 row = WorldState(
                     kind=kind,
                     key=safe_key,
                     value=_jsonable(value or {}),
                     status=status or "open",
-                    source=source or "environment",
+                    source=safe_source,
                     is_simulated=bool(is_simulated),
                 )
                 s.add(row)
@@ -332,7 +333,7 @@ class StateRepository:
                 if status is not None:
                     row.status = status
                 if source is not None:
-                    row.source = source
+                    row.source = str(source)[:64]
                 if is_simulated is not None:
                     row.is_simulated = is_simulated
                 row.updated_at = utcnow()
