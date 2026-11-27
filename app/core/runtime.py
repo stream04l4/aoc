@@ -399,6 +399,9 @@ class OrganismRuntime:
         self.investigation_manager: InvestigationManager | None = None
         self.meta_reflection_manager: MetaReflectionManager | None = None
         self.affect: AffectModulator | None = None
+        self.self_edit_guard: ConstitutionGuard | None = None
+        self.self_edit_proposal_manager: ProposalManager | None = None
+        self.self_edit_manager: Any = None
 
         self.loop: AutonomousLoop | None = None
         self.scheduler: OrganismScheduler | None = None
@@ -515,6 +518,42 @@ class OrganismRuntime:
                 enabled=self.settings.kernel_v3.l2_evolution_bridge_enabled,
             )
             self.human_bridge.l2_bridge = self.l2_evolution_bridge
+        if self.settings.kernel_v3.self_edit_enabled:
+            from app.evolution.self_edit import SelfEditManager
+
+            self.self_edit_guard = ConstitutionGuard(
+                repo_root=self.settings.evolution.repo_root,
+                max_changed_files=self.settings.kernel_v3.self_edit_max_changed_files,
+                max_net_loc_delta=self.settings.kernel_v3.self_edit_max_loc_delta,
+                policy_mode=self.settings.kernel_v3.self_edit_policy_mode,
+            )
+            self.self_edit_proposal_manager = ProposalManager(
+                evo_repo=self.evolution_repo,
+                state_repo=self.repo,
+                constitution_guard=self.self_edit_guard,
+                entropy_sensor=self.entropy_sensor,
+            )
+            self.self_edit_manager = SelfEditManager(
+                evo_repo=self.evolution_repo,
+                state_repo=self.repo,
+                proposal_manager=self.self_edit_proposal_manager,
+                constitution_guard=self.self_edit_guard,
+                brain=self.brain,
+                repo_root=self.settings.evolution.repo_root,
+                workspace_root=self.settings.governance.workspace_root,
+                enabled=self.settings.kernel_v3.self_edit_enabled,
+                auto_approve_enabled=self.settings.kernel_v3.self_edit_auto_approve_enabled,
+                policy_mode=self.settings.kernel_v3.self_edit_policy_mode,
+                target_branch=self.settings.kernel_v3.self_edit_branch,
+                cooldown_minutes=self.settings.kernel_v3.self_edit_cooldown_minutes,
+                max_commits_per_day=self.settings.kernel_v3.self_edit_max_commits_per_day,
+                max_changed_files=self.settings.kernel_v3.self_edit_max_changed_files,
+                max_loc_delta=self.settings.kernel_v3.self_edit_max_loc_delta,
+                pytest_timeout_seconds=self.settings.kernel_v3.self_edit_pytest_timeout_seconds,
+                llm_review_enabled=self.settings.kernel_v3.self_edit_llm_review_enabled,
+            )
+            if self.telegram_webhook is not None:
+                self.telegram_webhook.self_edit_manager = self.self_edit_manager
         self.meta_reflection_manager = MetaReflectionManager(
             repo=self.repo,
             brain=self.brain,
@@ -530,6 +569,10 @@ class OrganismRuntime:
             attribution_min_cycles=self.settings.kernel_v3.meta_reflection_attribution_min_cycles,
             regression_delta=self.settings.kernel_v3.meta_reflection_regression_delta,
             l2_bridge_enabled=self.settings.kernel_v3.l2_evolution_bridge_enabled,
+            self_edit_manager=self.self_edit_manager,
+            self_edit_enabled=self.settings.kernel_v3.self_edit_enabled,
+            self_edit_auto_approve_enabled=self.settings.kernel_v3.self_edit_auto_approve_enabled,
+            self_edit_policy_mode=self.settings.kernel_v3.self_edit_policy_mode,
         )
 
         self.finalizer = TaskFinalizer(
@@ -554,6 +597,7 @@ class OrganismRuntime:
             world_pipeline=self.world_pipeline,
             meta_reflection_manager=self.meta_reflection_manager,
             reproduction_quality_scoring_enabled=self.settings.kernel_v3.reproduction_quality_scoring_enabled,
+            self_edit_manager=self.self_edit_manager,
         )
 
         async def _handle_finalize_event(ev: dict[str, Any]) -> dict[str, Any]:
@@ -625,6 +669,7 @@ class OrganismRuntime:
             culling_gc=self.culling_gc,
             telegram_notifier=self.telegram_notifier,
             meta_reflection_manager=self.meta_reflection_manager,
+            self_edit_manager=self.self_edit_manager,
         )
         self.finalizer._on_learning = self.loop._record_learning_signal
         self.finalizer._on_prediction_error = self.loop._record_prediction_error
@@ -677,6 +722,7 @@ class OrganismRuntime:
                     proposal_manager=self.proposal_manager,
                     succession_manager=self.succession_manager,
                     social_settings=self.settings.social,
+                    self_edit_manager=self.self_edit_manager,
                 )
                 self.telegram_poller.start()
         logger.info("runtime.started", organism=self.settings.organism.name, organism_id=str(self.organism_id))

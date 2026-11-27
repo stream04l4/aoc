@@ -2482,6 +2482,10 @@ def create_control_center_router(get_runtime) -> APIRouter:
                     item(key="policy.approval.default_ttl_hours", label="审批单默认有效期 (h)", description="超时自动置 EXPIRED 防止陈旧审批被误执行", effective_value=_nested_get(policy_yaml, "approval", "default_ttl_hours") or 24, yaml_value=_nested_get(policy_yaml, "approval", "default_ttl_hours"), default_value=24),
                     item(key="telegram.enabled", label="Telegram 通知/审批开关", description="是否启用 @Joel_aoc_bot 异步通知与受控 Webhook", effective_value=s.telegram.enabled, default_value=False, env_var="AOC_TELEGRAM__ENABLED"),
                     item(key="kernel_v3.l2_evolution_bridge_enabled", label="L2 演化提案受控桥接开关", description="将元反思 L2 建议经隔离 worktree + 四层宪法校验 + 二次人工确认落地（V5.3 M4）", effective_value=s.kernel_v3.l2_evolution_bridge_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "l2_evolution_bridge_enabled"), default_value=False, env_var="AOC_KERNEL_V3__L2_EVOLUTION_BRIDGE_ENABLED"),
+                    item(key="kernel_v3.self_edit_enabled", label="自主源码自改总开关", description="允许 AOC 在隔离 git worktree 中修改仓库代码/测试并进入自动化验证流（V5.4）", effective_value=s.kernel_v3.self_edit_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "self_edit_enabled"), default_value=False, env_var="AOC_KERNEL_V3__SELF_EDIT_ENABLED"),
+                    item(key="kernel_v3.self_edit_auto_approve_enabled", label="自主自改自我审批开关", description="通过宪法校验 + pytest + Critic 复核后无需人工预审即提交至独立演化分支（V5.4）", effective_value=s.kernel_v3.self_edit_auto_approve_enabled, yaml_value=_nested_get(settings_yaml, "kernel_v3", "self_edit_auto_approve_enabled"), default_value=False, env_var="AOC_KERNEL_V3__SELF_EDIT_AUTO_APPROVE_ENABLED"),
+                    item(key="kernel_v3.self_edit_policy_mode", label="自主自改边界模式", description="strict（白名单）或 wide_open（仅锁定密钥、auth.py 与 lifecycle.py）（V5.4）", effective_value=s.kernel_v3.self_edit_policy_mode, yaml_value=_nested_get(settings_yaml, "kernel_v3", "self_edit_policy_mode"), default_value="strict", env_var="AOC_KERNEL_V3__SELF_EDIT_POLICY_MODE"),
+                    item(key="kernel_v3.self_edit_branch", label="自主自改目标分支", description="自审通过后唯一写入的独立演化分支（从不直接改写 main）（V5.4）", effective_value=s.kernel_v3.self_edit_branch, yaml_value=_nested_get(settings_yaml, "kernel_v3", "self_edit_branch"), default_value="evo/auto", env_var="AOC_KERNEL_V3__SELF_EDIT_BRANCH"),
                     item(key="telegram.bot_token", label="Telegram Bot Token", description="机器人 API 密钥（严格脱敏）", effective_value=bool(s.telegram.bot_token and s.telegram.bot_token.get_secret_value()), env_var="AOC_TELEGRAM__BOT_TOKEN", sensitive=True),
                     item(key="telegram.webhook_secret", label="Telegram Webhook Secret", description="回调验签密钥（严格脱敏）", effective_value=bool(s.telegram.webhook_secret and s.telegram.webhook_secret.get_secret_value()), env_var="AOC_TELEGRAM__WEBHOOK_SECRET", sensitive=True),
                 ],
@@ -2904,6 +2908,8 @@ def create_control_center_router(get_runtime) -> APIRouter:
                                 "skill_refactor_queue",
                                 "skill_lifecycle_audit",
                                 "l2_evolution_bridge_state",
+                                "self_edit_queue",
+                                "self_edit_state",
                             ]
                         )
                     )
@@ -3079,6 +3085,19 @@ def create_control_center_router(get_runtime) -> APIRouter:
         lifecycle_audit = dict(audit_row.value or {}) if (audit_row and isinstance(audit_row.value, dict)) else None
         bridge_row = next((w for w in ws_rows if w.kind == "l2_evolution_bridge_state" and w.key == "primary"), None)
         bridge_state = dict(bridge_row.value or {}) if (bridge_row and isinstance(bridge_row.value, dict)) else None
+        se_state_row = next((w for w in ws_rows if w.kind == "self_edit_state" and w.key == "primary"), None)
+        se_state = dict(se_state_row.value or {}) if (se_state_row and isinstance(se_state_row.value, dict)) else None
+        se_open = [
+            {
+                "queue_key": w.key,
+                "title": (w.value or {}).get("title") if isinstance(w.value, dict) else None,
+                "target_files": (w.value or {}).get("target_files") if isinstance(w.value, dict) else [],
+                "priority": (w.value or {}).get("priority") if isinstance(w.value, dict) else 1,
+                "enqueued_at": (w.value or {}).get("enqueued_at") if isinstance(w.value, dict) else _iso(w.created_at),
+            }
+            for w in ws_rows
+            if w.kind == "self_edit_queue" and w.status == "open"
+        ]
 
         return {
             "read_only": True,
@@ -3096,6 +3115,12 @@ def create_control_center_router(get_runtime) -> APIRouter:
                 "skill_first_auto_heal_enabled": bool(kv3.skill_first_auto_heal_enabled),
                 "meta_reflection_attribution_enabled": bool(kv3.meta_reflection_attribution_enabled),
                 "l2_evolution_bridge_enabled": bool(kv3.l2_evolution_bridge_enabled),
+            },
+            "v5_4_feature_flags": {
+                "self_edit_enabled": bool(kv3.self_edit_enabled),
+                "self_edit_auto_approve_enabled": bool(kv3.self_edit_auto_approve_enabled),
+                "self_edit_policy_mode": str(kv3.self_edit_policy_mode),
+                "self_edit_branch": str(kv3.self_edit_branch),
             },
             "execution_modes": {
                 "counts": mode_counts,
@@ -3177,6 +3202,15 @@ def create_control_center_router(get_runtime) -> APIRouter:
             "l2_evolution_bridge": {
                 "enabled": bool(kv3.l2_evolution_bridge_enabled),
                 "state": bridge_state,
+            },
+            "self_edit": {
+                "enabled": bool(kv3.self_edit_enabled),
+                "auto_approve_enabled": bool(kv3.self_edit_auto_approve_enabled),
+                "policy_mode": str(kv3.self_edit_policy_mode),
+                "branch": str(kv3.self_edit_branch),
+                "pending_queue_count": len(se_open),
+                "pending_queue": se_open,
+                "state": se_state,
             },
         }
 

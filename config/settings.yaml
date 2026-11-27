@@ -120,3 +120,13 @@ kernel_v3:
   meta_reflection_attribution_min_cycles: 5
   meta_reflection_regression_delta: 0.08
   l2_evolution_bridge_enabled: false # V5.3 M4: Bridge Meta-Reflection L2 cards to ProposalManager + ConstitutionGuard
+  self_edit_enabled: false           # V5.4: Enable isolated worktree self-editing capability
+  self_edit_auto_approve_enabled: false # V5.4: Allow self-approval onto evo/auto after deterministic verification
+  self_edit_policy_mode: "strict"    # V5.4: strict (allowlist) | wide_open (hard-lock auth/lifecycle/secrets only)
+  self_edit_branch: "evo/auto"       # V5.4: Dedicated evolution branch (never mutates main directly)
+  self_edit_cooldown_minutes: 60
+  self_edit_max_commits_per_day: 6
+  self_edit_max_changed_files: 8
+  self_edit_max_loc_delta: 600
+  self_edit_pytest_timeout_seconds: 180
+  self_edit_llm_review_enabled: true

@@ -33,6 +33,8 @@ from app.cognition.interfaces import (
     MetaReflectionContext,
     MetaReflectionOutput,
     ResearchSynthesisContext,
+    SelfEditReviewContext,
+    SelfEditReviewDecision,
     SocialContext,
     SocialTurnDecision,
 )
@@ -130,6 +132,19 @@ class CognitionBrain(BrainInterface):
         )
 
     async def generate_goal(self, context: CognitiveContext) -> GoalProposal:
+        repro_rule = (
+            "For reproduction drive when `self_edit_enabled` is true, you MAY propose bounded improvements to "
+            f"AOC's own code, unit tests, or configs (policy_mode=`{context.self_edit_policy_mode}`): "
+            "prioritize `pending_self_edits` when non-empty, or `pending_skill_refactors` for reusable skill upgrades. "
+            "Self-edits run in an isolated worktree, must pass deterministic guards + pytest, and self-approve onto branch `evo/auto`. "
+            if context.self_edit_enabled
+            else (
+                "For reproduction drive, ONLY propose virtual capability-building, skill research, "
+                "or low-risk L1 isolated-workspace Python coding/utility tasks (e.g. creating a reusable "
+                "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
+                "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
+            )
+        )
         system_prompt = (
             "You are the goal generator of AOC. Given the selected drive, assessment, "
             "available agents, read-only internal affect_state, active_hypotheses, and remaining budget, "
@@ -139,11 +154,8 @@ class CognitionBrain(BrainInterface):
             "Set predicted_ig (0..1) honestly as your expected verified information gain. "
             "affect_state is READ-ONLY internal context (you may adjust exploration vs caution style, NEVER mutate affect or bypass Governance). "
             "If nothing worthwhile or safe can be done, set should_act=false. "
-            "For reproduction drive, ONLY propose virtual capability-building, skill research, "
-            "or low-risk L1 isolated-workspace Python coding/utility tasks (e.g. creating a reusable "
-            "skill.py + test_skill.py inside the task workspace to build coding/debugging evidence) — "
-            "NEVER modifying AOC Core source code, creating servers, cloning instances, or elevating permissions. "
-            "If `pending_skill_refactors` is non-empty during reproduction drive, prioritize proposing a concrete "
+            + repro_rule
+            + "If `pending_skill_refactors` is non-empty during reproduction drive, prioritize proposing a concrete "
             "refactoring/generalization goal targeting the top queued skill's `canonical_name` (`skill_key`). "
             "For curiosity drive, you may verify an unverified entry in active_hypotheses, attach a new lightweight "
             "hypothesis_to_test ({key, claim, verification_hint}), attach an external exploration_topic "
@@ -242,6 +254,11 @@ class CognitionBrain(BrainInterface):
         }
         if context.pending_skill_refactors:
             payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
+        if context.self_edit_enabled:
+            payload["self_edit_enabled"] = True
+            payload["self_edit_policy_mode"] = context.self_edit_policy_mode
+            if context.pending_self_edits:
+                payload["pending_self_edits"] = context.pending_self_edits[:3]
         proposal = await self._gateway.complete_structured(
             operation="generate_goal",
             system_prompt=system_prompt,
@@ -289,6 +306,17 @@ class CognitionBrain(BrainInterface):
             if isinstance(context.top_skill_match, dict) and context.top_skill_match
             else ""
         )
+        self_edit_rule = (
+            "\n- SELF-EDIT MODE (`execution_mode='self_edit'`): When the goal evolves AOC's own code, unit tests, "
+            "or configs (or resolves an item from `pending_self_edits`), set execution_mode='self_edit', "
+            "assigned_agent='codex', permission_level='L1', AND populate "
+            "`self_edit_spec={'target_files': ['app/...'], 'hypothesis': '<why>', 'change_summary': '<what>', "
+            "'test_targets': ['tests/unit/...'], 'rollback_plan': '<how>', 'queue_key': '<optional>'}`. "
+            "The kernel creates an isolated worktree and automatically runs pytest, critic self-review, and git commit "
+            "onto `evo/auto` (do NOT put git commit/push commands or host `/home/ubuntu` paths inside objective/description)."
+            if context.self_edit_enabled
+            else ""
+        )
         system_prompt = (
             "You are the action planner of AOC. Turn the proposed goal into ONE bounded, "
             "verifiable task for an available external AI agent. "
@@ -326,6 +354,7 @@ class CognitionBrain(BrainInterface):
             + brain_research_rule
             + explicit_refactor_rule
             + top_match_rule
+            + self_edit_rule
         )
         plan_query = " ".join(
             [
@@ -365,6 +394,11 @@ class CognitionBrain(BrainInterface):
             payload["pending_skill_refactors"] = context.pending_skill_refactors[:3]
         if context.top_skill_match:
             payload["top_skill_match"] = context.top_skill_match
+        if context.self_edit_enabled:
+            payload["self_edit_enabled"] = True
+            payload["self_edit_policy_mode"] = context.self_edit_policy_mode
+            if context.pending_self_edits:
+                payload["pending_self_edits"] = context.pending_self_edits[:3]
         return await self._gateway.complete_structured(
             operation="plan",
             system_prompt=system_prompt,
@@ -674,16 +708,26 @@ class CognitionBrain(BrainInterface):
         )
 
     async def reflect_on_system(self, context: MetaReflectionContext) -> MetaReflectionOutput:
-        """Periodic Meta-Reflection Critic diagnosing system bottlenecks and bounded upgrades (V5.2 M4 + V5.3 M3/M4)."""
-        l2_bridge_rule = (
-            "\n   BRIDGE METADATA (`proposed_change`, optional when modifying an allowlisted config/heuristic): "
-            "You may attach `proposed_change: {target_file, change_type, yaml_updates?, replacements?, hypothesis}` inside "
-            "`l2_upgrade_proposal` ONLY targeting a file in `evolvable_allowlist_sample` (e.g. `config/drives.yaml`, "
-            "`config/memory.yaml`, `app/cognition/brain.py`). NEVER target governance/policy/auth/security/drive-interface "
-            "constitutional files."
-            if context.l2_evolution_bridge_enabled
-            else ""
-        )
+        """Periodic Meta-Reflection Critic diagnosing system bottlenecks and bounded upgrades (V5.2 M4 + V5.3 M3/M4 + V5.4)."""
+        if context.self_edit_auto_approve_enabled:
+            l2_bridge_rule = (
+                "\n   AUTONOMOUS SELF-EDIT PIPELINE (`self_edit_auto_approve_enabled=true`, policy_mode="
+                f"`{context.self_edit_policy_mode}`): When you emit `l2_upgrade_proposal`, AOC can self-execute, test "
+                "(ConstitutionGuard + pytest), self-approve onto branch `evo/auto`, and report to Joel automatically! "
+                "Include `target_files`, `desired_change`, `test_plan`, `rollback_plan`, and optionally an exact "
+                "`proposed_change: {target_file, change_type, yaml_updates?, replacements?, hypothesis}` if trivial. "
+                "Locked files ONLY: `.env`/secrets, `app/api/auth.py`, `app/core/lifecycle.py`."
+            )
+        elif context.l2_evolution_bridge_enabled:
+            l2_bridge_rule = (
+                "\n   BRIDGE METADATA (`proposed_change`, optional when modifying an allowlisted config/heuristic): "
+                "You may attach `proposed_change: {target_file, change_type, yaml_updates?, replacements?, hypothesis}` inside "
+                "`l2_upgrade_proposal` ONLY targeting a file in `evolvable_allowlist_sample` (e.g. `config/drives.yaml`, "
+                "`config/memory.yaml`, `app/cognition/brain.py`). NEVER target governance/policy/auth/security/drive-interface "
+                "constitutional files."
+            )
+        else:
+            l2_bridge_rule = ""
         system_prompt = (
             "You are the Periodic Meta-Reflection Critic of AOC. Step back from single-cycle tasks and evaluate "
             "the organism's recent reliability, `llm_schema_retry_stats`, `attempt_failure_clusters` (timeout vs "
@@ -744,9 +788,38 @@ class CognitionBrain(BrainInterface):
         }
         if context.l2_evolution_bridge_enabled and context.evolvable_allowlist_sample:
             payload["evolvable_allowlist_sample"] = context.evolvable_allowlist_sample[:12]
+        if context.self_edit_auto_approve_enabled:
+            payload["self_edit_auto_approve_enabled"] = True
+            payload["self_edit_policy_mode"] = context.self_edit_policy_mode
         return await self._gateway.complete_structured(
             operation="meta_reflection",
             system_prompt=system_prompt,
             user_payload=payload,
             schema_cls=MetaReflectionOutput,
+        )
+
+    async def review_self_edit(self, context: SelfEditReviewContext) -> SelfEditReviewDecision:
+        """Critic review gate checking diff safety, coherence, and restart requirement before self-approval (V5.4)."""
+        system_prompt = (
+            "You are the Autonomous Self-Edit Reviewer of AOC. Inspect the proposed git diff, changed files, "
+            "hypothesis, and verified pytest summary. Reject ONLY if the change introduces security risks, disables "
+            "safety/auth/lifecycle guards, corrupts core data structures, or contradicts the stated hypothesis.\n"
+            "Return compact JSON `{approved, risk_level, summary_zh, concerns, restart_required}` where `summary_zh` "
+            "is plain Simplified Chinese (<= 160 chars) suitable for reporting to creator Joel, and `concerns` is an "
+            "empty list when approved. Keep internal reasoning brief."
+        )
+        payload = {
+            "proposal_key": context.proposal_key,
+            "title": context.title,
+            "hypothesis": context.hypothesis,
+            "policy_mode": context.policy_mode,
+            "changed_files": context.changed_files[:12],
+            "pytest_summary": context.pytest_summary[:240],
+            "unified_diff": context.unified_diff[:5000],
+        }
+        return await self._gateway.complete_structured(
+            operation="self_edit_review",
+            system_prompt=system_prompt,
+            user_payload=payload,
+            schema_cls=SelfEditReviewDecision,
         )

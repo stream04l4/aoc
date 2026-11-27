@@ -270,6 +270,44 @@ def format_notification_message(payload: dict[str, Any]) -> tuple[str, dict[str,
             f"原因：{payload.get('reason', '管理员触发')}\n"
             f"快照标签：{payload.get('rollback_tag') or '无'}"
         ), None
+    if kind == "self_edit_report":
+        pkey = str(payload.get("proposal_key") or "").strip()
+        restart_req = bool(payload.get("restart_required", False))
+        files = list(payload.get("changed_files") or [])
+        hdr = (
+            "🧬 [AOC 自主代码进化汇报 · 新版需重启生效]"
+            if restart_req
+            else "🧬 [AOC 自主代码进化汇报 · 已自动落地]"
+        )
+        lines = [
+            hdr,
+            f"提案：{pkey} | 分支：{payload.get('branch', 'evo/auto')} @ {payload.get('commit_sha', '')}",
+            f"主题：{str(payload.get('title') or '')[:140]}",
+            f"改动摘要：{str(payload.get('summary') or '')[:260]}",
+            f"修改文件({len(files)}, ±{payload.get('changed_lines', 0)}行)：{', '.join(files[:6]) or '无'}",
+            f"验证门禁：宪法校验 ✅ · 单元测试 ✅（{str(payload.get('pytest_summary') or '')[:120]}）· 自我审批 ✅",
+            f"回滚标签：{payload.get('rollback_tag', '')}",
+        ]
+        if restart_req:
+            lines.append(
+                f"🚀 需要你确认合并并重建容器（当前累积 {payload.get('pending_restart_count', 1)} 项待生效改动）：\n"
+                f"{payload.get('rebuild_command', 'cd /home/ubuntu/aoc && git merge --no-ff evo/auto && sudo docker compose up -d --build --no-deps aoc')}"
+            )
+        else:
+            lines.append("✅ 本次仅涉及无需重启的文件，可直接记录。")
+        reply_markup = (
+            {
+                "inline_keyboard": [
+                    [
+                        {"text": "⏪ 撤销此次自改", "callback_data": f"self_edit_revert:{pkey}"},
+                        {"text": "👀 查看改动 Diff", "callback_data": f"self_edit_diff:{pkey}"},
+                    ]
+                ]
+            }
+            if pkey
+            else None
+        )
+        return "\n".join(lines), reply_markup
     if kind == "evolution_arena_culled":
         reasons = "; ".join(str(r) for r in (payload.get("reasons") or []))[:260]
         text = (
@@ -645,6 +683,23 @@ async def _dispatch_human_bridge_callback(
     return {"ok": True, "kind": "human_card_choice", "card_id": card_id, "option_index": idx, "result": res}
 
 
+def _format_self_edit_status_text(state: dict[str, Any], queue_items: list[dict[str, Any]]) -> str:
+    pending = list(state.get("pending_commits") or [])
+    lines = [
+        "🧬 [AOC 自主代码进化状态]",
+        f"目标分支：{state.get('last_target_branch') or 'evo/auto'} | 最近阶段：{state.get('last_stage') or '暂无'}",
+        f"今日自改提交：{state.get('commits_today_count') or 0} | 累计自审通过：{state.get('total_self_approved') or 0} | 拦截：{state.get('total_rejected') or 0}",
+        f"待执行自改队列：{len(queue_items)} 项 | 待重建生效提交：{len(pending)} 项",
+    ]
+    if pending:
+        lines.append(
+            "待重启合入命令：cd /home/ubuntu/aoc && git merge --no-ff evo/auto && sudo docker compose up -d --build --no-deps aoc"
+        )
+        for item in pending[-3:]:
+            lines.append(f"- {item.get('proposal_key')} ({item.get('commit_sha')}): {str(item.get('title') or '')[:60]}")
+    return "\n".join(lines)
+
+
 class TelegramWebhookHandler:
     """Authenticates Telegram Webhook callbacks and routes approvals through ApprovalService."""
 
@@ -659,6 +714,7 @@ class TelegramWebhookHandler:
         human_bridge: HumanBridge | None = None,
         lifecycle: Any = None,
         social_settings: SocialSettings | None = None,
+        self_edit_manager: Any = None,
     ) -> None:
         self.settings = settings
         self.approval_service = approval_service
@@ -669,6 +725,7 @@ class TelegramWebhookHandler:
         self.human_bridge = human_bridge
         self.lifecycle = lifecycle
         self.social_settings = social_settings
+        self.self_edit_manager = self_edit_manager
 
     async def handle_update(
         self,
@@ -718,12 +775,15 @@ class TelegramWebhookHandler:
             if isinstance(rep, dict) and isinstance(rep.get("message_id"), int):
                 reply_to_msg_id = rep["message_id"]
             parts = msg_text.split()
-            if len(parts) >= 2 and parts[0].lower() in {
+            if parts and parts[0].lower() == "/evo_auto_status":
+                raw_action = "evo_auto_status:primary"
+            elif len(parts) >= 2 and parts[0].lower() in {
                 "/approve",
                 "/reject",
                 "/evo_approve",
                 "/evo_reject",
                 "/evo_promote",
+                "/evo_auto_revert",
             }:
                 raw_action = f"{parts[0].lower().lstrip('/')}:{parts[1]}"
         else:
@@ -848,6 +908,34 @@ class TelegramWebhookHandler:
                 "result": succ_res.model_dump(mode="json"),
             }
 
+        if action in {"self_edit_revert", "evo_auto_revert"} and nonce and self.self_edit_manager is not None:
+            approver = f"telegram:{username}({user_id})"
+            rev_res = await self.self_edit_manager.revert_commit(nonce, operator=approver)
+            reply_msg = f"⏪ 已撤销 {nonce}（{rev_res.get('revert_mode')}），{rev_res.get('branch')} -> {rev_res.get('new_tip')}"
+            if self.notifier is not None:
+                if callback_id:
+                    await self.notifier.answer_callback_query(callback_id, reply_msg[:180])
+                elif chat_id:
+                    await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": reply_msg})
+            return {"ok": True, "kind": "self_edit_revert", "action": action, "result": rev_res}
+
+        if action == "self_edit_diff" and nonce and self.self_edit_manager is not None:
+            diff_txt = await self.self_edit_manager.get_diff_summary(nonce)
+            if self.notifier is not None:
+                if callback_id:
+                    await self.notifier.answer_callback_query(callback_id, f"已发送 {nonce} Diff")
+                if chat_id:
+                    await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": diff_txt[:3900]})
+            return {"ok": True, "kind": "self_edit_diff", "proposal_key": nonce, "diff": diff_txt}
+
+        if action == "evo_auto_status" and self.self_edit_manager is not None:
+            st = await self.self_edit_manager.get_state()
+            q_items = await self.self_edit_manager.list_pending_self_edits(limit=5)
+            txt = _format_self_edit_status_text(st, q_items)
+            if self.notifier is not None and chat_id:
+                await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": txt[:3900]})
+            return {"ok": True, "kind": "self_edit_status", "state": st, "queue_count": len(q_items)}
+
         if action not in {"approve", "reject"} or not nonce:
             return {"ok": True, "ignored": True, "reason": "invalid approval callback syntax"}
 
@@ -880,6 +968,7 @@ class TelegramPoller:
         proposal_manager: Any = None,
         succession_manager: Any = None,
         social_settings: SocialSettings | None = None,
+        self_edit_manager: Any = None,
     ) -> None:
         self.settings = settings
         self.notifier = notifier
@@ -891,6 +980,7 @@ class TelegramPoller:
         self.proposal_manager = proposal_manager or getattr(webhook_handler, "proposal_manager", None)
         self.succession_manager = succession_manager or getattr(webhook_handler, "succession_manager", None)
         self.social_settings = social_settings
+        self.self_edit_manager = self_edit_manager or getattr(webhook_handler, "self_edit_manager", None)
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -963,6 +1053,28 @@ class TelegramPoller:
             if ":" in raw_action:
                 action, nonce = raw_action.split(":", 1)
                 action = action.strip().lower()
+                if action == "self_edit_revert" and nonce.strip() and self.self_edit_manager is not None:
+                    approver = f"telegram:{username}({user_id})"
+                    try:
+                        rev_res = await self.self_edit_manager.revert_commit(nonce.strip(), operator=approver)
+                        msg_reply = f"⏪ 已撤销 {nonce.strip()}（{rev_res.get('revert_mode')}），{rev_res.get('branch')} -> {rev_res.get('new_tip')}"
+                    except Exception as exc:
+                        rev_res = {"error": str(exc)}
+                        msg_reply = f"❌ 撤销自改失败：{exc}"
+                    cb_id = str(cb.get("id") or "")
+                    if cb_id:
+                        await self.notifier.answer_callback_query(cb_id, msg_reply[:180])
+                    if chat_id:
+                        await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": msg_reply})
+                    return {"ok": True, "kind": "self_edit_revert", "action": action, "result": rev_res}
+                if action == "self_edit_diff" and nonce.strip() and self.self_edit_manager is not None:
+                    diff_txt = await self.self_edit_manager.get_diff_summary(nonce.strip())
+                    cb_id = str(cb.get("id") or "")
+                    if cb_id:
+                        await self.notifier.answer_callback_query(cb_id, f"已展开 {nonce.strip()} Diff")
+                    if chat_id:
+                        await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": diff_txt[:3900]})
+                    return {"ok": True, "kind": "self_edit_diff", "proposal_key": nonce.strip(), "diff": diff_txt}
                 if action in {"evo_approve", "evo_reject"} and nonce.strip() and self.proposal_manager is not None:
                     approver = f"telegram:{username}({user_id})"
                     try:
@@ -1034,6 +1146,25 @@ class TelegramPoller:
 
         parts = text.split()
         cmd = parts[0].lower()
+        if cmd == "/evo_auto_status" and self.self_edit_manager is not None:
+            st = await self.self_edit_manager.get_state()
+            q_items = await self.self_edit_manager.list_pending_self_edits(limit=5)
+            reply_txt = _format_self_edit_status_text(st, q_items)
+            await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": reply_txt[:3900]})
+            return {"ok": True, "kind": "self_edit_status", "state": st, "queue_count": len(q_items)}
+
+        if len(parts) >= 2 and cmd == "/evo_auto_revert" and self.self_edit_manager is not None:
+            pkey = parts[1].strip()
+            approver = f"telegram:{username}({user_id})"
+            try:
+                rev_res = await self.self_edit_manager.revert_commit(pkey, operator=approver)
+                reply_txt = f"⏪ 已撤销自改 {pkey}（{rev_res.get('revert_mode')}），{rev_res.get('branch')} -> {rev_res.get('new_tip')}"
+            except Exception as exc:
+                rev_res = {"error": str(exc)}
+                reply_txt = f"❌ 撤销自改失败：{exc}"
+            await self.notifier._post("sendMessage", {"chat_id": chat_id, "text": reply_txt})
+            return {"ok": True, "kind": "self_edit_revert_cmd", "proposal_key": pkey, "result": rev_res}
+
         if len(parts) >= 2 and cmd == "/evo_promote" and self.succession_manager is not None:
             pkey = parts[1].strip()
             note = " ".join(parts[2:]).strip()

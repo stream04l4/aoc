@@ -27,6 +27,8 @@ _NON_INHERITABLE_WORLD_KINDS = (
     "skill_refactor_queue",
     "skill_lifecycle_audit",
     "l2_evolution_bridge_state",
+    "self_edit_queue",
+    "self_edit_state",
 )
 _REQUIRED_BLANK_TABLES = (
     "memory_index",

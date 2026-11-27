@@ -104,7 +104,7 @@ class ActionPlan(BaseModel):
     goal_title: str = ""
     objective: str = ""
     description: str = ""
-    execution_mode: str = "codex"  # codex | skill_first | brain_research
+    execution_mode: str = "codex"  # codex | skill_first | brain_research | self_edit
     assigned_agent: str = "codex"
     required_capability: str = "general_task"
     expected_output: str = ""
@@ -118,6 +118,8 @@ class ActionPlan(BaseModel):
     skill_invocation: dict[str, Any] | None = None
     # V5.2 M3: optional explicit directed skill refactoring target ({skill_key, canonical_name?, skill_id?, reason?, target_generalization?})
     skill_refactor_target: dict[str, Any] | None = None
+    # V5.4: optional autonomous self-edit spec ({target_files, hypothesis, change_summary?, test_targets?, rollback_plan?, queue_key?})
+    self_edit_spec: dict[str, Any] | None = None
     # Advisory prediction ONLY — never directly updates drive satisfaction (task book 9.1)
     expected_improvement: float = 0.0
     rationale: str = ""
@@ -131,6 +133,8 @@ class ActionPlan(BaseModel):
             return "brain_research"
         if raw in {"skill_first", "skill", "skill_runtime"}:
             return "skill_first"
+        if raw in {"self_edit", "self_evolve", "code_evolution", "edit_self"}:
+            return "self_edit"
         return "codex"
 
     @field_validator("permission_level")
@@ -186,6 +190,10 @@ class CognitiveContext(BaseModel):
     pending_skill_refactors: list[dict[str, Any]] = Field(default_factory=list)
     # V5.3 M2: Highest-scoring deterministic VALIDATED skill candidate pre-selected for plan()
     top_skill_match: dict[str, Any] | None = None
+    # V5.4: Autonomous self-edit capability state & pending queue items
+    self_edit_enabled: bool = False
+    self_edit_policy_mode: str = "strict"
+    pending_self_edits: list[dict[str, Any]] = Field(default_factory=list)
     budget_remaining: dict[str, Any] = Field(default_factory=dict)
     active_goals: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -402,6 +410,9 @@ class MetaReflectionContext(BaseModel):
     previous_reflection_impact: dict[str, Any] | None = None
     l2_evolution_bridge_enabled: bool = False
     evolvable_allowlist_sample: list[str] = Field(default_factory=list)
+    # V5.4: Autonomous self-editing & self-approval settings for Meta-Reflection
+    self_edit_auto_approve_enabled: bool = False
+    self_edit_policy_mode: str = "strict"
 
 
 class MetaReflectionOutput(BaseModel):
@@ -419,6 +430,35 @@ class MetaReflectionOutput(BaseModel):
     @classmethod
     def _clamp_meta_conf(cls, v: float) -> float:
         return clamp01(v)
+
+
+class SelfEditReviewContext(BaseModel):
+    """Diff & test verification snapshot passed to BrainInterface.review_self_edit() (V5.4)."""
+
+    proposal_key: str = ""
+    title: str = ""
+    hypothesis: str = ""
+    policy_mode: str = "strict"
+    changed_files: list[str] = Field(default_factory=list)
+    unified_diff: str = ""
+    pytest_summary: str = ""
+
+
+class SelfEditReviewDecision(BaseModel):
+    """Structured Critic self-approval decision before landing commit onto evo/auto (V5.4)."""
+
+    approved: bool = True
+    risk_level: str = "low"  # low | medium | high
+    summary_zh: str = ""
+    concerns: list[str] = Field(default_factory=list)
+    restart_required: bool | None = None
+    usage: LLMUsage = Field(default_factory=LLMUsage)
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def _norm_risk(cls, v: Any) -> str:
+        val = str(v or "low").strip().lower()
+        return val if val in {"low", "medium", "high"} else "medium"
 
 
 class BrainInterface(ABC):
@@ -455,3 +495,11 @@ class BrainInterface(ABC):
     async def reflect_on_system(self, context: MetaReflectionContext) -> MetaReflectionOutput:
         """Optional periodic meta-reflection critic (default no-op for minimal stubs)."""
         return MetaReflectionOutput(diagnosis_summary="meta_reflection_not_implemented", confidence=0.0)
+
+    async def review_self_edit(self, context: SelfEditReviewContext) -> SelfEditReviewDecision:
+        """Optional Critic review gate for autonomous self-edits (defaults approved for deterministic stubs)."""
+        return SelfEditReviewDecision(
+            approved=True,
+            risk_level="low",
+            summary_zh=context.title or "通过确定性校验与测试",
+        )

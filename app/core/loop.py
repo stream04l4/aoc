@@ -156,6 +156,7 @@ class AutonomousLoop:
         culling_gc: Any = None,
         telegram_notifier: Any = None,
         meta_reflection_manager: Any = None,
+        self_edit_manager: Any = None,
     ) -> None:
         self.organism_id = organism_id
         self.settings = settings
@@ -185,6 +186,7 @@ class AutonomousLoop:
         self.culling_gc = culling_gc
         self.telegram_notifier = telegram_notifier
         self.meta_reflection_manager = meta_reflection_manager
+        self.self_edit_manager = self_edit_manager
         self._consecutive_idle_cycles: int = 0
         self._low_ig_streak: int = 0
         self._last_prediction_error: float = 0.0
@@ -744,6 +746,13 @@ class AutonomousLoop:
                 except Exception as exc:
                     logger.warning("cycle.skill_refactors_load_degraded", cycle_id=str(cycle_id), error=str(exc))
 
+            pending_self_edits: list[dict[str, Any]] = []
+            if kv3.self_edit_enabled and self.self_edit_manager is not None:
+                try:
+                    pending_self_edits = await self.self_edit_manager.list_pending_self_edits(limit=3)
+                except Exception as exc:
+                    logger.warning("cycle.self_edits_load_degraded", cycle_id=str(cycle_id), error=str(exc))
+
             cog_ctx = CognitiveContext(
                 observation=pre_obs,
                 drives=list(pre_drives.values()),
@@ -770,6 +779,9 @@ class AutonomousLoop:
                 interest_portfolio=interest_portfolio_items,
                 explicit_skill_refactor_enabled=bool(self.settings.kernel_v3.explicit_skill_refactor_enabled),
                 pending_skill_refactors=pending_skill_refactors,
+                self_edit_enabled=bool(kv3.self_edit_enabled and self.self_edit_manager is not None),
+                self_edit_policy_mode=str(kv3.self_edit_policy_mode or "strict"),
+                pending_self_edits=pending_self_edits,
                 budget_remaining=budget.model_dump(mode="json"),
                 active_goals=await self.repo.list_goals(statuses=[GoalStatus.ACTIVE.value], limit=5),
             )
@@ -1202,6 +1214,18 @@ class AutonomousLoop:
                 plan = plan.model_copy(update={"execution_mode": "codex", "assigned_agent": fallback_agent})
             if not kv3.explicit_skill_refactor_enabled and plan.skill_refactor_target is not None:
                 plan = plan.model_copy(update={"skill_refactor_target": None})
+            plan_wants_self_edit = str(plan.execution_mode or "").strip().lower() == "self_edit"
+            is_self_edit = bool(
+                kv3.self_edit_enabled
+                and self.self_edit_manager is not None
+                and plan_wants_self_edit
+            )
+            if plan_wants_self_edit and not is_self_edit:
+                healthy_agents = self.registry.list_healthy()
+                fallback_agent = healthy_agents[0].agent_id if healthy_agents else "codex"
+                plan = plan.model_copy(update={"execution_mode": "codex", "assigned_agent": fallback_agent, "self_edit_spec": None})
+            elif is_self_edit and plan.permission_level == PermissionLevel.L0.value:
+                plan = plan.model_copy(update={"permission_level": PermissionLevel.L1.value})
             is_brain_research = bool(kv3.brain_research_enabled) and plan_wants_brain
             verdict = await self.governance.validate_plan(plan, decision.selected_drive)
             plan_hash = compute_plan_hash(plan)
@@ -1419,14 +1443,111 @@ class AutonomousLoop:
                 retry_backoff_mult = float(
                     ((decision.constraints or {}).get("affect_modulation") or {}).get("retry_backoff_multiplier", 1.0) or 1.0
                 )
-                dispatch_info = await self.orchestrator.submit_plan(
-                    plan=plan,
-                    verdict=verdict,
-                    goal_id=goal_id,
-                    plan_id=plan_id,
-                    cycle_id=cycle_id,
-                    retry_backoff_multiplier=retry_backoff_mult,
-                )
+                submit_kwargs: dict[str, Any] = {
+                    "plan": plan,
+                    "verdict": verdict,
+                    "goal_id": goal_id,
+                    "plan_id": plan_id,
+                    "cycle_id": cycle_id,
+                    "retry_backoff_multiplier": retry_backoff_mult,
+                }
+                se_meta: dict[str, Any] | None = None
+                if is_self_edit and self.self_edit_manager is not None:
+                    se_spec = plan.self_edit_spec if isinstance(plan.self_edit_spec, dict) else {}
+                    t_files = [
+                        str(f).strip()
+                        for f in list(se_spec.get("target_files") or [])
+                        if str(f).strip()
+                    ]
+                    can_se, se_gate_reason, _ = await self.self_edit_manager.can_start_self_edit(now=now)
+                    ok_targets, target_viols, clean_targets = self.self_edit_manager.validate_target_files(t_files)
+                    if not ok_targets:
+                        await self.repo.log_decision(
+                            decision_type="self_edit_gate",
+                            selected="REJECTED",
+                            alternatives=[],
+                            reason=f"Blocked locked self-edit targets: {', '.join(target_viols)}",
+                            payload={"target_files": t_files, "violations": target_viols},
+                            cycle_id=cycle_id,
+                        )
+                        await self.repo.transition_goal(
+                            goal_id,
+                            GoalStatus.REJECTED.value,
+                            note=f"Self-edit target blocked: {', '.join(target_viols)}",
+                        )
+                        outcome = "POLICY_DENIED"
+                        await self._finalize_cycle(
+                            cycle_id,
+                            outcome,
+                            pre_drives,
+                            pre_drives,
+                            {**state_changes, "self_edit_blocked": target_viols},
+                            t0,
+                        )
+                        return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
+                    if not can_se:
+                        await self.repo.log_decision(
+                            decision_type="self_edit_gate",
+                            selected="DEFERRED",
+                            alternatives=[],
+                            reason=se_gate_reason,
+                            payload={"target_files": clean_targets},
+                            cycle_id=cycle_id,
+                        )
+                        await self.repo.transition_goal(
+                            goal_id,
+                            GoalStatus.ABANDONED.value,
+                            note=f"Self-edit deferred ({se_gate_reason})",
+                        )
+                        outcome = "IDLE"
+                        await self.lifecycle.transition(LifecycleState.IDLE, reason=se_gate_reason, cycle_id=cycle_id)
+                        await self._finalize_cycle(
+                            cycle_id,
+                            outcome,
+                            pre_drives,
+                            pre_drives,
+                            {**state_changes, "self_edit_deferred": se_gate_reason},
+                            t0,
+                        )
+                        return await self.repo.get_cycle(cycle_id) or {"cycle_id": str(cycle_id), "outcome": outcome}
+
+                    q_key = se_spec.get("queue_key")
+                    if not q_key and isinstance(goal_proposal.related_key, str) and goal_proposal.related_key.startswith("self_edit:"):
+                        q_key = goal_proposal.related_key
+                    se_meta = await self.self_edit_manager.prepare_codex_worktree(
+                        title=str(goal_proposal.title or plan.goal_title or plan.objective)[:160],
+                        hypothesis=str(se_spec.get("hypothesis") or goal_proposal.rationale or plan.objective)[:500],
+                        target_files=clean_targets,
+                        change_summary=str(se_spec.get("change_summary") or goal_proposal.description or plan.objective)[:400],
+                        test_targets=list(se_spec.get("test_targets") or []),
+                        rollback_plan=str(se_spec.get("rollback_plan") or ""),
+                        queue_key=str(q_key) if q_key else None,
+                    )
+                    submit_kwargs["workspace_override"] = se_meta["worktree_path"]
+                    submit_kwargs["resource_budget_extra"] = {"self_edit": se_meta}
+                    submit_kwargs["description_suffix"] = (
+                        "[Autonomous Self-Edit Worktree Instructions]\n"
+                        f"- Target branch after verification: `{se_meta['target_branch']}` | Proposal: `{se_meta['proposal_key']}`\n"
+                        f"- Focus files: {clean_targets or ['(determined by task scope)']}\n"
+                        "- Read existing target files and relevant unit tests in current workspace `.` before editing.\n"
+                        "- Make minimal, well-structured changes and add/update unit tests covering your changes.\n"
+                        "- Hard-locked files (DO NOT edit): secrets/credentials, `app/api/auth.py`, `app/core/lifecycle.py`.\n"
+                        "- Do NOT run `git commit`, `git push`, or `docker`; kernel automatically runs pytest, critic self-review, and git commit after your run finishes."
+                    )
+
+                try:
+                    dispatch_info = await self.orchestrator.submit_plan(**submit_kwargs)
+                except Exception:
+                    if se_meta is not None and self.self_edit_manager is not None:
+                        self.self_edit_manager.cleanup_worktree(se_meta["worktree_path"])
+                    raise
+                if (
+                    se_meta is not None
+                    and self.self_edit_manager is not None
+                    and dispatch_info.get("status") == TaskStatus.FAILED.value
+                    and not dispatch_info.get("execution_id")
+                ):
+                    self.self_edit_manager.cleanup_worktree(se_meta["worktree_path"])
                 task_id = dispatch_info["task_id"]
 
                 # ── 11. WAIT / MONITOR ──────────────────────────────────────────
