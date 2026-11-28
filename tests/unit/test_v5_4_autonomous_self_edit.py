@@ -65,7 +65,7 @@ from app.orchestration.orchestrator import AgentOrchestrator
 from app.perception.interfaces import Observation
 from app.perception.manager import SensorManager
 from app.storage.database import Database
-from app.storage.models import Base, OutboxEvent
+from app.storage.models import AgentTaskRow, Base, OutboxEvent
 from app.storage.repository import StateRepository
 from sqlalchemy import select
 from scripts.v5_soak_check import run_v5_soak_check
@@ -897,3 +897,267 @@ async def test_v5_4_control_center_and_soak_check_hygiene(tmp_path: Path):
     assert dirty_soak["steady_state_ok"] is False
     assert dirty_soak["checks"]["v5_4_self_edit"]["ok"] is False
     assert any("Orphan self-edit worktrees" in f for f in dirty_soak["failures"])
+
+
+@pytest.mark.asyncio
+async def test_v5_4_1_wide_open_unlocks_creative_drive_edits_and_keeps_hard_locks(tmp_path: Path):
+    """wide_open skips strict AST/YAML/behavior locks on evo/auto while keeping hard locks & syntax checks."""
+    repo_root = tmp_path / "repo"
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".venv")
+    shutil.copytree(PROJECT_ROOT / "app", repo_root / "app", ignore=ignore)
+    shutil.copytree(PROJECT_ROOT / "config", repo_root / "config", ignore=ignore)
+
+    strict_guard = ConstitutionGuard(repo_root=repo_root, policy_mode="strict")
+    wide_guard = ConstitutionGuard(repo_root=repo_root, policy_mode="wide_open")
+
+    # 1. Creative drive module edit with httpx import + experimental YAML bounds
+    creative_drive_py = (
+        "import httpx\n\n"
+        "async def experimental_probe() -> bool:\n"
+        "    return hasattr(httpx, 'AsyncClient')\n"
+    )
+    creative_drive_yaml = (
+        "drives:\n"
+        "  curiosity:\n"
+        "    weight: 9.5\n"
+        "    base_urgency: 0.42\n"
+    )
+    strict_res = await strict_guard.evaluate(
+        {
+            "files": ["app/drives/curiosity.py", "config/drives.yaml"],
+            "file_overrides": {
+                "app/drives/curiosity.py": creative_drive_py,
+                "config/drives.yaml": creative_drive_yaml,
+            },
+        }
+    )
+    assert strict_res.passed is False
+
+    wide_res = await wide_guard.evaluate(
+        {
+            "files": ["app/drives/curiosity.py", "config/drives.yaml"],
+            "file_overrides": {
+                "app/drives/curiosity.py": creative_drive_py,
+                "config/drives.yaml": creative_drive_yaml,
+            },
+        }
+    )
+    assert wide_res.passed is True, wide_res.violations
+    l4 = next((lyr for lyr in wide_res.layers if lyr.layer == "layer4_drive_invariants"), None)
+    assert l4 is not None and l4.details.get("skipped") == "wide_open_creative_mode"
+
+    # 2. Still rejects Python syntax errors and hard-locked secrets/auth/lifecycle
+    bad_syntax = await wide_guard.evaluate(
+        {"files": ["app/drives/curiosity.py"], "file_overrides": {"app/drives/curiosity.py": "def broken(:\n    pass\n"}}
+    )
+    assert bad_syntax.passed is False
+    assert any("syntax error" in v for v in bad_syntax.violations)
+
+    for locked_path, override in [
+        ("app/api/auth.py", "def bypass(): pass\n"),
+        ("app/core/lifecycle.py", "def bypass(): pass\n"),
+        (".env", "AOC_API__ADMIN_KEY=override\n"),
+    ]:
+        locked_res = await wide_guard.evaluate({"files": [locked_path], "file_overrides": {locked_path: override}})
+        assert locked_res.passed is False
+
+    bad_secret_yaml = await wide_guard.evaluate(
+        {"files": ["config/drives.yaml"], "file_overrides": {"config/drives.yaml": "api:\n  admin_key: leaked\n"}}
+    )
+    assert bad_secret_yaml.passed is False
+    assert any("forbidden_secret_yaml_key" in v for v in bad_secret_yaml.violations)
+
+
+@pytest.mark.asyncio
+async def test_v5_4_1_loop_strips_brittle_keywords_and_boosts_timeout_and_queue_urgency(tmp_path: Path):
+    """Loop strips guessed contains_keywords, floors timeout_seconds to 600s, adds fast-test hint, and lifts queue urgency."""
+    repo_root = tmp_path / "repo"
+    main_sha = _create_git_repo(repo_root, include_app_and_config=True)
+    ws_root = tmp_path / "workspaces"
+    ws_root.mkdir(parents=True, exist_ok=True)
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'se_v541.db'}")
+    await _init_db(db)
+
+    class _BrittlePlannerBrain(BrainInterface):
+        async def assess(self, observation, memories, drives):
+            return AssessmentResult(summary="Ready")
+
+        async def generate_goal(self, context: CognitiveContext) -> GoalProposal:
+            q_item = context.pending_self_edits[0]
+            return GoalProposal(
+                should_act=True,
+                title=f"自改实现：{q_item['title']}",
+                description=q_item["desired_change"],
+                drive_type="reproduction",
+                related_key=q_item["queue_key"],
+                success_criteria=["pytest passes"],
+                predicted_ig=0.85,
+            )
+
+        async def plan(self, context: CognitiveContext) -> ActionPlan:
+            q_item = context.pending_self_edits[0]
+            return ActionPlan(
+                should_execute=True,
+                goal_title=context.goal.title,
+                objective="Implement helper and tests",
+                description="Edit app/math_helper.py cleanly",
+                execution_mode="self_edit",
+                assigned_agent="codex",
+                required_capability="coding",
+                expected_output="Updated math helper",
+                timeout_seconds=120,
+                permission_level=PermissionLevel.L0.value,
+                success_criteria=["pytest passes"],
+                verification=[
+                    VerificationSpec(
+                        kind="contains_keywords",
+                        target="app/math_helper.py",
+                        keywords=["_nonexistent_helper"],
+                    ),
+                    VerificationSpec(kind="file_exists", target="tests/unit/test_nonexistent.py"),
+                ],
+                self_edit_spec={
+                    "target_files": q_item["target_files"],
+                    "hypothesis": "Add helper cleanly",
+                    "change_summary": "Add subtract_numbers",
+                    "test_targets": ["tests/unit/test_math_helper.py"],
+                    "queue_key": q_item["queue_key"],
+                },
+            )
+
+        async def evaluate(self, context: EvaluationContext) -> EvaluationResult:
+            return EvaluationResult(goal_achieved=True, summary="Verified", information_gain=0.8)
+
+        async def review_self_edit(self, context: SelfEditReviewContext) -> SelfEditReviewDecision:
+            return SelfEditReviewDecision(approved=True, risk_level="low", summary_zh="通过", concerns=[], restart_required=True)
+
+    try:
+        settings = Settings(
+            api=ApiSettings(auth_enabled=True, admin_key=SecretStr("k")),
+            database=DatabaseSettings(url=f"sqlite+aiosqlite:///{tmp_path / 'se_v541.db'}"),
+            governance=GovernanceSettings(auto_approve_max_level="L2", workspace_root=str(ws_root)),
+            evolution=EvolutionSettings(repo_root=str(repo_root), instances_root=str(tmp_path / "inst")),
+            perception=PerceptionSettings(llm_probe=False),
+            kernel_v3=KernelV3Settings(
+                self_edit_enabled=True,
+                self_edit_auto_approve_enabled=True,
+                self_edit_policy_mode="wide_open",
+                self_edit_branch="evo/auto",
+                self_edit_cooldown_minutes=0,
+                reproduction_quality_scoring_enabled=True,
+                plan_preflight_enabled=True,
+                goal_dedup_enabled=False,
+            ),
+            social=SocialSettings(enabled=False),
+        )
+        state_repo = StateRepository(db)
+        evo_repo = EvolutionRepository(db)
+        identity = await state_repo.get_or_create_identity(name="AOC-001", version="1.0.0")
+        lifecycle = LifecycleManager(identity["id"], state_repo)
+        await lifecycle.transition(LifecycleState.ACTIVE, reason="test startup")
+
+        guard = ConstitutionGuard(repo_root=repo_root, policy_mode="wide_open")
+        pm = ProposalManager(evo_repo=evo_repo, state_repo=state_repo, constitution_guard=guard)
+        brain = _BrittlePlannerBrain()
+        se_mgr = SelfEditManager(
+            evo_repo=evo_repo,
+            state_repo=state_repo,
+            proposal_manager=pm,
+            constitution_guard=guard,
+            brain=brain,
+            repo_root=repo_root,
+            workspace_root=ws_root,
+            enabled=True,
+            auto_approve_enabled=True,
+            policy_mode="wide_open",
+            target_branch="evo/auto",
+            cooldown_minutes=0,
+        )
+        await se_mgr.enqueue_self_edit(
+            title="补充辅助函数",
+            target_files=["app/math_helper.py", "tests/unit/test_math_helper.py"],
+            desired_change="Add helper function",
+            priority=3,
+        )
+
+        class _DummySensor:
+            name = "dummy"
+
+            async def observe(self) -> Observation:
+                return Observation(
+                    timestamp=datetime.now(timezone.utc),
+                    system_state={
+                        "disk": {"free_ratio": 0.70, "paths": {"/": {"free_ratio": 0.70}}},
+                        "memory": {"available_ratio": 0.70},
+                        "cpu": {"load_per_core": 0.2},
+                        "llm": {"available": True},
+                        "database": {"ok": True},
+                    },
+                    environment_state={"unknown_topics": []},
+                    available_resources={
+                        "agents": {"enabled_count": 1, "healthy_count": 1, "capabilities": ["coding", "general_task"]},
+                        "budget": {"tasks_used": 0, "tasks_limit": 100, "tokens_used": 0, "tokens_limit": 1_000_000},
+                    },
+                    confidence=1.0,
+                )
+
+        perception = SensorManager(repo=state_repo)
+        perception.register(_DummySensor())
+        drives = DriveEngine(config={
+            "arbitration": {"weights": {"survival": 1.0, "reproduction": 0.9, "curiosity": 0.1}, "idle_threshold": 0.05},
+            "reproduction": {"base_urgency": 0.45},
+        })
+        governance = GovernanceManager(settings.governance, state_repo)
+        reg = AgentRegistry(repo=state_repo)
+        reg.register(_FakeSelfEditAgent(), probe=AgentProbeResult(ok=True, binary="codex", version="fake"))
+        orch = AgentOrchestrator(registry=reg, governance=governance, repo=state_repo, backend=LocalSubprocessBackend())
+        mem = ExperienceManager(state_repo, backend=None, outbox_enabled=False, embed_on_write=False)
+        fin = TaskFinalizer(
+            organism_id=identity["id"],
+            repo=state_repo,
+            perception=perception,
+            drives=drives,
+            brain=brain,
+            governance=governance,
+            memory=mem,
+            verifier=orch.verifier,
+            self_edit_manager=se_mgr,
+            skill_auto_crystallize=False,
+        )
+        loop = AutonomousLoop(
+            organism_id=identity["id"],
+            settings=settings,
+            repo=state_repo,
+            lifecycle=lifecycle,
+            perception=perception,
+            drives=drives,
+            brain=brain,
+            governance=governance,
+            registry=reg,
+            orchestrator=orch,
+            memory=mem,
+            finalizer=fin,
+            self_edit_manager=se_mgr,
+        )
+
+        # Open self_edit_queue items lift reproduction pending_skill_refactor_count
+        obs_pre = await perception.perceive(persist=False)
+        dctx = await loop._build_drive_context(obs_pre, None, datetime.now(timezone.utc))
+        assert dctx.pending_skill_refactor_count >= 1
+
+        cycle = await loop.run_cycle()
+        assert cycle["outcome"] == "SUCCEEDED"
+
+        async with db.session() as s:
+            task_row = (await s.execute(select(AgentTaskRow))).scalars().first()
+        assert task_row is not None
+        assert task_row.timeout_seconds == 600
+        assert [v.get("kind") for v in (task_row.verification or [])] == ["non_empty_output"]
+        assert "CRITICAL FAST-TEST RULE" in (task_row.description or "")
+
+        se_state = await se_mgr.get_state()
+        assert se_state["last_stage"] == "SELF_APPROVED_COMMITTED"
+        assert _git(repo_root, "rev-parse", "refs/heads/main").stdout.strip() == main_sha
+        assert _git(repo_root, "rev-parse", "refs/heads/evo/auto").stdout.strip() == se_state["last_commit_sha"]
+    finally:
+        await db.dispose()

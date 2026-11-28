@@ -133,10 +133,12 @@ class CognitionBrain(BrainInterface):
 
     async def generate_goal(self, context: CognitiveContext) -> GoalProposal:
         repro_rule = (
-            "For reproduction drive when `self_edit_enabled` is true, you MAY propose bounded improvements to "
-            f"AOC's own code, unit tests, or configs (policy_mode=`{context.self_edit_policy_mode}`): "
-            "prioritize `pending_self_edits` when non-empty, or `pending_skill_refactors` for reusable skill upgrades. "
-            "Self-edits run in an isolated worktree, must pass deterministic guards + pytest, and self-approve onto branch `evo/auto`. "
+            "For reproduction drive when `self_edit_enabled` is true, you have wide creative freedom on the isolated "
+            f"experimental branch `evo/auto` (`main` untouched, policy_mode=`{context.self_edit_policy_mode}`) to propose "
+            "bold, high-leverage evolutions to AOC's own code, tools, cognition, memory, parsers, UI/observability, configs, "
+            "and tests (not only minor tweaks). Prioritize `pending_self_edits` when non-empty (or propose fresh creative "
+            "upgrades), alongside `pending_skill_refactors` for reusable skill upgrades. "
+            "Self-edits run in an isolated worktree, verify via pytest, and self-approve onto `evo/auto`. "
             if context.self_edit_enabled
             else (
                 "For reproduction drive, ONLY propose virtual capability-building, skill research, "
@@ -309,11 +311,13 @@ class CognitionBrain(BrainInterface):
         self_edit_rule = (
             "\n- SELF-EDIT MODE (`execution_mode='self_edit'`): When the goal evolves AOC's own code, unit tests, "
             "or configs (or resolves an item from `pending_self_edits`), set execution_mode='self_edit', "
-            "assigned_agent='codex', permission_level='L1', AND populate "
+            "assigned_agent='codex', permission_level='L1', `timeout_seconds` between 540 and 600, "
+            "`verification=[{'kind': 'non_empty_output'}]` ONLY (NEVER add `contains_keywords` guessing internal "
+            "function/helper names; the kernel runs authoritative worktree diff + pytest checks), AND populate "
             "`self_edit_spec={'target_files': ['app/...'], 'hypothesis': '<why>', 'change_summary': '<what>', "
             "'test_targets': ['tests/unit/...'], 'rollback_plan': '<how>', 'queue_key': '<optional>'}`. "
-            "The kernel creates an isolated worktree and automatically runs pytest, critic self-review, and git commit "
-            "onto `evo/auto` (do NOT put git commit/push commands or host `/home/ubuntu` paths inside objective/description)."
+            "Encourage creative, high-leverage implementations on isolated branch `evo/auto`, and do NOT ask Codex to run "
+            "full/unrelated test suites inside objective/description (keep git commit/push and host `/home/ubuntu` paths out)."
             if context.self_edit_enabled
             else ""
         )
@@ -712,8 +716,9 @@ class CognitionBrain(BrainInterface):
         if context.self_edit_auto_approve_enabled:
             l2_bridge_rule = (
                 "\n   AUTONOMOUS SELF-EDIT PIPELINE (`self_edit_auto_approve_enabled=true`, policy_mode="
-                f"`{context.self_edit_policy_mode}`): When you emit `l2_upgrade_proposal`, AOC can self-execute, test "
-                "(ConstitutionGuard + pytest), self-approve onto branch `evo/auto`, and report to Joel automatically! "
+                f"`{context.self_edit_policy_mode}`): When you emit `l2_upgrade_proposal`, AOC encourages bold, "
+                "high-leverage code/architecture/tool evolution on isolated branch `evo/auto` (`main` untouched), "
+                "self-executes, runs pytest, self-approves, and reports to Joel automatically! "
                 "Include `target_files`, `desired_change`, `test_plan`, `rollback_plan`, and optionally an exact "
                 "`proposed_change: {target_file, change_type, yaml_updates?, replacements?, hypothesis}` if trivial. "
                 "Locked files ONLY: `.env`/secrets, `app/api/auth.py`, `app/core/lifecycle.py`."
@@ -801,9 +806,10 @@ class CognitionBrain(BrainInterface):
     async def review_self_edit(self, context: SelfEditReviewContext) -> SelfEditReviewDecision:
         """Critic review gate checking diff safety, coherence, and restart requirement before self-approval (V5.4)."""
         system_prompt = (
-            "You are the Autonomous Self-Edit Reviewer of AOC. Inspect the proposed git diff, changed files, "
-            "hypothesis, and verified pytest summary. Reject ONLY if the change introduces security risks, disables "
-            "safety/auth/lifecycle guards, corrupts core data structures, or contradicts the stated hypothesis.\n"
+            "You are the Pro-Creativity Self-Edit Reviewer for AOC on isolated experimental branch `evo/auto` "
+            "(`main` stays untouched). Approve by default (`approved=true`) whenever syntax & pytest passed; reject ONLY "
+            "for clear credential/secret leakage, disabling auth/lifecycle kill-switch guards, or severely broken/"
+            "destructive code. NEVER veto ambitious refactors, new modules/features, drive experiments, or creative tuning.\n"
             "Return compact JSON `{approved, risk_level, summary_zh, concerns, restart_required}` where `summary_zh` "
             "is plain Simplified Chinese (<= 160 chars) suitable for reporting to creator Joel, and `concerns` is an "
             "empty list when approved. Keep internal reasoning brief."
@@ -813,7 +819,7 @@ class CognitionBrain(BrainInterface):
             "title": context.title,
             "hypothesis": context.hypothesis,
             "policy_mode": context.policy_mode,
-            "changed_files": context.changed_files[:12],
+            "changed_files": context.changed_files[:30],
             "pytest_summary": context.pytest_summary[:240],
             "unified_diff": context.unified_diff[:5000],
         }
