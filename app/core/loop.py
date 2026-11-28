@@ -1775,10 +1775,26 @@ class AutonomousLoop:
                 term_statuses = [
                     st for st in recent_statuses if st in {"SUCCEEDED", "FAILED", "TIMEOUT", "CANCELLED"}
                 ]
+                exec_rel: float | None = None
                 if term_statuses:
-                    execution_reliability_recent = clamp01(
+                    exec_rel = clamp01(
                         sum(1 for st in term_statuses if st == "SUCCEEDED") / len(term_statuses)
                     )
+                recent_term_goals = await self.repo.list_goals(
+                    statuses=[GoalStatus.ACHIEVED.value, GoalStatus.FAILED.value], limit=20
+                )
+                goal_rel: float | None = None
+                if len(recent_term_goals) >= 5:
+                    goal_rel = clamp01(
+                        sum(1 for g in recent_term_goals if g.get("status") == GoalStatus.ACHIEVED.value)
+                        / len(recent_term_goals)
+                    )
+                if exec_rel is not None and goal_rel is not None:
+                    execution_reliability_recent = clamp01(0.5 * exec_rel + 0.5 * goal_rel)
+                elif exec_rel is not None:
+                    execution_reliability_recent = exec_rel
+                elif goal_rel is not None:
+                    execution_reliability_recent = goal_rel
 
                 pb_rows = await self.repo.list_world_items(kind="external_playbook")
                 now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)

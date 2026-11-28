@@ -15,7 +15,7 @@ from typing import Any
 
 from app.core.enums import DriveType
 from app.drives.interfaces import DriveContext, DriveEvaluation, DriveEvaluator, clamp01
-from app.drives.scoring import extract_number, linear_band, weighted_dimensions
+from app.drives.scoring import aggregate_dimensions, extract_number, linear_band
 from app.perception.interfaces import is_unavailable
 
 
@@ -148,8 +148,29 @@ class ReproductionDriveEvaluator(DriveEvaluator):
                 urgency_boost += min(0.15, 0.15 * clamp01((pain - 0.25) / 0.75))
                 notes.append(f"meta-reflection unresolved pain ({pain:.2f})")
 
-        satisfaction, data_conf, w_notes = weighted_dimensions(
-            dimensions, weights, default_when_all_missing=0.40
+        if ctx.reproduction_quality_scoring_enabled:
+            q_agg = self.cfg.get("quality_aggregation", {}) if isinstance(self.cfg.get("quality_aggregation"), dict) else {}
+            rep_beta = float(q_agg.get("softmin_beta", 1.0))
+            default_rep_gates: dict[str, dict[str, Any]] = {
+                "skill_reuse_quality": {"threshold": 0.50, "lethal": 0.0, "gamma": 1.2, "floor": 0.55},
+                "execution_reliability": {"threshold": 0.65, "lethal": 0.0, "gamma": 1.2, "floor": 0.50},
+            }
+        else:
+            q_agg = self.cfg.get("aggregation", {}) if isinstance(self.cfg.get("aggregation"), dict) else {}
+            rep_beta = float(q_agg.get("softmin_beta", 0.4))
+            default_rep_gates = {
+                "capability_coverage": {"threshold": 0.50, "lethal": 0.0, "gamma": 1.2, "floor": 0.85},
+                "reusable_skills": {"threshold": 0.40, "lethal": 0.0, "gamma": 1.2, "floor": 0.85},
+            }
+        cfg_rep_gates = q_agg.get("gates") if isinstance(q_agg.get("gates"), dict) else {}
+        rep_gates = {**default_rep_gates, **cfg_rep_gates}
+
+        satisfaction, data_conf, w_notes = aggregate_dimensions(
+            dimensions,
+            weights,
+            default_when_all_missing=0.40,
+            softmin_beta=rep_beta,
+            gates=rep_gates,
         )
         notes.extend(w_notes)
         confidence = clamp01(data_conf * max(0.2, obs.confidence)) if data_conf > 0 else 0.0

@@ -16,7 +16,7 @@ from typing import Any
 
 from app.core.enums import DriveType, ExecutionStatus
 from app.drives.interfaces import DriveContext, DriveEvaluation, DriveEvaluator, clamp01
-from app.drives.scoring import extract_number, linear_band, weighted_dimensions
+from app.drives.scoring import aggregate_dimensions, extract_number, linear_band
 from app.perception.interfaces import is_unavailable
 
 
@@ -87,8 +87,25 @@ class SurvivalDriveEvaluator(DriveEvaluator):
         if db_health_score is not None and "database" not in raw_weights:
             raw_weights["database"] = 0.25
 
-        satisfaction, data_conf, w_notes = weighted_dimensions(
-            dimensions, raw_weights, default_when_all_missing=0.35
+        agg_cfg = self.cfg.get("aggregation", {}) if isinstance(self.cfg.get("aggregation"), dict) else {}
+        surv_beta = float(agg_cfg.get("softmin_beta", 1.2))
+        default_surv_gates: dict[str, dict[str, Any]] = {
+            "resources": {"threshold": 0.80, "lethal": 0.0, "gamma": 1.2, "floor": 0.0},
+            "llm_health": {"threshold": 0.60, "lethal": 0.0, "gamma": 1.5, "floor": 0.0},
+            "database": {"threshold": 0.80, "lethal": 0.0, "gamma": 1.5, "floor": 0.0},
+            "reliability": {"threshold": 0.55, "lethal": 0.0, "gamma": 1.2, "floor": 0.45},
+        }
+        cfg_gates = agg_cfg.get("gates") if isinstance(agg_cfg.get("gates"), dict) else {}
+        eff_gates = {**default_surv_gates, **cfg_gates}
+        # Hard P1-1 invariant: economic quota is decoupled and can never gate survival satisfaction
+        eff_gates.pop("budget", None)
+
+        satisfaction, data_conf, w_notes = aggregate_dimensions(
+            dimensions,
+            raw_weights,
+            default_when_all_missing=0.35,
+            softmin_beta=surv_beta,
+            gates=eff_gates,
         )
         notes.extend(w_notes)
 
@@ -132,9 +149,9 @@ class SurvivalDriveEvaluator(DriveEvaluator):
         self, sys_state: dict[str, Any], avail_res: dict[str, Any], th: dict[str, Any]
     ) -> tuple[float | None, list[str]]:
         notes: list[str] = []
-        sub_scores: list[float] = []
+        res_dims: dict[str, float | None] = {}
 
-        # Disk free ratio (take worst mounted path)
+        # Disk free ratio (take worst mounted path; 0% free = lethal 0.0)
         disk_info = sys_state.get("disk")
         if not is_unavailable(disk_info) and isinstance(disk_info, dict):
             ratios: list[float] = []
@@ -147,24 +164,22 @@ class SurvivalDriveEvaluator(DriveEvaluator):
                         ratios.append(r)
             if ratios:
                 worst_disk = min(ratios)
-                d_crit = float(th.get("disk_free_critical", 0.05))
-                d_ok = float(th.get("disk_free_healthy", 0.20))
-                # Nonlinear curve: squaring slightly below healthy penalizes critically low disk sharply
-                lin = linear_band(worst_disk, d_crit, d_ok)
-                disk_score = clamp01(lin**1.5)
-                sub_scores.append(disk_score)
+                d_crit = float(th.get("disk_free_critical", 0.00))
+                d_ok = float(th.get("disk_free_healthy", 0.35))
+                disk_score = linear_band(worst_disk, d_crit, d_ok)
+                res_dims["disk"] = disk_score
                 if worst_disk < d_ok:
                     notes.append(f"disk free ratio low: {worst_disk:.1%}")
 
-        # Memory available ratio
+        # Memory available ratio (0% free = lethal 0.0)
         mem_info = sys_state.get("memory")
         if not is_unavailable(mem_info) and isinstance(mem_info, dict):
             mem_avail = extract_number(mem_info, "available_ratio")
             if mem_avail is not None:
-                m_crit = float(th.get("mem_avail_critical", 0.05))
-                m_ok = float(th.get("mem_avail_healthy", 0.25))
-                mem_score = clamp01(linear_band(mem_avail, m_crit, m_ok) ** 1.3)
-                sub_scores.append(mem_score)
+                m_crit = float(th.get("mem_avail_critical", 0.00))
+                m_ok = float(th.get("mem_avail_healthy", 0.30))
+                mem_score = linear_band(mem_avail, m_crit, m_ok)
+                res_dims["memory"] = mem_score
                 if mem_avail < m_ok:
                     notes.append(f"memory available ratio low: {mem_avail:.1%}")
 
@@ -174,22 +189,38 @@ class SurvivalDriveEvaluator(DriveEvaluator):
             load_per_core = extract_number(cpu_info, "load_per_core")
             if load_per_core is not None:
                 l_ok = float(th.get("load_per_core_ok", 1.0))
-                l_bad = float(th.get("load_per_core_bad", 3.0))
+                l_bad = float(th.get("load_per_core_bad", 4.0))
                 load_score = linear_band(load_per_core, l_bad, l_ok)
-                sub_scores.append(load_score)
+                res_dims["cpu"] = load_score
                 if load_per_core > l_ok:
                     notes.append(f"sustained load/core elevated: {load_per_core:.2f}")
 
-        if not sub_scores:
+        if not res_dims:
             return None, ["system resource metrics unavailable"]
 
-        # If any physical resource is in the critical zone, it cannot be masked by other healthy resources
-        avg_score = sum(sub_scores) / len(sub_scores)
-        min_score = min(sub_scores)
+        res_agg = self.cfg.get("resource_aggregation", {}) if isinstance(self.cfg.get("resource_aggregation"), dict) else {}
+        res_beta = float(res_agg.get("softmin_beta", 1.0))
+        default_res_gates: dict[str, dict[str, Any]] = {
+            "disk": {"threshold": 0.85, "lethal": 0.0, "gamma": 1.2, "floor": 0.0},
+            "memory": {"threshold": 0.80, "lethal": 0.0, "gamma": 1.2, "floor": 0.0},
+            "cpu": {"threshold": 0.50, "lethal": 0.0, "gamma": 1.2, "floor": 0.15},
+        }
+        cfg_res_gates = res_agg.get("gates") if isinstance(res_agg.get("gates"), dict) else {}
+        res_gates = {**default_res_gates, **cfg_res_gates}
+        obs_weights = {k: 1.0 for k in res_dims}
+        res_score, _, gate_notes = aggregate_dimensions(
+            res_dims,
+            obs_weights,
+            softmin_beta=res_beta,
+            gates=res_gates,
+        )
+        notes.extend(gate_notes)
+
+        min_score = min(v for v in res_dims.values() if v is not None)
         crit_dim = float(th.get("critical_dimension", 0.15))
         if min_score <= crit_dim:
-            return clamp01(min_score), notes
-        return clamp01(0.4 * avg_score + 0.6 * min_score), notes
+            return clamp01(min(res_score, min_score)), notes
+        return res_score, notes
 
     def _score_llm(self, sys_state: dict[str, Any], th: dict[str, Any]) -> tuple[float | None, list[str]]:
         llm = sys_state.get("llm")

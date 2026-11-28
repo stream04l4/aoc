@@ -33,16 +33,29 @@ drives:
       reliability: 0.25
       # budget is tracked as Economic Quota (P1-1), intentionally decoupled from Survival health/CRITICAL
     thresholds:
-      disk_free_critical: 0.05   # free ratio at which disk score hits 0
-      disk_free_healthy: 0.20    # free ratio at which disk score hits 1
-      mem_avail_critical: 0.05
-      mem_avail_healthy: 0.25
+      disk_free_critical: 0.00   # 0% free = lethal (cannot run at all)
+      disk_free_healthy: 0.35    # below 35% free enters warning slope
+      mem_avail_critical: 0.00   # 0% available memory = lethal
+      mem_avail_healthy: 0.30
       load_per_core_ok: 1.0      # sustained load/core below this is fine
-      load_per_core_bad: 3.0     # sustained load/core at which cpu headroom score hits 0
+      load_per_core_bad: 4.0     # sustained load/core at which cpu headroom score hits 0
       llm_latency_ok_ms: 5000
       llm_latency_bad_ms: 60000
       failure_window: 10         # last N executions considered for reliability
       critical_dimension: 0.15   # any single dimension below this -> urgency 1.0
+    resource_aggregation:
+      softmin_beta: 1.0
+      gates:
+        disk: {threshold: 0.85, lethal: 0.0, gamma: 1.2, floor: 0.0}
+        memory: {threshold: 0.80, lethal: 0.0, gamma: 1.2, floor: 0.0}
+        cpu: {threshold: 0.50, lethal: 0.0, gamma: 1.2, floor: 0.15}
+    aggregation:
+      softmin_beta: 1.2
+      gates:
+        resources: {threshold: 0.80, lethal: 0.0, gamma: 1.2, floor: 0.0}
+        llm_health: {threshold: 0.60, lethal: 0.0, gamma: 1.5, floor: 0.0}
+        database: {threshold: 0.80, lethal: 0.0, gamma: 1.5, floor: 0.0}
+        reliability: {threshold: 0.55, lethal: 0.0, gamma: 1.2, floor: 0.45}
 
   reproduction:
     weight: 0.75
@@ -76,6 +89,16 @@ drives:
       - repository_analysis
       - system_diagnosis
       - knowledge_summarization
+    aggregation:
+      softmin_beta: 0.4
+      gates:
+        capability_coverage: {threshold: 0.50, lethal: 0.0, gamma: 1.2, floor: 0.85}
+        reusable_skills: {threshold: 0.40, lethal: 0.0, gamma: 1.2, floor: 0.85}
+    quality_aggregation:
+      softmin_beta: 1.0
+      gates:
+        skill_reuse_quality: {threshold: 0.50, lethal: 0.0, gamma: 1.2, floor: 0.55}
+        execution_reliability: {threshold: 0.65, lethal: 0.0, gamma: 1.2, floor: 0.50}
 
   curiosity:
     weight: 1.15
@@ -97,3 +120,8 @@ drives:
       new_knowledge_window: 5    # semantic memories in window considered "fully fed"
       learning_half_life_hours: 12
       information_gain_half_life_hours: 24
+    aggregation:
+      softmin_beta: 0.8
+      gates:
+        knowledge_gaps: {threshold: 0.50, lethal: 0.0, gamma: 1.2, floor: 0.35}
+        unknown_information: {threshold: 0.50, lethal: 0.0, gamma: 1.2, floor: 0.55}
