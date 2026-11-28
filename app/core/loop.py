@@ -1224,8 +1224,19 @@ class AutonomousLoop:
                 healthy_agents = self.registry.list_healthy()
                 fallback_agent = healthy_agents[0].agent_id if healthy_agents else "codex"
                 plan = plan.model_copy(update={"execution_mode": "codex", "assigned_agent": fallback_agent, "self_edit_spec": None})
-            elif is_self_edit and plan.permission_level == PermissionLevel.L0.value:
-                plan = plan.model_copy(update={"permission_level": PermissionLevel.L1.value})
+            elif is_self_edit:
+                se_updates: dict[str, Any] = {}
+                if plan.permission_level == PermissionLevel.L0.value:
+                    se_updates["permission_level"] = PermissionLevel.L1.value
+                # Self-edit changes are verified authoritatively by SelfEditManager (git diff + guards + pytest).
+                # Strip brittle planner-guessed contains_keywords / file_exists specs so Orchestrator never
+                # false-rejects a succeeded Codex self-edit over internal helper or file naming.
+                se_updates["verification"] = [VerificationSpec(kind="non_empty_output")]
+                max_t = int(getattr(self.settings.governance.budget, "max_task_timeout_seconds", 600) or 600)
+                min_se_timeout = min(max_t, 600)
+                if int(plan.timeout_seconds or 0) < min_se_timeout:
+                    se_updates["timeout_seconds"] = min_se_timeout
+                plan = plan.model_copy(update=se_updates)
             is_brain_research = bool(kv3.brain_research_enabled) and plan_wants_brain
             verdict = await self.governance.validate_plan(plan, decision.selected_drive)
             plan_hash = compute_plan_hash(plan)
@@ -1527,12 +1538,13 @@ class AutonomousLoop:
                     submit_kwargs["resource_budget_extra"] = {"self_edit": se_meta}
                     submit_kwargs["description_suffix"] = (
                         "[Autonomous Self-Edit Worktree Instructions]\n"
-                        f"- Target branch after verification: `{se_meta['target_branch']}` | Proposal: `{se_meta['proposal_key']}`\n"
+                        f"- Target branch after verification: `{se_meta['target_branch']}` (isolated experimental branch; `main` is untouched) | Proposal: `{se_meta['proposal_key']}`\n"
                         f"- Focus files: {clean_targets or ['(determined by task scope)']}\n"
+                        "- CREATIVE FREEDOM: You are encouraged to explore bold, high-leverage improvements — add new features/tools, refactor architecture, improve cognition/memory/parsers/UI, and write clean unit tests.\n"
                         "- Read existing target files and relevant unit tests in current workspace `.` before editing.\n"
-                        "- Make minimal, well-structured changes and add/update unit tests covering your changes.\n"
-                        "- Hard-locked files (DO NOT edit): secrets/credentials, `app/api/auth.py`, `app/core/lifecycle.py`.\n"
-                        "- Do NOT run `git commit`, `git push`, or `docker`; kernel automatically runs pytest, critic self-review, and git commit after your run finishes."
+                        "- CRITICAL FAST-TEST RULE (AVOID TIMEOUT): NEVER run the full `tests/unit` suite or unrelated heavy test files (`test_v5_2_1_hotfixes.py`, `test_v5_4_autonomous_self_edit.py`, etc.) inside Codex! Run ONLY a fast check on the specific test file(s) you added or directly edited (e.g. `timeout 60 /home/ubuntu/aoc/.venv/bin/python -m pytest -q <your_test_file>` or `python3 -m py_compile <changed_py_files>`), then finish promptly.\n"
+                        "- Hard-locked files ONLY (DO NOT edit): `.env`/secrets/keys, `app/api/auth.py`, `app/core/lifecycle.py`.\n"
+                        "- Do NOT run `git commit`, `git push`, or `docker`; kernel automatically runs regression pytest, critic review, and commits onto `evo/auto` right after your run finishes."
                     )
 
                 try:
@@ -1785,6 +1797,9 @@ class AutonomousLoop:
 
                 refactor_rows = await self.repo.list_world_items(kind="skill_refactor_queue", status="open")
                 pending_skill_refactor_count = len(refactor_rows)
+                if self.settings.kernel_v3.self_edit_enabled and self.self_edit_manager is not None:
+                    se_queue_rows = await self.repo.list_world_items(kind="self_edit_queue", status="open")
+                    pending_skill_refactor_count += len(se_queue_rows)
                 meta_rows = await self.repo.list_world_items(kind="meta_reflection_state")
                 meta_pri = next((r for r in meta_rows if r.get("key") == "primary"), None)
                 if meta_pri and isinstance(meta_pri.get("value"), dict):

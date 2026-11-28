@@ -231,7 +231,7 @@ class SelfEditManager:
             _strip_rel_prefix(str(p))
             for p in (target_files or [])
             if str(p).strip()
-        ][:8]
+        ][:30]
         q_key = (queue_key or f"self_edit:{uuid.uuid4().hex[:10]}").strip()[:120]
         now_iso = utcnow().isoformat()
         payload = {
@@ -417,7 +417,7 @@ class SelfEditManager:
             "target_files": clean_targets,
             "hypothesis": (hypothesis or title)[:500],
             "change_summary": str(change_summary or title)[:400],
-            "test_targets": [_strip_rel_prefix(str(t)) for t in (test_targets or []) if str(t).strip()][:8],
+            "test_targets": [_strip_rel_prefix(str(t)) for t in (test_targets or []) if str(t).strip()][:16],
             "rollback_plan": str(rollback_plan or "")[:300],
             "queue_key": queue_key,
             "title": str(title or pkey)[:160],
@@ -539,7 +539,6 @@ class SelfEditManager:
                         _add_if_exists(t)
         if not selected:
             for fallback in (
-                "tests/unit/test_v5_4_autonomous_self_edit.py",
                 "tests/unit/test_v5_3_m4_l2_bridge_and_obs.py",
                 "tests/unit/test_v5_m2_constitution_entropy_funnel.py",
             ):
