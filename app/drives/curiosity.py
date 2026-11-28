@@ -21,7 +21,7 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 from app.core.enums import DriveType
 from app.drives.interfaces import DriveContext, DriveEvaluation, DriveEvaluator, clamp01
-from app.drives.scoring import weighted_dimensions
+from app.drives.scoring import aggregate_dimensions
 
 
 class CuriosityDriveEvaluator(DriveEvaluator):
@@ -110,8 +110,20 @@ class CuriosityDriveEvaluator(DriveEvaluator):
                 "learning_progress": 0.15,
             },
         )
-        satisfaction, data_conf, w_notes = weighted_dimensions(
-            dimensions, weights, default_when_all_missing=0.50
+        cur_agg = self.cfg.get("aggregation", {}) if isinstance(self.cfg.get("aggregation"), dict) else {}
+        cur_beta = float(cur_agg.get("softmin_beta", 0.8))
+        default_cur_gates: dict[str, dict[str, Any]] = {
+            "knowledge_gaps": {"threshold": 0.50, "lethal": 0.0, "gamma": 1.2, "floor": 0.35},
+            "unknown_information": {"threshold": 0.50, "lethal": 0.0, "gamma": 1.2, "floor": 0.55},
+        }
+        cfg_cur_gates = cur_agg.get("gates") if isinstance(cur_agg.get("gates"), dict) else {}
+        cur_gates = {**default_cur_gates, **cfg_cur_gates}
+        satisfaction, data_conf, w_notes = aggregate_dimensions(
+            dimensions,
+            weights,
+            default_when_all_missing=0.50,
+            softmin_beta=cur_beta,
+            gates=cur_gates,
         )
         notes.extend(w_notes)
 
